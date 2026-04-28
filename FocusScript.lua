@@ -1,4 +1,3 @@
-
 -- ShopController
 -- Location: StarterPlayer > StarterPlayerScripts > ShopController
 
@@ -388,10 +387,20 @@ local function MakeEpicSubTab(name, iconId)
 	btn.MouseButton1Down:Connect(function()
 		if shared.PlayUISound then shared.PlayUISound(SoundConfig.UIClick or "") end
 		activeEpicSubTab = name
+
+		-- 1. Change Button Colors
 		for tName, data in pairs(epicSubTabButtons) do
 			data.btn.BackgroundColor3 = (tName == activeEpicSubTab) and TAB_COLOR_ACTIVE or TAB_COLOR_BASE
 			data.stroke.Color = (tName == activeEpicSubTab) and T.bodyText or T.panelStroke
 		end
+
+		-- 2. ✨ SHOW THE CORRECT CARDS
+		for id, ref in pairs(epicCardRefs) do
+			if ref and ref.frame then
+				ref.frame.Visible = (ref.tab == activeEpicSubTab)
+			end
+		end
+		if EpicScroll then EpicScroll.CanvasPosition = Vector2.new(0,0) end
 	end)
 
 	epicSubTabButtons[name] = {btn = btn, stroke = stroke}
@@ -779,16 +788,6 @@ end
 local function HighlightMainTab(tabName)
 	for name,btn in pairs(mainTabButtons) do btn.BackgroundColor3=(name==tabName) and T.panelStroke or T.buttonSecondary end
 end
-local function HighlightEpicSubTab(subTabName)
-	for name,refs in pairs(epicSubTabButtons) do
-		if name==subTabName then refs.btn.BackgroundColor3=T.cardBG; refs.stroke.Thickness=1.5
-		else refs.btn.BackgroundColor3=T.buttonSecondary; refs.stroke.Thickness=0 end
-	end
-end
-local function ShowEpicCardsForTab(tabName)
-	for id,ref in pairs(epicCardRefs) do ref.frame.Visible=(ref.tab==tabName) end
-	EpicScroll.CanvasPosition=Vector2.new(0,0)
-end
 local function SwitchToMainTab(tabName)
 	if shared.PlayUISound then shared.PlayUISound(SoundConfig.UIClick or "") end
 	activeMainTab = tabName
@@ -805,15 +804,19 @@ local function SwitchToMainTab(tabName)
 	RegularScroll.Visible = (tabName == "Upgrades")
 	EpicScroll.Visible    = (tabName == "Epic")
 	EpicSubTabBar.Visible = (tabName == "Epic")
+
+	-- ✨ FORCE CARDS TO SHOW WHEN OPENING EPIC TAB
+	if tabName == "Epic" then
+		for id, ref in pairs(epicCardRefs) do
+			if ref and ref.frame then
+				ref.frame.Visible = (ref.tab == activeEpicSubTab)
+			end
+		end
+	end
 end
-local function SwitchEpicSubTab(subTabName)
-	activeEpicSubTab=subTabName; HighlightEpicSubTab(subTabName); ShowEpicCardsForTab(subTabName); UpdateAllEpicCards()
-end
+
 tabUpgrades.MouseButton1Down:Connect(function() PlayUI(SoundConfig.UIClick); SwitchToMainTab("Upgrades") end)
 tabEpic.MouseButton1Down:Connect(function() PlayUI(SoundConfig.UIClick); SwitchToMainTab("Epic") end)
-for name,refs in pairs(epicSubTabButtons) do
-	refs.btn.MouseButton1Down:Connect(function() PlayUI(SoundConfig.UIClick); SwitchEpicSubTab(name) end)
-end
 
 ---------------------------------------------------------------
 -- OPEN / CLOSE
@@ -997,3 +1000,75 @@ end
 
 task.wait(2)
 RefreshLook()
+
+local EpicUpgradeConfig = {}
+
+-- 1. TABS REMOVED: Everything sits in one clean panel now!
+EpicUpgradeConfig.Tabs = {"Epic"} 
+
+-- 2. DYNAMIC SCALING MATH
+local function scaleCost(base, growth, level)
+	return math.floor(base * math.pow(growth, level))
+end
+
+-- 3. THE UPGRADES
+EpicUpgradeConfig.Tiers = {
+	{
+		tierName = "Permanent Upgrades",
+		unlockRequirement = 0,
+		upgrades = {
+			["epicAuraValue"] = {
+				displayName = "Aura Value Multiplier",
+				description = "Permanently increases the base value of all generated Auras by +10% per level.",
+				iconId = "rbxassetid://0", 
+				maxLevel = 50, category = "Epic", baseCost = 10, costGrowth = 1.3,
+				apply = function(d) return 1 + ((d.epicUpgrades and d.epicUpgrades.epicAuraValue) or 0) * 0.1 end
+			},
+			["epicHoldSpeed"] = {
+				displayName = "Turbo Purchasing",
+				description = "Increases how fast you buy regular upgrades when holding down the button.",
+				iconId = "rbxassetid://0", 
+				maxLevel = 10, category = "Epic", baseCost = 25, costGrowth = 1.5,
+				apply = function(d) return 1 + ((d.epicUpgrades and d.epicUpgrades.epicHoldSpeed) or 0) * 0.3 end
+			},
+			["epicMoveSpeed"] = {
+				displayName = "Swiftness",
+				description = "Permanently increases your character's walking speed.",
+				iconId = "rbxassetid://0", 
+				maxLevel = 15, category = "Epic", baseCost = 15, costGrowth = 1.4,
+				apply = function(d) return ((d.epicUpgrades and d.epicUpgrades.epicMoveSpeed) or 0) * 1 end
+			},
+			["epicClickMilestone"] = {
+				displayName = "Milestone Momentum",
+				description = "Reduces the clicks/time required to reach the next clicker milestone.",
+				iconId = "rbxassetid://0", 
+				maxLevel = 20, category = "Epic", baseCost = 50, costGrowth = 1.6,
+				apply = function(d) return ((d.epicUpgrades and d.epicUpgrades.epicClickMilestone) or 0) * 2 end
+			},
+			["epicPrestigeReward"] = {
+				displayName = "Soul Aura Mastery",
+				description = "Increases the amount of Soul Auras you receive when prestiging by +5% per level.",
+				iconId = "rbxassetid://0", 
+				maxLevel = 25, category = "Epic", baseCost = 100, costGrowth = 1.8,
+				apply = function(d) return 1 + ((d.epicUpgrades and d.epicUpgrades.epicPrestigeReward) or 0) * 0.05 end
+			}
+		}
+	}
+}
+
+function EpicUpgradeConfig.GetUpgradeConfig(upgradeId)
+	for _, tierData in ipairs(EpicUpgradeConfig.Tiers) do
+		if tierData.upgrades[upgradeId] then return tierData.upgrades[upgradeId] end
+	end
+	return nil
+end
+
+function EpicUpgradeConfig.CalculateCost(upgradeId, currentLevel)
+	local cfg = EpicUpgradeConfig.GetUpgradeConfig(upgradeId)
+	if not cfg then return math.huge end
+	if currentLevel >= cfg.maxLevel then return math.huge end
+	return scaleCost(cfg.baseCost, cfg.costGrowth, currentLevel)
+end
+
+EpicUpgradeConfig.TabColors = { Epic = Color3.fromRGB(150, 80, 255) }
+return EpicUpgradeConfig
