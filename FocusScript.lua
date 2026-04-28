@@ -48,8 +48,10 @@ EpicUpgradeConfig.Tiers = {
 				iconId = "rbxassetid://0", 
 				maxLevel = 25, category = "Epic", baseCost = 100, costGrowth = 1.8,
 				apply = function(d) return 1 + ((d.epicUpgrades and d.epicUpgrades.epicPrestigeReward) or 0) * 0.05 end
-			}
+			},
+
 		}
+
 	}
 }
 
@@ -258,7 +260,7 @@ shopIcon.Image = "rbxassetid://14916846070" -- 🖼️ PLACEHOLDER: Cart Icon ID
 -- SHOP PANEL
 ---------------------------------------------------------------
 local PANEL_MAX_W=420; local PANEL_MAX_H=510; local HEADER_H=42
-local MAINTAB_H=34; local SUBTAB_H=30; local CURRENCY_H=24
+local MAINTAB_H=34; local SUBTAB_H=30; local CURRENCY_H=0
 
 local ShopPanel=Instance.new("Frame"); ShopPanel.Name="ShopPanel"
 ShopPanel.Size=UDim2.new(0.88, 0, 0.82, 0)
@@ -328,23 +330,31 @@ end
 local activeShopTabText = "Regular Upgrades"
 
 local MainTabBar = Instance.new("Frame")
-MainTabBar.Size = UDim2.new(1, -20, 0, 75) -- ✨ Taller to fit hover text
+MainTabBar.Size = UDim2.new(1, -20, 0, 85) -- ✨ Made taller (was 75)
 MainTabBar.Position = UDim2.new(0, 10, 0, HEADER_H + 4)
 MainTabBar.BackgroundTransparency = 1; MainTabBar.ZIndex = 11; MainTabBar.Parent = ShopPanel
 
+-- ✨ MOVED TEXT TO THE TOP OF THE BAR
 local ShopHoverLabel = Instance.new("TextLabel", MainTabBar)
-ShopHoverLabel.Size = UDim2.new(1, 0, 0, 18); ShopHoverLabel.Position = UDim2.new(0, 0, 1, -18)
+ShopHoverLabel.Size = UDim2.new(1, 0, 0, 20)
+ShopHoverLabel.Position = UDim2.new(0, 0, 0, 0) -- Locks perfectly to the top
 ShopHoverLabel.BackgroundTransparency = 1; ShopHoverLabel.TextColor3 = T.bodyText
 ShopHoverLabel.TextScaled = true; ShopHoverLabel.Font = T.font
 ShopHoverLabel.Text = activeShopTabText
 
+-- ✨ PUSHED THE BUTTONS DOWN SO THEY DON'T OVERLAP
 local TabBtnFrame = Instance.new("Frame", MainTabBar)
-TabBtnFrame.Size = UDim2.new(1, 0, 1, -20); TabBtnFrame.BackgroundTransparency = 1
+TabBtnFrame.Size = UDim2.new(1, 0, 1, -25)
+TabBtnFrame.Position = UDim2.new(0, 0, 0, 25) -- Pushed down 25 pixels
+TabBtnFrame.BackgroundTransparency = 1
+
 local TabListLayout = Instance.new("UIListLayout", TabBtnFrame)
 TabListLayout.FillDirection = Enum.FillDirection.Horizontal
 TabListLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
 TabListLayout.VerticalAlignment = Enum.VerticalAlignment.Center
 TabListLayout.Padding = UDim.new(0, 25)
+
+-- (Keep your local mainTabButtons = {} and MakeMainTab function exactly as it is below this!)
 
 local TAB_COLOR_BASE   = T.buttonSecondary
 local TAB_COLOR_HOVER  = T.buttonPrimary    -- Color when mouse is over it
@@ -394,23 +404,26 @@ CurrencyLabel.Text="$0"; CurrencyLabel.TextColor3=T.currencyColor; CurrencyLabel
 CurrencyLabel.Font=T.font; CurrencyLabel.TextXAlignment=Enum.TextXAlignment.Right
 CurrencyLabel.ZIndex=11; CurrencyLabel.Parent=ShopPanel
 
----------------------------------------------------------------
--- SCROLL FRAMES
----------------------------------------------------------------
 local function MakeScroll(name,yTop)
 	local sf=Instance.new("ScrollingFrame"); sf.Name=name
 	sf.Size=UDim2.new(1,-20,1,-(yTop+10)); sf.Position=UDim2.new(0,10,0,yTop)
 	sf.BackgroundTransparency=1; sf.BorderSizePixel=0; sf.ScrollBarThickness=4; sf.ScrollBarImageColor3=T.subText
 	sf.CanvasSize=UDim2.new(0,0,0,0); sf.ZIndex=11; sf.Visible=false; sf.Parent=ShopPanel
+
+	-- ✨ THIS IS THE MAGIC LINE THAT STOPS SCROLL OVERLAP:
+	sf.ClipsDescendants = true 
+
 	local layout=Instance.new("UIListLayout"); layout.Padding=UDim.new(0,8); layout.Parent=sf
 	layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
 		sf.CanvasSize=UDim2.new(0,0,0,layout.AbsoluteContentSize.Y+10)
 	end); return sf
 end
-local REGULAR_SCROLL_TOP=HEADER_H+MAINTAB_H+CURRENCY_H+16
-local RegularScroll=MakeScroll("RegularScroll",REGULAR_SCROLL_TOP)
-local EPIC_SCROLL_TOP = HEADER_H + MAINTAB_H + SUBTAB_H + CURRENCY_H + 45
-local EpicScroll=MakeScroll("EpicScroll",EPIC_SCROLL_TOP)
+
+-- ✨ Both scrolls now start at the exact same height since sub-tabs are gone!
+local REGULAR_SCROLL_TOP = HEADER_H + MAINTAB_H + 20
+local RegularScroll = MakeScroll("RegularScroll", REGULAR_SCROLL_TOP)
+local EPIC_SCROLL_TOP = HEADER_H + MAINTAB_H + 20
+local EpicScroll = MakeScroll("EpicScroll", EPIC_SCROLL_TOP)
 
 local EpicSubTabBar = Instance.new("Frame", ShopPanel)
 EpicSubTabBar.Name = "EpicSubTabBar"
@@ -434,8 +447,10 @@ EpicTabListLayout.VerticalAlignment = Enum.VerticalAlignment.Center
 EpicTabListLayout.Padding = UDim.new(0, 15)
 
 local epicSubTabButtons = {}
+local activeEpicSubTab = "Active" 
 
-local function MakeEpicSubTab(name, iconId)
+-- ✨ Added 'hoverText' as a parameter
+local function MakeEpicSubTab(name, hoverText, iconId)
 	local btn = Instance.new("ImageButton", EpicTabBtnFrame)
 	btn.Name = "EpicSubTab_" .. name
 	btn.Size = UDim2.new(0, 40, 0, 40)
@@ -450,8 +465,16 @@ local function MakeEpicSubTab(name, iconId)
 	icon.BackgroundTransparency = 1; icon.ScaleType = Enum.ScaleType.Fit
 	icon.Image = iconId
 
-	btn.MouseEnter:Connect(function() if activeEpicSubTab ~= name then btn.BackgroundColor3 = TAB_COLOR_HOVER end end)
-	btn.MouseLeave:Connect(function() if activeEpicSubTab ~= name then btn.BackgroundColor3 = TAB_COLOR_BASE end end)
+	-- ✨ SMART HOVER LOGIC FOR SUB-TABS
+	btn.MouseEnter:Connect(function() 
+		ShopHoverLabel.Text = hoverText -- Changes text on hover
+		if activeEpicSubTab ~= name then btn.BackgroundColor3 = TAB_COLOR_HOVER end 
+	end)
+
+	btn.MouseLeave:Connect(function() 
+		ShopHoverLabel.Text = activeShopTabText -- Reverts back to current active text
+		if activeEpicSubTab ~= name then btn.BackgroundColor3 = TAB_COLOR_BASE end 
+	end)
 
 	local scale = Instance.new("UIScale", btn)
 	btn.MouseEnter:Connect(function() game:GetService("TweenService"):Create(scale, TweenInfo.new(0.15), {Scale = 1.08}):Play() end)
@@ -461,28 +484,24 @@ local function MakeEpicSubTab(name, iconId)
 		if shared.PlayUISound then shared.PlayUISound(SoundConfig.UIClick or "") end
 		activeEpicSubTab = name
 
-		-- 1. Change Button Colors
+		-- ✨ Make the text "stick" when clicked
+		activeShopTabText = hoverText
+		ShopHoverLabel.Text = hoverText
+
 		for tName, data in pairs(epicSubTabButtons) do
 			data.btn.BackgroundColor3 = (tName == activeEpicSubTab) and TAB_COLOR_ACTIVE or TAB_COLOR_BASE
 			data.stroke.Color = (tName == activeEpicSubTab) and T.bodyText or T.panelStroke
 		end
-
-		-- 2. ✨ SHOW THE CORRECT CARDS
-		for id, ref in pairs(epicCardRefs) do
-			if ref and ref.frame then
-				ref.frame.Visible = (ref.tab == activeEpicSubTab)
-			end
-		end
-		if EpicScroll then EpicScroll.CanvasPosition = Vector2.new(0,0) end
 	end)
 
 	epicSubTabButtons[name] = {btn = btn, stroke = stroke}
 	return btn
 end
 
-local epicTab1 = MakeEpicSubTab("Epic", "rbxassetid://14916846070")
-local epicTab2 = MakeEpicSubTab("Passive", "rbxassetid://14916846070")
-local epicTab3 = MakeEpicSubTab("Luck", "rbxassetid://14916846070")
+-- ✨ ADDED THE CUSTOM HOVER TEXT FOR EACH TAB!
+local epicTab1 = MakeEpicSubTab("Active", "Active Abilities", "rbxassetid://14916846070")
+local epicTab2 = MakeEpicSubTab("Passive", "Passive Boosts", "rbxassetid://14916846070")
+local epicTab3 = MakeEpicSubTab("Luck", "Luck & RNG", "rbxassetid://14916846070")
 local activeEpicSubTab = "Epic"
 ---------------------------------------------------------------
 -- CARD BUILDER
@@ -848,10 +867,6 @@ function UpdateCurrencyDisplay()
 	if activeMainTab=="Upgrades" then
 		CurrencyLabel.Text="$"..FormatNumber(currentCurrency); CurrencyLabel.TextColor3=T.currencyColor
 		CurrencyLabel.Position=UDim2.new(0,12,0,HEADER_H+MAINTAB_H+8)
-	else
-		CurrencyLabel.Text=" "..FormatNumber(liveGoldenAuras).." Golden Auras"
-		CurrencyLabel.TextColor3=T.accentGold
-		CurrencyLabel.Position=UDim2.new(0,12,0,HEADER_H+MAINTAB_H+SUBTAB_H+14)
 	end
 end
 
@@ -869,22 +884,21 @@ local function SwitchToMainTab(tabName)
 	ShopHoverLabel.Text = activeShopTabText
 
 	for name, data in pairs(mainTabButtons) do
-		-- ✨ Applies the Active color, otherwise resets to Base
 		data.btn.BackgroundColor3 = (name == tabName) and TAB_COLOR_ACTIVE or TAB_COLOR_BASE
 		data.stroke.Color = (name == tabName) and T.bodyText or T.panelStroke
 	end
 
 	RegularScroll.Visible = (tabName == "Upgrades")
 	EpicScroll.Visible    = (tabName == "Epic")
-	EpicSubTabBar.Visible = (tabName == "Epic")
 
-	-- ✨ FORCE CARDS TO SHOW WHEN OPENING EPIC TAB
+	-- ✨ Instantly show ALL epic cards when switching to the Epic tab
 	if tabName == "Epic" then
 		for id, ref in pairs(epicCardRefs) do
 			if ref and ref.frame then
-				ref.frame.Visible = (ref.tab == activeEpicSubTab)
+				ref.frame.Visible = true 
 			end
 		end
+		if EpicScroll then EpicScroll.CanvasPosition = Vector2.new(0,0) end
 	end
 end
 
@@ -1054,7 +1068,6 @@ local function RefreshLook()
 		flairedExtraUI = true
 		-- Flair all the new circular tabs!
 		for name, data in pairs(mainTabButtons) do UITheme.ApplyFlair(data.btn, "Ghost") end
-		for name, data in pairs(epicSubTabButtons) do UITheme.ApplyFlair(data.btn, "Ghost") end
 	end
 
 	for _, scrollName in ipairs({"RegularScroll", "EpicScroll"}) do
