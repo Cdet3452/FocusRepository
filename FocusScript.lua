@@ -1,3 +1,75 @@
+local EpicUpgradeConfig = {}
+
+-- 1. TABS REMOVED: Everything sits in one clean panel now!
+EpicUpgradeConfig.Tabs = {"Epic"} 
+
+-- 2. DYNAMIC SCALING MATH
+local function scaleCost(base, growth, level)
+	return math.floor(base * math.pow(growth, level))
+end
+
+-- 3. THE UPGRADES
+EpicUpgradeConfig.Tiers = {
+	{
+		tierName = "Permanent Upgrades",
+		unlockRequirement = 0,
+		upgrades = {
+			["epicAuraValue"] = {
+				displayName = "Aura Value Multiplier",
+				description = "Permanently increases the base value of all generated Auras by +10% per level.",
+				iconId = "rbxassetid://0", 
+				maxLevel = 50, category = "Epic", baseCost = 10, costGrowth = 1.3,
+				apply = function(d) return 1 + ((d.epicUpgrades and d.epicUpgrades.epicAuraValue) or 0) * 0.1 end
+			},
+			["epicHoldSpeed"] = {
+				displayName = "Turbo Purchasing",
+				description = "Increases how fast you buy regular upgrades when holding down the button.",
+				iconId = "rbxassetid://0", 
+				maxLevel = 10, category = "Epic", baseCost = 25, costGrowth = 1.5,
+				apply = function(d) return 1 + ((d.epicUpgrades and d.epicUpgrades.epicHoldSpeed) or 0) * 0.3 end
+			},
+			["epicMoveSpeed"] = {
+				displayName = "Swiftness",
+				description = "Permanently increases your character's walking speed.",
+				iconId = "rbxassetid://0", 
+				maxLevel = 15, category = "Epic", baseCost = 15, costGrowth = 1.4,
+				apply = function(d) return ((d.epicUpgrades and d.epicUpgrades.epicMoveSpeed) or 0) * 1 end
+			},
+			["epicClickMilestone"] = {
+				displayName = "Milestone Momentum",
+				description = "Reduces the clicks/time required to reach the next clicker milestone.",
+				iconId = "rbxassetid://0", 
+				maxLevel = 20, category = "Epic", baseCost = 50, costGrowth = 1.6,
+				apply = function(d) return ((d.epicUpgrades and d.epicUpgrades.epicClickMilestone) or 0) * 2 end
+			},
+			["epicPrestigeReward"] = {
+				displayName = "Soul Aura Mastery",
+				description = "Increases the amount of Soul Auras you receive when prestiging by +5% per level.",
+				iconId = "rbxassetid://0", 
+				maxLevel = 25, category = "Epic", baseCost = 100, costGrowth = 1.8,
+				apply = function(d) return 1 + ((d.epicUpgrades and d.epicUpgrades.epicPrestigeReward) or 0) * 0.05 end
+			}
+		}
+	}
+}
+
+function EpicUpgradeConfig.GetUpgradeConfig(upgradeId)
+	for _, tierData in ipairs(EpicUpgradeConfig.Tiers) do
+		if tierData.upgrades[upgradeId] then return tierData.upgrades[upgradeId] end
+	end
+	return nil
+end
+
+function EpicUpgradeConfig.CalculateCost(upgradeId, currentLevel)
+	local cfg = EpicUpgradeConfig.GetUpgradeConfig(upgradeId)
+	if not cfg then return math.huge end
+	if currentLevel >= cfg.maxLevel then return math.huge end
+	return scaleCost(cfg.baseCost, cfg.costGrowth, currentLevel)
+end
+
+EpicUpgradeConfig.TabColors = { Epic = Color3.fromRGB(150, 80, 255) }
+return EpicUpgradeConfig
+
 -- ShopController
 -- Location: StarterPlayer > StarterPlayerScripts > ShopController
 
@@ -337,13 +409,14 @@ local function MakeScroll(name,yTop)
 end
 local REGULAR_SCROLL_TOP=HEADER_H+MAINTAB_H+CURRENCY_H+16
 local RegularScroll=MakeScroll("RegularScroll",REGULAR_SCROLL_TOP)
-local EPIC_SCROLL_TOP=HEADER_H+MAINTAB_H+SUBTAB_H+CURRENCY_H+22
+local EPIC_SCROLL_TOP = HEADER_H + MAINTAB_H + SUBTAB_H + CURRENCY_H + 45
 local EpicScroll=MakeScroll("EpicScroll",EPIC_SCROLL_TOP)
 
 local EpicSubTabBar = Instance.new("Frame", ShopPanel)
 EpicSubTabBar.Name = "EpicSubTabBar"
 EpicSubTabBar.Size = UDim2.new(1, -20, 0, 50)
-EpicSubTabBar.Position = UDim2.new(0, 10, 0, HEADER_H + MAINTAB_H + 4)
+-- ✨ ADDED CURRENCY_H SO IT SITS UNDER THE GOLD TEXT
+EpicSubTabBar.Position = UDim2.new(0, 10, 0, HEADER_H + MAINTAB_H + CURRENCY_H + 20)
 EpicSubTabBar.BackgroundTransparency = 1
 EpicSubTabBar.ZIndex = 11
 EpicSubTabBar.Visible = false
@@ -407,10 +480,10 @@ local function MakeEpicSubTab(name, iconId)
 	return btn
 end
 
-local epicTab1 = MakeEpicSubTab("Active", "rbxassetid://14916846070")
+local epicTab1 = MakeEpicSubTab("Epic", "rbxassetid://14916846070")
 local epicTab2 = MakeEpicSubTab("Passive", "rbxassetid://14916846070")
 local epicTab3 = MakeEpicSubTab("Luck", "rbxassetid://14916846070")
-
+local activeEpicSubTab = "Epic"
 ---------------------------------------------------------------
 -- CARD BUILDER
 ---------------------------------------------------------------
@@ -1000,75 +1073,3 @@ end
 
 task.wait(2)
 RefreshLook()
-
-local EpicUpgradeConfig = {}
-
--- 1. TABS REMOVED: Everything sits in one clean panel now!
-EpicUpgradeConfig.Tabs = {"Epic"} 
-
--- 2. DYNAMIC SCALING MATH
-local function scaleCost(base, growth, level)
-	return math.floor(base * math.pow(growth, level))
-end
-
--- 3. THE UPGRADES
-EpicUpgradeConfig.Tiers = {
-	{
-		tierName = "Permanent Upgrades",
-		unlockRequirement = 0,
-		upgrades = {
-			["epicAuraValue"] = {
-				displayName = "Aura Value Multiplier",
-				description = "Permanently increases the base value of all generated Auras by +10% per level.",
-				iconId = "rbxassetid://0", 
-				maxLevel = 50, category = "Epic", baseCost = 10, costGrowth = 1.3,
-				apply = function(d) return 1 + ((d.epicUpgrades and d.epicUpgrades.epicAuraValue) or 0) * 0.1 end
-			},
-			["epicHoldSpeed"] = {
-				displayName = "Turbo Purchasing",
-				description = "Increases how fast you buy regular upgrades when holding down the button.",
-				iconId = "rbxassetid://0", 
-				maxLevel = 10, category = "Epic", baseCost = 25, costGrowth = 1.5,
-				apply = function(d) return 1 + ((d.epicUpgrades and d.epicUpgrades.epicHoldSpeed) or 0) * 0.3 end
-			},
-			["epicMoveSpeed"] = {
-				displayName = "Swiftness",
-				description = "Permanently increases your character's walking speed.",
-				iconId = "rbxassetid://0", 
-				maxLevel = 15, category = "Epic", baseCost = 15, costGrowth = 1.4,
-				apply = function(d) return ((d.epicUpgrades and d.epicUpgrades.epicMoveSpeed) or 0) * 1 end
-			},
-			["epicClickMilestone"] = {
-				displayName = "Milestone Momentum",
-				description = "Reduces the clicks/time required to reach the next clicker milestone.",
-				iconId = "rbxassetid://0", 
-				maxLevel = 20, category = "Epic", baseCost = 50, costGrowth = 1.6,
-				apply = function(d) return ((d.epicUpgrades and d.epicUpgrades.epicClickMilestone) or 0) * 2 end
-			},
-			["epicPrestigeReward"] = {
-				displayName = "Soul Aura Mastery",
-				description = "Increases the amount of Soul Auras you receive when prestiging by +5% per level.",
-				iconId = "rbxassetid://0", 
-				maxLevel = 25, category = "Epic", baseCost = 100, costGrowth = 1.8,
-				apply = function(d) return 1 + ((d.epicUpgrades and d.epicUpgrades.epicPrestigeReward) or 0) * 0.05 end
-			}
-		}
-	}
-}
-
-function EpicUpgradeConfig.GetUpgradeConfig(upgradeId)
-	for _, tierData in ipairs(EpicUpgradeConfig.Tiers) do
-		if tierData.upgrades[upgradeId] then return tierData.upgrades[upgradeId] end
-	end
-	return nil
-end
-
-function EpicUpgradeConfig.CalculateCost(upgradeId, currentLevel)
-	local cfg = EpicUpgradeConfig.GetUpgradeConfig(upgradeId)
-	if not cfg then return math.huge end
-	if currentLevel >= cfg.maxLevel then return math.huge end
-	return scaleCost(cfg.baseCost, cfg.costGrowth, currentLevel)
-end
-
-EpicUpgradeConfig.TabColors = { Epic = Color3.fromRGB(150, 80, 255) }
-return EpicUpgradeConfig
