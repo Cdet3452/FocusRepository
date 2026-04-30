@@ -1,3 +1,363 @@
+-- UIController
+-- Location: StarterPlayer > StarterPlayerScripts > UIController
+-- FIX: Habitat bar no longer resets to 0 when a partial UpdateHUD fires
+--      (e.g. from BoostManager which only sends goldenAuras/boostInventory).
+--      Now only updates habitat bar, rate, and currency when those fields
+--      are explicitly present in the payload.
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService        = game:GetService("RunService")
+local TweenService      = game:GetService("TweenService")
+local AdminConfig       = require(ReplicatedStorage.Modules.AdminConfig)
+local Formatter         = require(ReplicatedStorage.Modules.NumberFormatter)
+local UITheme = require(game:GetService("ReplicatedStorage").Modules.UITheme)
+
+local player    = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local UpdateHUD = ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHUD")
+local ShipAuras = ReplicatedStorage.RemoteEvents:WaitForChild("ShipAuras")
+local mainHUD   = playerGui:WaitForChild("MainHUD")
+
+local isAutoMode = AdminConfig.AutoDispatch
+local HabitatHolder = workspace:WaitForChild("HabitatHolder")
+local GoldenAurasLabel = mainHUD:WaitForChild("GoldenAurasLabel")
+	
+local serverCurrency     = 0
+local prevServerCurrency = 0
+local displayedCurrency  = 0
+local ratePerSecond      = 0
+local pendingAuras       = 0
+local habitatCapacity    = AdminConfig.BaseHabitatCapacity
+local passiveInterval    = AdminConfig.PassiveInterval
+local currentCooldownTime = 15
+local isShipOnCooldown = false
+
+local lastSpendTick = 0
+local liveGoldenAuras = 0
+
+-- ✨ NEW: Listen for instant purchases triggered by the Shop!
+player:GetAttributeChangedSignal("LocalSpend"):Connect(function()
+	local spend = player:GetAttribute("LocalSpend") or 0
+	if spend > 0 then
+		displayedCurrency = math.max(0, displayedCurrency - spend)
+		lastSpendTick = tick()
+		player:SetAttribute("LocalSpend", 0) -- Reset
+	end
+end)
+
+player:GetAttributeChangedSignal("LocalAuraSpend"):Connect(function()
+	local spend = player:GetAttribute("LocalAuraSpend") or 0
+	if spend > 0 then
+		liveGoldenAuras = math.max(0, liveGoldenAuras - spend)
+		player:SetAttribute("LiveGoldenAuras", liveGoldenAuras)
+		GoldenAurasLabel.Text = "GAURAS: " .. liveGoldenAuras
+		lastSpendTick = tick()
+		player:SetAttribute("LocalAuraSpend", 0)
+	end
+end)
+
+local function FormatNumber(n) return Formatter.Format(n) end
+local function FormatRate(perSecond)
+	if perSecond <= 0 then return "$0/sec" end
+	return "$" .. Formatter.Format(perSecond) .. "/sec"
+end
+local function GetRateColor(pending, capacity)
+	local ratio = math.clamp((pending or 0) / (capacity or 50), 0, 1)
+	if ratio >= 1     then return Color3.fromRGB(255, 60,  60)
+	elseif ratio >= 0.75 then return Color3.fromRGB(255, 200, 0)
+	elseif ratio >= 0.5  then return Color3.fromRGB(80,  255, 80)
+	else                      return Color3.fromRGB(80,  180, 80) end
+end
+
+local function UpdateHabitatBar(pending, capacity)
+	local ratio = math.clamp((pending or 0) / (capacity or 50), 0, 1)
+	local color = GetRateColor(pending, capacity)
+	local currentModel = HabitatHolder:FindFirstChild("HabitatModel")
+	if currentModel then
+		local currentGui = currentModel:FindFirstChild("HabitatGui")
+		local barBg = currentGui and currentGui:FindFirstChild("BarBackground")
+		local barFill = barBg and barBg:FindFirstChild("BarFill")
+		if barFill then
+			TweenService:Create(barFill, TweenInfo.new(0.3), { Size = UDim2.new(ratio, 0, 1, 0), BackgroundColor3 = color }):Play()
+		end
+	end
+end
+
+local hud        = playerGui:WaitForChild("MainHUD")
+local curr       = hud:WaitForChild("CurrencyLabel")
+local rate       = hud:WaitForChild("RateLabel")
+local sendButton = hud:WaitForChild("SendButton")
+local modeToggle = hud:WaitForChild("ModeToggle")
+
+local sharedCooldownEnd = 0
+local manualCooldownLoopID = 0
+-----------------------------------------------------------------------------
+-- ✨ NEON BLUE MANUAL BUTTON (Dark Transparent Overlay)
+-----------------------------------------------------------------------------
+local function SyncManualCooldownVisuals()
+	if isAutoMode or not sendButton.Visible then return end
+
+	local progressContainer = sendButton:FindFirstChild("CooldownProgress")
+	local fillPart = progressContainer and progressContainer:FindFirstChild("Fill")
+	local textTarget = sendButton:FindFirstChildOfClass("TextLabel") or sendButton
+
+	local uiStroke = sendButton:FindFirstChildOfClass("UIStroke") or Instance.new("UIStroke", sendButton)
+	uiStroke.Thickness = 1.5
+
+	if not fillPart then return end
+
+	sendButton.ClipsDescendants = true 
+	progressContainer.Size = UDim2.new(1, 0, 1, 0)
+	progressContainer.Position = UDim2.new(0, 0, 0, 0)
+	progressContainer.AnchorPoint = Vector2.new(0, 0)
+
+	fillPart.BorderSizePixel = 0
+	fillPart.AnchorPoint = Vector2.new(0, 1)
+	fillPart.Position = UDim2.new(0, 0, 1, 0)
+	for _, child in ipairs(fillPart:GetChildren()) do
+		if child:IsA("UICorner") or child:IsA("UIAspectRatioConstraint") or child:IsA("UIStroke") then child:Destroy() end
+	end
+
+	manualCooldownLoopID = manualCooldownLoopID + 1
+	local currentLoop = manualCooldownLoopID
+	local timeLeft = sharedCooldownEnd - tick()
+
+	-- ✨ SHADOW FIX 1: The base button is ALWAYS bright neon blue underneath!
+	sendButton.BackgroundColor3 = Color3.fromRGB(0, 160, 255)
+	uiStroke.Color = Color3.fromRGB(0, 220, 255) 
+
+	-- ✨ SHADOW FIX 2: The Fill is forced to be a black, semi-transparent shadow!
+	fillPart.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+	fillPart.BackgroundTransparency = 0.55
+
+	if timeLeft > 0 then
+		isShipOnCooldown = true
+		if textTarget ~= sendButton then sendButton.Text = "" end
+
+		task.spawn(function()
+			while timeLeft > 0 and manualCooldownLoopID == currentLoop do
+				local percentage = timeLeft / currentCooldownTime
+
+				TweenService:Create(fillPart, TweenInfo.new(0.1, Enum.EasingStyle.Linear), {
+					Size = UDim2.new(1, 0, percentage, 0)
+				}):Play()
+
+				task.wait(0.1)
+				timeLeft = sharedCooldownEnd - tick() 
+			end
+
+			if manualCooldownLoopID == currentLoop then
+				isShipOnCooldown = false
+				textTarget.Text = ""
+				fillPart.Size = UDim2.new(1, 0, 0, 0) -- Hides the shadow when ready!
+			end
+		end)
+	else
+		isShipOnCooldown = false
+		textTarget.Text = ""
+		fillPart.Size = UDim2.new(1, 0, 0, 0) -- Hides the shadow when ready!
+	end
+end
+
+-----------------------------------------------------------------------------
+-- ✨ VISIBILITY HANDLER
+-----------------------------------------------------------------------------
+local function UpdateSendButton()
+	if AdminConfig.DisableShipping then sendButton.Visible = false; return end
+	sendButton.Visible = not isAutoMode and (pendingAuras or 0) > 0
+	if sendButton.Visible then
+		SyncManualCooldownVisuals()
+	end
+end
+
+-----------------------------------------------------------------------------
+-- ✨ NEW: AUTO MODE COOLDOWN BAR SETUP (WITH STROKE & COLOR MATCHING)
+-----------------------------------------------------------------------------
+local autoProgressContainer = Instance.new("Frame")
+autoProgressContainer.Name = "AutoProgressContainer"
+autoProgressContainer.Size = UDim2.new(0, 12, 1, 0)
+autoProgressContainer.Position = UDim2.new(1, 8, 0, 0) 
+autoProgressContainer.BackgroundColor3 = Color3.fromRGB(24, 60, 24) 
+autoProgressContainer.BorderSizePixel = 0
+autoProgressContainer.Visible = false
+autoProgressContainer.Parent = modeToggle
+
+Instance.new("UICorner", autoProgressContainer).CornerRadius = UDim.new(0.5, 0)
+
+local autoStroke = Instance.new("UIStroke")
+autoStroke.Color = Color3.fromRGB(0, 255, 128) 
+autoStroke.Thickness = 1.5
+autoStroke.Parent = autoProgressContainer
+
+local autoFillClip = Instance.new("Frame")
+autoFillClip.Size = UDim2.new(1, 0, 1, 0)
+autoFillClip.BackgroundTransparency = 1
+autoFillClip.ClipsDescendants = true
+autoFillClip.Parent = autoProgressContainer
+Instance.new("UICorner", autoFillClip).CornerRadius = UDim.new(0.5, 0)
+
+local autoFill = Instance.new("Frame")
+autoFill.Name = "Fill"
+autoFill.Size = UDim2.new(1, 0, 1, 0)
+autoFill.Position = UDim2.new(0, 0, 1, 0)
+autoFill.AnchorPoint = Vector2.new(0, 1) 
+autoFill.BackgroundColor3 = Color3.fromRGB(0, 255, 128) 
+autoFill.BorderSizePixel = 0
+autoFill.Parent = autoFillClip
+
+local autoLoopID = 0
+
+-----------------------------------------------------------------------------
+-- ✨ UPDATED MODE TOGGLE VISUALS (Universal Sync)
+-----------------------------------------------------------------------------
+local function UpdateModeToggleVisuals()
+	local textLabel = modeToggle:FindFirstChildOfClass("TextLabel") or modeToggle
+	local uiStroke = modeToggle:FindFirstChildOfClass("UIStroke")
+
+	autoLoopID = autoLoopID + 1 
+	local currentLoop = autoLoopID
+
+	if isAutoMode then
+		modeToggle.BackgroundColor3 = Color3.fromRGB(24, 60, 24)
+		textLabel.Text = "[AUTO ACTIVE]"
+		textLabel.TextColor3 = Color3.fromRGB(0, 255, 128)
+		if uiStroke then uiStroke.Color = Color3.fromRGB(0, 255, 128) end
+
+		autoProgressContainer.Visible = true
+
+		task.spawn(function()
+			while isAutoMode and autoLoopID == currentLoop do
+				local timeLeft = sharedCooldownEnd - tick()
+
+				-- If the timer hits 0, it shipped! Start a fresh loop!
+				if timeLeft <= 0 then
+					sharedCooldownEnd = tick() + currentCooldownTime
+					timeLeft = currentCooldownTime
+
+					-- ✨ THE PERFECT SYNC FIX: Let the flawless UI clock trigger the truck!
+					-- If there are actually Auras in the base, send the truck instantly!
+					if (pendingAuras or 0) > 0 then
+						ShipAuras:FireServer("manual")
+					end
+				end
+
+				local percentage = timeLeft / currentCooldownTime
+				autoFill.Size = UDim2.new(1, 0, percentage, 0)
+
+				local tween = TweenService:Create(autoFill, TweenInfo.new(timeLeft, Enum.EasingStyle.Linear), {
+					Size = UDim2.new(1, 0, 0, 0)
+				})
+				tween:Play()
+
+				local elapsed = 0
+				while elapsed < timeLeft and isAutoMode and autoLoopID == currentLoop do
+					task.wait(0.1)
+					elapsed += 0.1
+				end
+
+				if tween then tween:Cancel() end
+			end
+		end)
+	else
+		modeToggle.BackgroundColor3 = Color3.fromRGB(38, 38, 45)
+		textLabel.Text = "Mode: Manual"
+		textLabel.TextColor3 = Color3.fromRGB(220, 230, 240)
+		if uiStroke then uiStroke.Color = Color3.fromRGB(100, 180, 220) end
+
+		autoProgressContainer.Visible = false
+	end
+end
+
+sendButton.MouseButton1Down:Connect(function()
+	if AdminConfig.DisableShipping then return end
+	if isAutoMode or isShipOnCooldown or (pendingAuras or 0) <= 0 then return end
+
+	ShipAuras:FireServer("manual")
+
+	-- Set the Universal Timer
+	sharedCooldownEnd = tick() + currentCooldownTime
+	SyncManualCooldownVisuals()
+end)
+
+modeToggle.MouseButton1Down:Connect(function()
+	if AdminConfig.DisableShipping then return end
+
+	isAutoMode = not isAutoMode
+	ShipAuras:FireServer("setMode", isAutoMode and "auto" or "manual")
+
+	UpdateModeToggleVisuals()
+	UpdateSendButton() 
+end)
+
+-- INITIAL SETUP
+UpdateModeToggleVisuals()
+sendButton.Visible = false
+
+if AdminConfig.DisableShipping then
+	isAutoMode         = false
+	sendButton.Visible = false
+	modeToggle.Visible = false
+end
+
+UpdateHUD.OnClientEvent:Connect(function(stats)
+	-- ✨ ROLLBACK SHIELD: Moved to the Master Controller!
+	local safeToSync = (tick() - lastSpendTick) > 0.5
+
+	if stats.goldenAuras ~= nil and safeToSync then
+		liveGoldenAuras = stats.goldenAuras
+		player:SetAttribute("LiveGoldenAuras", liveGoldenAuras)
+		GoldenAurasLabel.Text = "GAURAS: " .. liveGoldenAuras
+	end
+
+	if stats.currency ~= nil and safeToSync then
+		local newServerCurrency = stats.currency
+		if newServerCurrency < prevServerCurrency then
+			displayedCurrency = newServerCurrency
+			curr.TextColor3 = Color3.fromRGB(255, 80, 80)
+			TweenService:Create(curr, TweenInfo.new(0.3), { TextColor3 = Color3.fromRGB(255, 255, 255) }):Play()
+		elseif newServerCurrency > displayedCurrency then
+			displayedCurrency = newServerCurrency
+		end
+		prevServerCurrency = newServerCurrency
+		serverCurrency     = newServerCurrency
+	end
+
+	if stats.pendingAuras ~= nil then
+		pendingAuras    = stats.pendingAuras
+		habitatCapacity = stats.habitatCapacity or habitatCapacity
+		UpdateHabitatBar(pendingAuras, habitatCapacity)
+		UpdateSendButton()
+	end
+
+	if stats.rate ~= nil then
+		passiveInterval = stats.passiveInterval or passiveInterval
+		local serverRate = stats.rate
+		ratePerSecond = (passiveInterval > 0 and serverRate > 0) and serverRate / passiveInterval or 0
+		rate.Text = FormatRate(ratePerSecond)
+		TweenService:Create(rate, TweenInfo.new(0.3), { TextColor3 = GetRateColor(pendingAuras, habitatCapacity) }):Play()
+	end
+
+	if stats.shipCooldown ~= nil then currentCooldownTime = stats.shipCooldown end
+end)
+
+RunService.RenderStepped:Connect(function(dt)
+	if ratePerSecond > 0 then
+		displayedCurrency += ratePerSecond * dt
+	end
+	-- ✨ BROADCAST THE EXACT MATH TO THE SHOP!
+	player:SetAttribute("LiveCurrency", displayedCurrency) 
+	curr.Text = "Currency: $" .. FormatNumber(displayedCurrency)
+end)
+
+
+local function RefreshLook()
+	UITheme.ApplyFlair(GoldenAurasLabel, "GoldStroke")
+end
+
+task.wait(2)
+RefreshLook()
+
 -- ShopController
 -- Location: StarterPlayer > StarterPlayerScripts > ShopController
 
@@ -27,6 +387,7 @@ local upgradeState     = {}
 local epicUpgradeState  = {}
 local currentCurrency   = 0
 local liveGoldenAuras   = 0
+local lastSpendTick = 0 -- ✨ Tracks when we last spent money!
 local shopOpen          = false
 local activeMainTab     = "Upgrades"
 local activeEpicSubTab  = "Active"
@@ -465,7 +826,6 @@ local function BuildCard(parent, upgradeId, cfg, isEpic, cardRefsTable)
 		return false
 	end
 
-	local lastSpendTick = 0 -- ✨ Tracks when we last spent money!
 
 	local function TryBuy()
 		if isEpic then
@@ -473,11 +833,12 @@ local function BuildCard(parent, upgradeId, cfg, isEpic, cardRefsTable)
 			if not state or state.maxed then return false end 
 
 			if not IsTutorialFinished() then PlayErrorFeedback(buyButton); return false end
-			if liveGoldenAuras < state.cost then PlayErrorFeedback(buyButton); return false end
+			local currentAuras = player:GetAttribute("LiveGoldenAuras") or 0
+			if currentAuras < state.cost then PlayErrorFeedback(buyButton); return false end
 
 			local wasMaxedLocally = state.maxed
-			liveGoldenAuras -= state.cost 
-			lastSpendTick = tick() -- ✨ THE FIX: We just spent Auras!
+			player:SetAttribute("LocalAuraSpend", state.cost) -- ✨ Tell UIController to deduct!
+
 			state.level += 1
 			state.maxed = (state.level >= state.maxLevel)
 			state.cost = state.maxed and 0 or EpicUpgradeConfig.CalculateCost(upgradeId, state.level)
@@ -490,11 +851,12 @@ local function BuildCard(parent, upgradeId, cfg, isEpic, cardRefsTable)
 			if not state or state.maxed then return false end 
 
 			if not IsTutorialFinished() and upgradeId ~= "blockValue" then PlayErrorFeedback(buyButton); return false end
-			if currentCurrency < state.cost then PlayErrorFeedback(buyButton); return false end
+			local currentCash = player:GetAttribute("LiveCurrency") or 0
+			if currentCash < state.cost then PlayErrorFeedback(buyButton); return false end
 
 			local wasMaxedLocally = state.maxed
-			currentCurrency -= state.cost 
-			lastSpendTick = tick() -- ✨ THE FIX: We just spent Cash!
+			player:SetAttribute("LocalSpend", state.cost) -- ✨ Tell UIController to deduct!
+
 			state.level += 1
 			state.maxed = (state.level >= state.maxLevel)
 			state.cost = state.maxed and 0 or UpgradeConfig.CalculateCost(upgradeId, state.level)
@@ -543,8 +905,7 @@ local function BuildCard(parent, upgradeId, cfg, isEpic, cardRefsTable)
 				break
 			end
 
-			-- ✨ THE SPEED LIMIT FIX: Capped at 0.04s max speed to prevent server DDOSing!
-			task.wait(math.max(0.04, 0.2 - ((tick() - holdStart) * 0.05)))
+			task.wait(math.max(0.02, (0.15 - ((tick() - holdStart) * 0.05)) / holdSpeedMultiplier))
 		end
 
 		if pulseTween then pulseTween:Cancel() end
@@ -593,12 +954,10 @@ end
 function UpdateRegularCard(upgradeId)
 	local ref=regularCardRefs[upgradeId]; local state=upgradeState[upgradeId]
 	if not ref or not state then return end
-
-	if UITheme and UITheme.Apply then
-		UITheme.Apply(ref.frame, "ShopCard")
-	end
+	if UITheme and UITheme.Apply then UITheme.Apply(ref.frame, "ShopCard") end
 
 	ref.levelLabel.Text="Lv. "..state.level.." / "..state.maxLevel
+	local currentCash = player:GetAttribute("LiveCurrency") or 0
 
 	if state.level >= state.maxLevel then
 		ref.frame.LayoutOrder = (ref.baseOrder or 0) + 100000 
@@ -608,13 +967,11 @@ function UpdateRegularCard(upgradeId)
 		ref.buyButton.BackgroundColor3=Color3.fromRGB(100, 100, 100)
 	else
 		ref.frame.LayoutOrder = ref.baseOrder or 0 
-
-		if currentCurrency<state.cost then
-			ref.buyButton.Text="$"..FormatNumber(state.cost)
+		ref.buyButton.Text="$"..FormatNumber(state.cost)
+		if currentCash < state.cost then
 			ref.buyButton.TextColor3=Color3.fromRGB(255, 100, 100) 
 			ref.buyButton.BackgroundColor3=Color3.fromRGB(60, 170, 80) 
 		else
-			ref.buyButton.Text="$"..FormatNumber(state.cost)
 			ref.buyButton.TextColor3=Color3.fromRGB(255, 255, 255) 
 			ref.buyButton.BackgroundColor3=Color3.fromRGB(60, 170, 80) 
 		end
@@ -624,12 +981,10 @@ end
 function UpdateEpicCard(upgradeId)
 	local ref=epicCardRefs[upgradeId]; local state=epicUpgradeState[upgradeId]
 	if not ref or not state then return end
-
-	if UITheme and UITheme.Apply then
-		UITheme.Apply(ref.frame, "ShopCard")
-	end
+	if UITheme and UITheme.Apply then UITheme.Apply(ref.frame, "ShopCard") end
 
 	ref.levelLabel.Text="Lv. "..state.level.." / "..state.maxLevel
+	local currentAuras = player:GetAttribute("LiveGoldenAuras") or 0
 
 	if state.level >= state.maxLevel then
 		ref.frame.LayoutOrder = (ref.baseOrder or 0) + 100000 
@@ -639,18 +994,26 @@ function UpdateEpicCard(upgradeId)
 		ref.buyButton.BackgroundColor3=Color3.fromRGB(100, 100, 100)
 	else
 		ref.frame.LayoutOrder = ref.baseOrder or 0 
-
-		if liveGoldenAuras<state.cost then
-			ref.buyButton.Text="✦ "..FormatNumber(state.cost)
+		ref.buyButton.Text="✦ "..FormatNumber(state.cost)
+		if currentAuras < state.cost then
 			ref.buyButton.TextColor3=Color3.fromRGB(255, 100, 100) 
 			ref.buyButton.BackgroundColor3=Color3.fromRGB(150, 80, 255) 
 		else
-			ref.buyButton.Text="✦ "..FormatNumber(state.cost)
 			ref.buyButton.TextColor3=Color3.fromRGB(255, 255, 255) 
 			ref.buyButton.BackgroundColor3=Color3.fromRGB(150, 80, 255) 
 		end
 	end
 end
+
+function UpdateCurrencyDisplay()
+	if activeMainTab=="Upgrades" then
+		local currentCash = player:GetAttribute("LiveCurrency") or 0
+		CurrencyLabel.Text="$"..FormatNumber(currentCash)
+		CurrencyLabel.TextColor3=T.currencyColor
+		CurrencyLabel.Position=UDim2.new(0,12,0,HEADER_H+MAINTAB_H+8)
+	end
+end
+
 local function UpdateAllRegularCards() for id in pairs(regularCardRefs) do UpdateRegularCard(id) end end
 local function UpdateAllEpicCards() for id in pairs(epicCardRefs) do UpdateEpicCard(id) end end
 
@@ -756,12 +1119,7 @@ task.delay(1, function()
 	isLoadingData = false
 end)
 
-function UpdateCurrencyDisplay()
-	if activeMainTab=="Upgrades" then
-		CurrencyLabel.Text="$"..FormatNumber(currentCurrency); CurrencyLabel.TextColor3=T.currencyColor
-		CurrencyLabel.Position=UDim2.new(0,12,0,HEADER_H+MAINTAB_H+8)
-	end
-end
+
 
 ---------------------------------------------------------------
 -- TAB SWITCHING
@@ -820,56 +1178,19 @@ end
 ShopButton.MouseButton1Down:Connect(function() if shopOpen then CloseShop() else OpenShop() end end)
 CloseButton.MouseButton1Down:Connect(CloseShop)
 
----------------------------------------------------------------
--- CURRENCY SYNC (Rollback Shielded)
----------------------------------------------------------------
-local ratePerSecond=0
-local prevServerCurrency=0 
-local UpdateHUD=ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHUD")
 
-UpdateHUD.OnClientEvent:Connect(function(stats)
-	-- ✨ ROLLBACK SHIELD: Has it been at least 0.5 seconds since our last purchase?
-	local safeToSync = (tick() - lastSpendTick) > 0.5
-
-	if stats.currency ~= nil then
-		local newServerCurrency = stats.currency
-
-		-- Only accept the server's money count if we aren't actively spamming the buy button!
-		if safeToSync then
-			if newServerCurrency < prevServerCurrency then
-				currentCurrency = newServerCurrency
-			elseif newServerCurrency > currentCurrency then
-				currentCurrency = newServerCurrency
-			end
-		end
-		prevServerCurrency = newServerCurrency
-	end
-
-	if stats.goldenAuras ~= nil then 
-		if safeToSync then
-			liveGoldenAuras = stats.goldenAuras 
-		end
-	end
-
-	if stats.rate and stats.passiveInterval then
-		local interval=stats.passiveInterval
-		ratePerSecond=(interval>0 and stats.rate>0) and (stats.rate/interval) or 0
-	end
-end)
 
 ---------------------------------------------------------------
 -- LIVE UPDATE LOOP
 ---------------------------------------------------------------
 local lastCardUpdate=0
 RunService.Heartbeat:Connect(function(dt)
-	-- ✨ THE DESYNC FIX: Always calculate currency in the background even if shop is closed!
-	if ratePerSecond>0 then currentCurrency+=ratePerSecond*dt end
-
-	-- Stop running UI visual updates if shop is closed
+	-- No more messy math here! Just visual updates!
 	if not shopOpen then return end
 
 	local now=tick()
-	if now-lastCardUpdate>0.3 then
+	-- ✨ Faster updates! Buttons now snap red/green almost instantly
+	if now-lastCardUpdate > 0.1 then 
 		lastCardUpdate=now
 		if activeMainTab=="Upgrades" then UpdateAllRegularCards() else UpdateAllEpicCards() end
 		UpdateCurrencyDisplay()
