@@ -465,45 +465,43 @@ local function BuildCard(parent, upgradeId, cfg, isEpic, cardRefsTable)
 		return false
 	end
 
+	local lastSpendTick = 0 -- ✨ Tracks when we last spent money!
+
 	local function TryBuy()
 		if isEpic then
 			local state = epicUpgradeState[upgradeId]
-			if not state or state.maxed then return end 
+			if not state or state.maxed then return false end 
 
-			-- ✨ THE EPIC TUTORIAL LOCK (Uses Memory):
-			if not IsTutorialFinished() then
-				PlayErrorFeedback(buyButton) -- Buzz error
-				return -- Cancel the purchase!
-			end
-			-- ✨ ==========================================
+			if not IsTutorialFinished() then PlayErrorFeedback(buyButton); return false end
+			if liveGoldenAuras < state.cost then PlayErrorFeedback(buyButton); return false end
 
-			if liveGoldenAuras < state.cost then PlayErrorFeedback(buyButton); return end
-
-			local wasMaxedLocally = state.maxed; liveGoldenAuras -= state.cost; state.level += 1
+			local wasMaxedLocally = state.maxed
+			liveGoldenAuras -= state.cost 
+			lastSpendTick = tick() -- ✨ THE FIX: We just spent Auras!
+			state.level += 1
 			state.maxed = (state.level >= state.maxLevel)
 			state.cost = state.maxed and 0 or EpicUpgradeConfig.CalculateCost(upgradeId, state.level)
 
 			if state.maxed and not wasMaxedLocally then PlayFeedbackSound("MaxOut", 0.6); PlayUIBurst(buyButton, 20) else PlayPurchaseSound() end
 			UpdateEpicCard(upgradeId); UpdateCurrencyDisplay(); PurchaseEpicUpgrade:FireServer(upgradeId)
+			return true 
 		else
 			local state = upgradeState[upgradeId]
-			if not state or state.maxed then return end 
+			if not state or state.maxed then return false end 
 
-			-- ✨ THE REGULAR TUTORIAL LOCK (Uses Memory):
-			if not IsTutorialFinished() and upgradeId ~= "blockValue" then
-				PlayErrorFeedback(buyButton) -- Shake the wrong button and play error sound
-				return -- Cancel the purchase entirely!
-			end
-			-- ✨ ==========================================
+			if not IsTutorialFinished() and upgradeId ~= "blockValue" then PlayErrorFeedback(buyButton); return false end
+			if currentCurrency < state.cost then PlayErrorFeedback(buyButton); return false end
 
-			if currentCurrency < state.cost then PlayErrorFeedback(buyButton); return end
-
-			local wasMaxedLocally = state.maxed; currentCurrency -= state.cost; state.level += 1
+			local wasMaxedLocally = state.maxed
+			currentCurrency -= state.cost 
+			lastSpendTick = tick() -- ✨ THE FIX: We just spent Cash!
+			state.level += 1
 			state.maxed = (state.level >= state.maxLevel)
 			state.cost = state.maxed and 0 or UpgradeConfig.CalculateCost(upgradeId, state.level)
 
 			if state.maxed and not wasMaxedLocally then PlayFeedbackSound("MaxOut", 0.6); PlayUIBurst(buyButton, 20) else PlayPurchaseSound() end
 			UpdateRegularCard(upgradeId); UpdateCurrencyDisplay(); PurchaseUpgrade:FireServer(upgradeId)
+			return true 
 		end
 	end
 
@@ -538,9 +536,15 @@ local function BuildCard(parent, upgradeId, cfg, isEpic, cardRefsTable)
 				holdingBuy = false
 				break
 			end
-			TryBuy()
-			-- Base speed gets divided by your epic speed multiplier!
-			task.wait(math.max(0.01, (0.15 - ((tick() - holdStart) * 0.05)) / holdSpeedMultiplier))
+
+			local success = TryBuy()
+			if not success then
+				holdingBuy = false
+				break
+			end
+
+			-- ✨ THE SPEED LIMIT FIX: Capped at 0.04s max speed to prevent server DDOSing!
+			task.wait(math.max(0.04, 0.2 - ((tick() - holdStart) * 0.05)))
 		end
 
 		if pulseTween then pulseTween:Cancel() end
@@ -817,15 +821,36 @@ ShopButton.MouseButton1Down:Connect(function() if shopOpen then CloseShop() else
 CloseButton.MouseButton1Down:Connect(CloseShop)
 
 ---------------------------------------------------------------
--- CURRENCY SYNC
+-- CURRENCY SYNC (Rollback Shielded)
 ---------------------------------------------------------------
 local ratePerSecond=0
+local prevServerCurrency=0 
 local UpdateHUD=ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHUD")
+
 UpdateHUD.OnClientEvent:Connect(function(stats)
-	if stats.currency~=nil then
-		if stats.currency>currentCurrency then currentCurrency=stats.currency end
+	-- ✨ ROLLBACK SHIELD: Has it been at least 0.5 seconds since our last purchase?
+	local safeToSync = (tick() - lastSpendTick) > 0.5
+
+	if stats.currency ~= nil then
+		local newServerCurrency = stats.currency
+
+		-- Only accept the server's money count if we aren't actively spamming the buy button!
+		if safeToSync then
+			if newServerCurrency < prevServerCurrency then
+				currentCurrency = newServerCurrency
+			elseif newServerCurrency > currentCurrency then
+				currentCurrency = newServerCurrency
+			end
+		end
+		prevServerCurrency = newServerCurrency
 	end
-	if stats.goldenAuras~=nil then liveGoldenAuras=stats.goldenAuras end
+
+	if stats.goldenAuras ~= nil then 
+		if safeToSync then
+			liveGoldenAuras = stats.goldenAuras 
+		end
+	end
+
 	if stats.rate and stats.passiveInterval then
 		local interval=stats.passiveInterval
 		ratePerSecond=(interval>0 and stats.rate>0) and (stats.rate/interval) or 0
@@ -837,8 +862,12 @@ end)
 ---------------------------------------------------------------
 local lastCardUpdate=0
 RunService.Heartbeat:Connect(function(dt)
-	if not shopOpen then return end
+	-- ✨ THE DESYNC FIX: Always calculate currency in the background even if shop is closed!
 	if ratePerSecond>0 then currentCurrency+=ratePerSecond*dt end
+
+	-- Stop running UI visual updates if shop is closed
+	if not shopOpen then return end
+
 	local now=tick()
 	if now-lastCardUpdate>0.3 then
 		lastCardUpdate=now
@@ -846,7 +875,6 @@ RunService.Heartbeat:Connect(function(dt)
 		UpdateCurrencyDisplay()
 	end
 end)
-
 ---------------------------------------------------------------
 -- SERVER EVENTS (Cleaned of Sound/UI logic)
 ---------------------------------------------------------------
