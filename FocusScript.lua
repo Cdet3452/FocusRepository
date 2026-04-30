@@ -1,3 +1,260 @@
+-- ShippingManager
+-- Location: ServerScriptService > ShippingManager
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+local HttpService = game:GetService("HttpService")
+
+local AdminConfig = require(ReplicatedStorage.Modules.AdminConfig)
+local UpgradeConfig = require(ReplicatedStorage.Modules.UpgradeConfig)
+local MutationConfig = require(ReplicatedStorage.Modules.MutationConfig)
+local GameManager = require(ServerScriptService.GameManager)
+local EpicUpgradeConfig = require(ReplicatedStorage.Modules.EpicUpgradeConfig)
+local ShipAuras = ReplicatedStorage.RemoteEvents:WaitForChild("ShipAuras")
+local UpdateHUD = ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHUD")
+
+local playerTimers = {}
+local activeTrucks = {}
+local playerAutoMode = {}
+local pendingPayouts = {} -- SECURE PAYOUT STORAGE: [uid] = { [dispatchId] = amount }
+
+Players.PlayerAdded:Connect(function(player)
+	playerTimers[player.UserId] = AdminConfig.ShipInterval
+	activeTrucks[player.UserId] = 0
+	playerAutoMode[player.UserId] = AdminConfig.AutoDispatch
+	pendingPayouts[player.UserId] = {}
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	playerTimers[player.UserId] = nil
+	activeTrucks[player.UserId] = nil
+	playerAutoMode[player.UserId] = nil
+	pendingPayouts[player.UserId] = nil
+end)
+
+local function SendHUDUpdate(player)
+	local uid = player.UserId
+	local data = GameManager.GetData(uid)
+	local runtime = GameManager.GetRuntime(uid)
+	if not data or not runtime then return end
+
+	-- No more looping! Instant O(1) lookup.
+	local totalMutatedValue = runtime.totalMutatedValue
+
+	local pending = runtime.cubeCount
+	local avgValue = pending > 0 and (totalMutatedValue / pending) or AdminConfig.BaseAuraValue
+	local rate = math.floor(pending * avgValue)
+
+	local habCfg = UpgradeConfig.GetUpgradeConfig("habitatCapacity")
+	local habitatCap = (habCfg and habCfg.apply) and habCfg.apply(data) or AdminConfig.BaseHabitatCapacity
+
+	local tickCfg = UpgradeConfig.GetUpgradeConfig("passiveTickSpeed")
+	local passiveInt = (tickCfg and tickCfg.apply) and tickCfg.apply(data) or AdminConfig.PassiveInterval
+
+	-- ✨ NEW: Calculate the upgraded cooldown time
+	local shipReduction = 0
+	local shipCfg = EpicUpgradeConfig.GetUpgradeConfig("epicShipCooldown")
+	if shipCfg and shipCfg.apply then
+		shipReduction = shipCfg.apply(data)
+	end
+	local finalCooldown = math.max(1, AdminConfig.ShipInterval - shipReduction)
+
+	UpdateHUD:FireClient(player, {
+		currency        = data.currency,
+		pendingAuras    = pending,
+		habitatCapacity = habitatCap,
+		rate            = rate,
+		passiveInterval = passiveInt,
+		totalEarned     = data.totalEarned    or 0,
+		soulAuras       = data.soulAuras      or 0,
+		farmEvaluation  = data.farmEvaluation or 0,
+		shipCooldown    = finalCooldown, -- ✨ SEND TO UI!
+	})
+end
+
+local function TryDispatch(player)
+	if AdminConfig.DisableShipping then return end
+	local uid = player.UserId
+	local data = GameManager.GetData(uid)
+	local runtime = GameManager.GetRuntime(uid)
+	if not data or not runtime then return end
+	-- ✨ MAX TRUCKS FIX: Allow up to 50 queued trucks so fast upgraded cooldowns are never blocked!
+	if (activeTrucks[uid] or 0) >= 50 then return end
+	local totalCubes = runtime.cubeCount
+	if totalCubes <= 0 then return end
+
+	local toCollect = math.min(totalCubes, AdminConfig.PlatformCapacity)
+	local cubeIds, cubes = GameManager.CollectOldestCubes(uid, toCollect)
+	local collected = #cubeIds
+	if collected == 0 then return end
+
+	local totalPayout = 0
+	for _, cube in ipairs(cubes) do
+		totalPayout = totalPayout + MutationConfig.GetMutatedValue(cube)
+	end
+
+	activeTrucks[uid] = (activeTrucks[uid] or 0) + 1
+	data.totalPlatformsShipped = (data.totalPlatformsShipped or 0) + 1
+
+	-- SECURE ID GENERATION
+	local dispatchId = HttpService:GenerateGUID(false)
+	pendingPayouts[uid][dispatchId] = totalPayout
+
+	SendHUDUpdate(player)
+
+	ShipAuras:FireClient(player, {
+		collected  = collected,
+		payout     = totalPayout,
+		dispatchId = dispatchId -- Send ID to client instead of trusting it later
+	})
+end
+
+ShipAuras.OnServerEvent:Connect(function(player, action, value)
+	local uid = player.UserId
+
+	if action == "manual" then
+		TryDispatch(player)
+
+		-- ✨ SERVER FIX 1: Reset the server's auto-timer when they manually ship!
+		-- This prevents the server from accidentally double-shipping 1 second later.
+		local data = GameManager.GetData(uid)
+		local shipReduction = 0
+		if data then
+			local shipCfg = EpicUpgradeConfig.GetUpgradeConfig("epicShipCooldown")
+			if shipCfg and shipCfg.apply then shipReduction = shipCfg.apply(data) end
+		end
+		playerTimers[uid] = math.max(1, AdminConfig.ShipInterval - shipReduction)
+		return
+	end
+
+	if action == "setMode" then
+		playerAutoMode[uid] = (value == "auto")
+		-- ✨ SERVER FIX 2: We REMOVED the timer reset here! 
+		-- Now the server perfectly preserves the exact time left, just like the UI!
+		return
+	end
+
+	if action == "payout" then
+		if player:GetAttribute("TutorialFrozen") then return end
+		local data = GameManager.GetData(uid)
+		if not data then return end
+
+		-- SECURITY CHECK: value is now the dispatchId, NOT the money amount
+		local dispatchId = value
+		local actualPayout = pendingPayouts[uid] and pendingPayouts[uid][dispatchId]
+
+		if not actualPayout then 
+			warn("[Security] Player " .. player.Name .. " attempted invalid platform payout.")
+			return 
+		end
+
+		-- Clear the memory so it can't be fired twice
+		pendingPayouts[uid][dispatchId] = nil
+
+		activeTrucks[uid] = math.max(0, (activeTrucks[uid] or 1) - 1)
+		data.currency       = (data.currency or 0)       + actualPayout
+		data.totalEarned    = (data.totalEarned or 0)    + actualPayout
+		data.farmEvaluation = (data.farmEvaluation or 0) + actualPayout
+
+		SendHUDUpdate(player)
+	end
+end)
+
+-- PassiveIncome
+-- Location: ServerScriptService > PassiveIncome
+-- CHANGE: farmEvaluation now included in UpdateHUD payload so client
+--         gets the real value on every passive tick without waiting for AreaUpdated.
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local AdminConfig = require(ReplicatedStorage.Modules.AdminConfig)
+local UpgradeConfig = require(ReplicatedStorage.Modules.UpgradeConfig)
+local MutationConfig = require(ReplicatedStorage.Modules.MutationConfig)
+local GameManager = require(ServerScriptService.GameManager)
+
+local UpdateHUD = ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHUD")
+
+if script:GetAttribute("Running") then script:Destroy() return end
+script:SetAttribute("Running", true)
+
+local function GetPassiveInterval(data)
+	local cfg = UpgradeConfig.GetUpgradeConfig("passiveTickSpeed")
+	if cfg and cfg.apply then return cfg.apply(data) end
+	return AdminConfig.PassiveInterval
+end
+
+local function GetHabitatCapacity(data)
+	local cfg = UpgradeConfig.GetUpgradeConfig("habitatCapacity")
+	if cfg and cfg.apply then return cfg.apply(data) end
+	return AdminConfig.BaseHabitatCapacity
+end
+
+local playerTimers = {}
+
+Players.PlayerAdded:Connect(function(p) playerTimers[p.UserId] = 0 end)
+Players.PlayerRemoving:Connect(function(p) playerTimers[p.UserId] = nil end)
+
+while true do
+	task.wait(0.5)
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player:GetAttribute("TutorialFrozen") then continue end
+		local uid = player.UserId
+		local data = GameManager.GetData(uid)
+		local runtime = GameManager.GetRuntime(uid)
+		if not data or not runtime then continue end
+		if runtime.cubeCount <= 0 then continue end
+
+		local interval = GetPassiveInterval(data)
+		playerTimers[uid] = (playerTimers[uid] or 0) + 0.5
+
+		if playerTimers[uid] >= interval then
+			playerTimers[uid] = 0
+
+			-- No more looping! Instant O(1) lookup.
+			local totalMutatedValue = runtime.totalMutatedValue
+
+			local passiveEarned = math.floor(totalMutatedValue)
+			if passiveEarned <= 0 then continue end
+
+			data.currency       = (data.currency or 0)       + passiveEarned
+			data.totalEarned    = (data.totalEarned or 0)    + passiveEarned
+			data.farmEvaluation = (data.farmEvaluation or 0) + passiveEarned
+
+			local habitatCap = GetHabitatCapacity(data)
+			local pending = runtime.cubeCount
+			local avgValue = pending > 0 and (totalMutatedValue / pending) or AdminConfig.BaseAuraValue
+			local rate = math.floor(pending * avgValue)
+
+			UpdateHUD:FireClient(player, {
+				currency        = data.currency,
+				pendingAuras    = pending,
+				habitatCapacity = habitatCap,
+				rate            = rate,
+				passiveInterval = interval,
+				totalEarned     = data.totalEarned     or 0,
+				soulAuras       = data.soulAuras       or 0,
+				farmEvaluation  = data.farmEvaluation  or 0,  -- ADDED
+			})
+		end
+	end
+end
+
+-- Put this at the very bottom of ServerScriptService > PassiveIncome
+local RemoteEvents = game:GetService("ReplicatedStorage"):WaitForChild("RemoteEvents")
+local TutorialFreeze = RemoteEvents:FindFirstChild("TutorialFreeze")
+
+-- If the event doesn't exist yet, create it automatically!
+if not TutorialFreeze then
+	TutorialFreeze = Instance.new("RemoteEvent")
+	TutorialFreeze.Name = "TutorialFreeze"
+	TutorialFreeze.Parent = RemoteEvents
+end
+
+TutorialFreeze.OnServerEvent:Connect(function(player, isFrozen)
+	player:SetAttribute("TutorialFrozen", isFrozen)
+end)
+
 -- UIController
 -- Location: StarterPlayer > StarterPlayerScripts > UIController
 -- FIX: Habitat bar no longer resets to 0 when a partial UpdateHUD fires
@@ -92,6 +349,25 @@ local modeToggle = hud:WaitForChild("ModeToggle")
 
 local sharedCooldownEnd = 0
 local manualCooldownLoopID = 0
+
+player:GetAttributeChangedSignal("LocalSpend"):Connect(function()
+	local spend = player:GetAttribute("LocalSpend") or 0
+	if spend > 0 then
+		displayedCurrency = math.max(0, displayedCurrency - spend)
+		lastSpendTick = tick() -- Activate Rollback Shield!
+		player:SetAttribute("LocalSpend", 0)
+	end
+end)
+
+player:GetAttributeChangedSignal("LocalAuraSpend"):Connect(function()
+	local spend = player:GetAttribute("LocalAuraSpend") or 0
+	if spend > 0 then
+		liveGoldenAuras = math.max(0, (liveGoldenAuras or 0) - spend)
+		GoldenAurasLabel.Text = "GAURAS: " .. liveGoldenAuras
+		lastSpendTick = tick() -- Activate Rollback Shield!
+		player:SetAttribute("LocalAuraSpend", 0)
+	end
+end)
 -----------------------------------------------------------------------------
 -- ✨ NEON BLUE MANUAL BUTTON (Dark Transparent Overlay)
 -----------------------------------------------------------------------------
@@ -301,30 +577,41 @@ if AdminConfig.DisableShipping then
 end
 
 UpdateHUD.OnClientEvent:Connect(function(stats)
-	-- ✨ ROLLBACK SHIELD: Moved to the Master Controller!
-	local safeToSync = (tick() - lastSpendTick) > 0.5
+	-- Shield the UI from laggy server updates for 1.0s after buying an item
+	local safeToSync = (tick() - lastSpendTick) > 1.0 
 
 	if stats.goldenAuras ~= nil and safeToSync then
 		liveGoldenAuras = stats.goldenAuras
-		player:SetAttribute("LiveGoldenAuras", liveGoldenAuras)
 		GoldenAurasLabel.Text = "GAURAS: " .. liveGoldenAuras
 	end
 
-	if stats.currency ~= nil and safeToSync then
+	if stats.currency ~= nil then
 		local newServerCurrency = stats.currency
-		if newServerCurrency < prevServerCurrency then
-			displayedCurrency = newServerCurrency
-			curr.TextColor3 = Color3.fromRGB(255, 80, 80)
-			TweenService:Create(curr, TweenInfo.new(0.3), { TextColor3 = Color3.fromRGB(255, 255, 255) }):Play()
-		elseif newServerCurrency > displayedCurrency then
-			displayedCurrency = newServerCurrency
+
+		if safeToSync then
+			-- Calculate how far out of sync the UI is from the Server
+			local drift = math.abs(newServerCurrency - displayedCurrency)
+
+			-- ✨ DRIFT CATCHER: If an Admin command gives you money, or you prestige, SNAP instantly!
+			if drift > (ratePerSecond * 3) + 10 then 
+				displayedCurrency = newServerCurrency
+
+				-- Flash green if we got rich, red if we went broke
+				if newServerCurrency > prevServerCurrency then
+					curr.TextColor3 = Color3.fromRGB(80, 255, 80)
+				else
+					curr.TextColor3 = Color3.fromRGB(255, 80, 80)
+				end
+				TweenService:Create(curr, TweenInfo.new(0.4), { TextColor3 = Color3.fromRGB(255, 255, 255) }):Play()
+			end
 		end
+
 		prevServerCurrency = newServerCurrency
-		serverCurrency     = newServerCurrency
+		serverCurrency = newServerCurrency
 	end
 
 	if stats.pendingAuras ~= nil then
-		pendingAuras    = stats.pendingAuras
+		pendingAuras = stats.pendingAuras
 		habitatCapacity = stats.habitatCapacity or habitatCapacity
 		UpdateHabitatBar(pendingAuras, habitatCapacity)
 		UpdateSendButton()
@@ -333,6 +620,7 @@ UpdateHUD.OnClientEvent:Connect(function(stats)
 	if stats.rate ~= nil then
 		passiveInterval = stats.passiveInterval or passiveInterval
 		local serverRate = stats.rate
+		-- Calculate the smooth tick rate for the visual counter
 		ratePerSecond = (passiveInterval > 0 and serverRate > 0) and serverRate / passiveInterval or 0
 		rate.Text = FormatRate(ratePerSecond)
 		TweenService:Create(rate, TweenInfo.new(0.3), { TextColor3 = GetRateColor(pendingAuras, habitatCapacity) }):Play()
@@ -341,20 +629,24 @@ UpdateHUD.OnClientEvent:Connect(function(stats)
 	if stats.shipCooldown ~= nil then currentCooldownTime = stats.shipCooldown end
 end)
 
+-----------------------------------------------------------------------------
+-- ✨ 3. THE VISUAL TICKER
+-----------------------------------------------------------------------------
 RunService.RenderStepped:Connect(function(dt)
+	-- Because the PassiveIncome script officially awards this, we smoothly tick it up visually!
 	if ratePerSecond > 0 then
 		displayedCurrency += ratePerSecond * dt
 	end
-	-- ✨ BROADCAST THE EXACT MATH TO THE SHOP!
+
+	-- Broadcast the flawless math to the Shop!
 	player:SetAttribute("LiveCurrency", displayedCurrency) 
+	player:SetAttribute("LiveGoldenAuras", liveGoldenAuras)
 	curr.Text = "Currency: $" .. FormatNumber(displayedCurrency)
 end)
-
 
 local function RefreshLook()
 	UITheme.ApplyFlair(GoldenAurasLabel, "GoldStroke")
 end
-
 task.wait(2)
 RefreshLook()
 
@@ -1321,3 +1613,1219 @@ end
 
 task.wait(2)
 RefreshLook()
+
+-- AuraSpawner
+-- Location: ServerScriptService > AuraSpawner
+-- FIX: areaMult now reads from AreaRegistry.GetMultiplier() — the authoritative source.
+--      AdminConfig.AreaValueMultipliers is no longer used here.
+local Players             = game:GetService("Players")
+local ReplicatedStorage   = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local TierConfig     = require(ReplicatedStorage.Modules.TierConfig)
+local UpgradeConfig  = require(ReplicatedStorage.Modules.UpgradeConfig)
+local PrestigeModule = require(ReplicatedStorage.Modules.PrestigeModule)
+local AdminConfig    = require(ReplicatedStorage.Modules.AdminConfig)
+local MutationConfig = require(ReplicatedStorage.Modules.MutationConfig)
+local AreaRegistry   = require(ReplicatedStorage.Modules.AreaRegistry)
+local GameManager    = require(ServerScriptService.GameManager)
+local BoostManager   = require(ServerScriptService.BoostManager)
+local WeatherManager = require(ServerScriptService.WeatherManager) 
+
+local AuraSpawned    = ReplicatedStorage.RemoteEvents:WaitForChild("AuraSpawned")
+local ProduceAura    = ReplicatedStorage.RemoteEvents:WaitForChild("ProduceAura")
+local UpdateHatchery = ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHatchery")
+local UpdateHUD      = ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHUD")
+local HabitatFull    = ReplicatedStorage.RemoteEvents:WaitForChild("HabitatFull")
+local CubeMutated    = ReplicatedStorage.RemoteEvents:WaitForChild("CubeMutated")
+
+local HABITAT_HOLDER = workspace:WaitForChild("HabitatHolder")
+local HABITAT_PART = HABITAT_HOLDER:WaitForChild("Position")
+local lastFire          = {}
+local holdStart         = {}
+local hatchery          = {}
+local clickSessionStart = {}
+local function GetHatcheryMax(data)
+	local cfg = UpgradeConfig.GetUpgradeConfig("hatcheryCapacity")
+	return (cfg and cfg.apply) and cfg.apply(data) or AdminConfig.HatcheryMax
+end
+
+local function GetHabitatCapacity(data)
+	local cfg = UpgradeConfig.GetUpgradeConfig("habitatCapacity")
+	return (cfg and cfg.apply) and cfg.apply(data) or AdminConfig.BaseHabitatCapacity
+end
+
+local function GetMutationSpeedMult(data)
+	local cfg = UpgradeConfig.GetUpgradeConfig("mutationSpeed")
+	return (cfg and cfg.apply) and cfg.apply(data) or 1
+end
+
+Players.PlayerAdded:Connect(function(p)
+	hatchery[p.UserId] = AdminConfig.HatcheryMax
+	clickSessionStart[p.UserId] = nil
+end)
+Players.PlayerRemoving:Connect(function(p)
+	hatchery[p.UserId]=nil; holdStart[p.UserId]=nil
+	lastFire[p.UserId]=nil; clickSessionStart[p.UserId]=nil
+end)
+
+task.spawn(function()
+	local PR = ServerScriptService:WaitForChild("PrestigeReset", 30)
+	if PR then
+		PR.Event:Connect(function(player)
+			local uid = player.UserId
+			local data = GameManager.GetData(uid)
+			hatchery[uid] = data and GetHatcheryMax(data) or AdminConfig.HatcheryMax
+			holdStart[uid]=nil; lastFire[uid]=nil; clickSessionStart[uid]=nil
+		end)
+	end
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(0.1)
+		for _, player in ipairs(Players:GetPlayers()) do
+			local uid = player.UserId
+			local data = GameManager.GetData(uid)
+			local hatchMax = data and GetHatcheryMax(data) or AdminConfig.HatcheryMax
+			local prev = hatchery[uid] or hatchMax
+			if holdStart[uid] then
+				hatchery[uid] = math.max(0, prev - AdminConfig.HatcheryDrainRate * 0.1)
+			else
+				hatchery[uid] = math.min(hatchMax, prev + AdminConfig.HatcheryRefillRate * 0.1)
+			end
+			if hatchery[uid] ~= prev then
+				UpdateHatchery:FireClient(player, { current=hatchery[uid], max=hatchMax })
+			end
+			if hatchery[uid] <= 0 and holdStart[uid] then
+				holdStart[uid] = nil
+				ReplicatedStorage.RemoteEvents.ForceStopHold:FireClient(player)
+			end
+		end
+	end
+end)
+
+local function GetAFKSpeed(runtime)
+	local idleTime = tick() - runtime.lastActiveTime
+	local speed = MutationConfig.AFKDecay[1].speed
+	for _, e in ipairs(MutationConfig.AFKDecay) do
+		if idleTime >= e.time then speed = e.speed end
+	end
+	return speed
+end
+
+local function SendHUDUpdate(player)
+	local uid = player.UserId
+	local data = GameManager.GetData(uid)
+	local runtime = GameManager.GetRuntime(uid)
+	if not data or not runtime then return end
+	local totalMV = runtime.totalMutatedValue or 0
+	local pending = runtime.cubeCount
+	local avgVal  = pending > 0 and (totalMV/pending) or AdminConfig.BaseAuraValue
+	local rate    = math.floor(pending * avgVal)
+	local passTickCfg = UpgradeConfig.GetUpgradeConfig("passiveTickSpeed")
+	
+	local passInt = (passTickCfg and passTickCfg.apply) and passTickCfg.apply(data) or AdminConfig.PassiveInterval
+	local displayRate = math.floor(rate * BoostManager.GetValueMultiplier(uid) * BoostManager.GetSpawnRateMultiplier(uid))
+	UpdateHUD:FireClient(player, {
+		currency=data.currency, pendingAuras=pending,
+		habitatCapacity=GetHabitatCapacity(data), rate=displayRate,
+		passiveInterval=passInt, totalEarned=data.totalEarned or 0,
+		soulAuras=data.soulAuras or 0, farmEvaluation=data.farmEvaluation or 0,
+		goldenAuras=data.goldenAuras or 0, boostInventory=data.boostInventory or {},
+		prestigeCount=data.prestigeCount or 0,
+		upgrades=data.upgrades or {},
+		totalCubesProduced = data.totalCubesProduced or 0,
+		currentArea        = data.currentArea or 1,
+	})
+end
+
+task.spawn(function()
+	while true do
+		local tickInterval = AdminConfig.MutationTickInterval or MutationConfig.CheckInterval
+		task.wait(tickInterval)
+		for _, player in ipairs(Players:GetPlayers()) do
+			local uid = player.UserId
+			local data = GameManager.GetData(uid)
+			local runtime = GameManager.GetRuntime(uid)
+			if not data or not runtime then continue end
+
+			local dt = tickInterval * GetAFKSpeed(runtime) * GetMutationSpeedMult(data) * (AdminConfig.MutationSpeedMultiplier or 1)
+
+			-- 1. Initialize our batch for this specific tick
+			local mutationBatch = {}
+
+			for cubeId, cube in pairs(runtime.cubes) do
+				-- 2. Store the value before any mutations happen
+				local oldMutatedValue = MutationConfig.GetMutatedValue(cube)
+				local mutated = false
+
+				local prev = cube.effectiveElapsed
+				cube.effectiveElapsed += dt
+				local pl = MutationConfig.GetValueBonusLevel(prev)
+				local nl = MutationConfig.GetValueBonusLevel(cube.effectiveElapsed)
+
+				if nl > pl then
+					mutated = true
+					local be = MutationConfig.ValueBonuses[nl]
+					-- Add to batch instead of firing immediately
+					table.insert(mutationBatch, { 
+						cubeId = cubeId, 
+						mutationType = "valueBonus",
+						bonusLevel = nl, 
+						bonusPercent = be and math.floor(be.bonus * 100) or 0 
+					})
+				end
+
+				local maxTier = AdminConfig.MutationMaxTierIndex or 3
+				local upgrades = 0
+
+				while cube.tierIndex < maxTier and cube.tierIndex < #TierConfig.Tiers and upgrades < 5 do
+					local timeSince = cube.effectiveElapsed - (cube.lastUpgradeElapsed or 0)
+					local bestChance, bestTime = 0, 0
+
+					for _, threshold in ipairs(MutationConfig.TierUpgrades) do
+						if timeSince >= threshold.time then 
+							bestChance = threshold.chance
+							bestTime = threshold.time 
+						end
+					end
+
+					if bestChance <= 0 then break end
+
+					if math.random() <= bestChance then
+						local oldTier = TierConfig.Tiers[cube.tierIndex]
+						cube.tierIndex += 1
+						local newTier = TierConfig.Tiers[cube.tierIndex]
+
+						cube.baseValue = math.floor(cube.baseValue * (newTier.multiplier/oldTier.multiplier))
+						cube.color = newTier.color
+						cube.glow = newTier.glow
+						cube.tierName = newTier.name
+						cube.lastUpgradeElapsed = (cube.lastUpgradeElapsed or 0) + bestTime
+						upgrades += 1
+						mutated = true
+
+						-- Add to batch instead of firing immediately
+						table.insert(mutationBatch, { 
+							cubeId = cubeId, 
+							mutationType = "tierUpgrade",
+							newColor = newTier.color, 
+							newGlow = newTier.glow, 
+							tierName = newTier.name 
+						})
+
+						if newTier.name == "Legendary" then
+							data.totalLegendaryCubes = (data.totalLegendaryCubes or 0) + 1
+						end
+					else 
+						break 
+					end
+				end
+
+				-- 3. Calculate the delta and apply it to the running total
+				if mutated then
+					local newMutatedValue = MutationConfig.GetMutatedValue(cube)
+					runtime.totalMutatedValue = (runtime.totalMutatedValue or 0) + (newMutatedValue - oldMutatedValue)
+				end
+			end
+
+			-- 4. Send the entire batch in ONE RemoteEvent
+			if #mutationBatch > 0 then
+				ReplicatedStorage.RemoteEvents.CubeMutatedBatch:FireClient(player, mutationBatch)
+			end
+
+			SendHUDUpdate(player)
+		end
+	end
+end)
+
+local function GetHoldMultiplier(holdTime, data)
+	local upgrades = data and data.upgrades or {}
+
+	-- Extract speed level
+	local speedData = upgrades["multiplierSpeed"]
+	local speedLevel = (typeof(speedData) == "table" and speedData.level) or (typeof(speedData) == "number" and speedData) or 0
+	local playerMultSpeed = 1.0 + (speedLevel * 0.05)
+
+	-- Extract Mythic Unlock (Tier 6)
+	local playerMaxTier = 5
+	local mythicData = upgrades["unlockMythicMult"]
+	local mythicLevel = (typeof(mythicData) == "table" and mythicData.level) or (typeof(mythicData) == "number" and mythicData) or 0
+	if mythicLevel > 0 then playerMaxTier = 6 end
+
+	local effectiveTime = holdTime * playerMultSpeed
+	local currentTier = 1
+
+	for i = 1, playerMaxTier do
+		if AdminConfig.MilestoneData[i] and effectiveTime >= AdminConfig.MilestoneData[i].time then
+			currentTier = i
+		end
+	end
+
+	-- Smooth Math to perfectly match the client
+	local nextTier = math.min(currentTier + 1, playerMaxTier)
+	if currentTier == playerMaxTier then
+		return AdminConfig.MilestoneData[currentTier].mult, AdminConfig.MilestoneData[currentTier].luck
+	end
+
+	local timePassed = effectiveTime - AdminConfig.MilestoneData[currentTier].time
+	local timeNeeded = AdminConfig.MilestoneData[nextTier].time - AdminConfig.MilestoneData[currentTier].time
+	local ratio = timePassed / timeNeeded
+
+	local cMult = AdminConfig.MilestoneData[currentTier].mult
+	local nMult = AdminConfig.MilestoneData[nextTier].mult
+	local smoothMult = cMult + ((nMult - cMult) * ratio)
+
+	return smoothMult, AdminConfig.MilestoneData[currentTier].luck
+end
+
+local function RollWithLuck(luckBonus)
+	local tiers = TierConfig.Tiers
+	local adjusted, total = {}, 0
+	for _, tier in ipairs(tiers) do
+		local chance = tier.chance
+		if tier.name ~= "Common" then chance += luckBonus/(#tiers-1) end
+		table.insert(adjusted, { tier=tier, chance=chance }); total += chance
+	end
+	local r, cum = math.random()*total, 0
+	for _, e in ipairs(adjusted) do
+		cum += e.chance; if r <= cum then return e.tier end
+	end
+	return tiers[1]
+end
+
+local function SpawnAura(player, data, runtime, holdMult, luckBonus)
+	local uid  = player.UserId
+	local tier = RollWithLuck(luckBonus)
+	local tierIndex = 1
+	for i, t in ipairs(TierConfig.Tiers) do if t.name == tier.name then tierIndex=i; break end end
+
+	-- ✨ THE ADDITIVE MATH FIX: Gather ALL Value Upgrades!
+	local totalValueMultiplier = 1.0 -- Starts at 100% base value
+	local valueUpgrades = {
+		"blockValue", "blockValueT2", "auraValueT3", 
+		"auraValueT4", "auraValueT6", "auraValueT8", "auraValueT10"
+	}
+
+	for _, upgradeId in ipairs(valueUpgrades) do
+		local cfg = UpgradeConfig.GetUpgradeConfig(upgradeId)
+		if cfg and cfg.apply then
+			totalValueMultiplier += cfg.apply(data) -- Additively stack the percentages!
+		end
+	end
+
+	local prestigeMult    = PrestigeModule.GetMultiplier(data.soulAuras)
+	local areaMult        = AreaRegistry.GetMultiplier(data.currentArea or 1)
+	local boostValueMult  = BoostManager.GetValueMultiplier(uid)
+	local _, weatherValueMult = WeatherManager.GetMultipliers(uid)
+
+	-- Apply the strictly additive totalValueMultiplier
+	local baseValue  = math.floor(AdminConfig.BaseAuraValue * tier.multiplier * totalValueMultiplier * prestigeMult * areaMult * boostValueMult * weatherValueMult)
+	local totalValue = baseValue + math.floor(baseValue * (holdMult - 1))
+
+	local spawnPos = HABITAT_PART.Position + Vector3.new(math.random(-3,3), 10, math.random(-3,3))	
+	local cubeRecord = {
+		spawnTime=tick(), effectiveElapsed=0, lastUpgradeElapsed=0,
+		baseValue=totalValue, tierIndex=tierIndex,
+		tierName=tier.name, color=tier.color, glow=tier.glow,
+	}
+	if AdminConfig.MutationInstantMax then
+		local mb = MutationConfig.ValueBonuses[#MutationConfig.ValueBonuses]
+		if mb then cubeRecord.effectiveElapsed = mb.time + 1 end
+	end
+
+	local cubeId = GameManager.AddCube(uid, cubeRecord)
+	if not cubeId then return end
+	data.totalCubesProduced = (data.totalCubesProduced or 0) + 1
+	if tier.name == "Legendary" then data.totalLegendaryCubes = (data.totalLegendaryCubes or 0) + 1 end
+	runtime.lastActiveTime = tick()
+
+	AuraSpawned:FireClient(player, {
+		cubeId=cubeId, tier=tier.name, color=tier.color,
+		glow=tier.glow, value=totalValue, spawnPos=spawnPos,
+	})
+end
+
+ProduceAura.OnServerEvent:Connect(function(player, action)
+	local uid = player.UserId
+	local now = tick()
+	if action == "start" then if (hatchery[uid] or 0) > 0 then holdStart[uid]=now end; return end
+	if action == "stop"  then holdStart[uid]=nil; return end
+	if (hatchery[uid] or 0) <= 0 then return end
+	if not holdStart[uid] then return end
+
+	local rushMult = BoostManager.GetSpawnRateMultiplier(uid)
+	local weatherSpawnMult, _ = WeatherManager.GetMultipliers(uid)
+
+		-- ClickHandler
+-- Location: StarterPlayer > StarterPlayerScripts > ClickHandler
+-- CHANGES: Added local FormatNumber (K/M/B/T/Q)
+--          ShowCubeValue: label.Text now uses FormatNumber instead of tostring
+--          Everything else identical to your uploaded script.
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local Debris = game:GetService("Debris")
+local AdminConfig = require(ReplicatedStorage.Modules.AdminConfig)
+local UITheme = require(game:GetService("ReplicatedStorage").Modules.UITheme)
+
+local ProduceAura = ReplicatedStorage.RemoteEvents:WaitForChild("ProduceAura")
+local AuraSpawned = ReplicatedStorage.RemoteEvents:WaitForChild("AuraSpawned")
+local UpdateHatchery = ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHatchery")
+local ForceStopHold = ReplicatedStorage.RemoteEvents:WaitForChild("ForceStopHold")
+local HabitatFull = ReplicatedStorage.RemoteEvents:WaitForChild("HabitatFull")
+local CubeMutated = ReplicatedStorage.RemoteEvents:WaitForChild("CubeMutated")
+local UpdateMultiplier = ReplicatedStorage:WaitForChild("UpdateMultiplier")
+local HabitatFullEvent = ReplicatedStorage:WaitForChild("HabitatFullEvent")
+local CubeMutatedBatch = ReplicatedStorage.RemoteEvents:WaitForChild("CubeMutatedBatch")
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local holding = false
+local fireRate = AdminConfig.FireRate
+local holdStart = nil
+local hatcheryEmpty = false
+local habitatFull = false
+
+local ClickButton = playerGui:WaitForChild("MainHUD"):WaitForChild("ClickButton")
+local HatcheryBar = playerGui:WaitForChild("MainHUD"):WaitForChild("HatcheryBar")
+local HatcheryFill = HatcheryBar:WaitForChild("Fill")
+local HatcheryLabel = HatcheryBar:WaitForChild("Label")
+local clickScale = ClickButton:FindFirstChildOfClass("UIScale") or Instance.new("UIScale", ClickButton)
+local clickStroke = ClickButton:FindFirstChildOfClass("UIStroke") or Instance.new("UIStroke", ClickButton)
+clickStroke.Color = Color3.fromRGB(255, 215, 0) -- Pure Gold
+clickStroke.Thickness = 0
+local basePos = ClickButton.Position
+local tiltSide = 1
+
+-- ✨ MILESTONE SYSTEM SETUP
+local Camera = workspace.CurrentCamera
+local defaultFOV = 70 -- Standard Roblox camera FOV
+local lastMilestone = 1
+
+local MilestoneData = AdminConfig.MilestoneData
+
+local playerMultSpeed = 1.0 -- Increased by "Synaptic Overdrive" upgrade
+local playerMaxTier = 5     -- Increased by "Epic Core Resonance" tier unlock upgrade
+local lastTierIndex = 1
+-- ADDED: FormatNumber so cube value popups show K/M instead of raw numbers
+local function FormatNumber(n)
+	n = math.floor(n or 0)
+	if n >= 1e15 then return string.format("%.3f Q", n / 1e15)
+	elseif n >= 1e12 then return string.format("%.3f T", n / 1e12)
+	elseif n >= 1e9  then return string.format("%.3f B", n / 1e9)
+	elseif n >= 1e6  then return string.format("%.3f M", n / 1e6)
+	elseif n >= 1e3  then return string.format("%.1fK", n / 1e3)
+	end
+	local s = tostring(n)
+	local result = ""
+	local count = 0
+	for i = #s, 1, -1 do
+		if count > 0 and count % 3 == 0 then result = "," .. result end
+		result = s:sub(i, i) .. result
+		count += 1
+	end
+	return result
+end	
+
+---------------------------------------------------------------
+-- AURA MODEL FOLDERS
+---------------------------------------------------------------
+local AurasFolder = ReplicatedStorage:FindFirstChild("Auras")
+local VFXFolder = ReplicatedStorage:FindFirstChild("VFX")
+
+local cubeDataMap = {}
+
+local TierScale = {
+	Common    = 1.0,
+	Uncommon  = 1.15,
+	Rare      = 1.3,
+	Epic      = 1.5,
+	Legendary = 1.75,
+}
+
+local function CloneAuraModel(tierName)
+	if not AurasFolder then return nil end
+	local template = AurasFolder:FindFirstChild(tierName)
+	if not template then return nil end
+	local clone = template:Clone()
+	if not clone.PrimaryPart then
+		warn("[Aura] Model '" .. tierName .. "' has no PrimaryPart set! Set PrimaryPart to the main BasePart (e.g. " .. tierName .. "VFX) for reliable positioning.")
+	end
+	return clone
+end
+
+local function CreatePlaceholderPart(color, glow)
+	local part = Instance.new("Part")
+	part.Size = Vector3.new(1.5, 1.5, 1.5)
+	part.Color = color
+	part.Anchored = false
+	part.CastShadow = false
+	part.Material = Enum.Material.Neon
+	if glow then
+		local light = Instance.new("PointLight")
+		light.Brightness = 3
+		light.Range = 8
+		light.Color = color
+		light.Parent = part
+	end
+	return part
+end
+
+local function SpawnAuraInstance(tierName, color, glow, position)
+	local auraModel = CloneAuraModel(tierName)
+	if auraModel then
+		auraModel:PivotTo(CFrame.new(position))
+		auraModel.Parent = workspace
+		if auraModel.PrimaryPart then
+			auraModel.PrimaryPart.Anchored = false
+			auraModel.PrimaryPart.CanCollide = true
+		end
+		return auraModel, true
+	else
+		local part = CreatePlaceholderPart(color, glow)
+		part.Position = position
+		part.Parent = workspace
+		return part, false
+	end
+end
+
+local function GetRootPart(instance)
+	if instance:IsA("Model") then
+		return instance.PrimaryPart or instance:FindFirstChildWhichIsA("BasePart")
+	end
+	return instance
+end
+
+local function ScaleAura(instance, tierName, animated, fromTierName)
+	local targetScale = TierScale[tierName] or 1.0
+	local fromScale = fromTierName and (TierScale[fromTierName] or 1.0) or nil
+
+	if instance:IsA("Model") then
+		if fromScale and animated then
+			pcall(function() instance:ScaleTo(fromScale) end)
+		end
+		if animated then
+			local root = instance.PrimaryPart or instance:FindFirstChildWhichIsA("BasePart")
+			if root and root:IsA("BasePart") then
+				local currentSize = root.Size
+				local ratio = targetScale / (fromScale or targetScale)
+				local targetSize = currentSize * ratio
+				TweenService:Create(root, TweenInfo.new(0.6, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+					Size = targetSize
+				}):Play()
+			end
+		else
+			pcall(function() instance:ScaleTo(targetScale) end)
+		end
+	elseif instance:IsA("BasePart") then
+		local baseSize = 1.5
+		local targetSize = Vector3.new(1, 1, 1) * (baseSize * targetScale)
+		if animated then
+			if fromScale then
+				instance.Size = Vector3.new(1, 1, 1) * (baseSize * fromScale)
+			end
+			TweenService:Create(instance, TweenInfo.new(0.6, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+				Size = targetSize
+			}):Play()
+		else
+			instance.Size = targetSize
+		end
+	end
+end
+
+---------------------------------------------------------------
+-- VFX SYSTEM
+---------------------------------------------------------------
+local function PlayVFX(effectName, position, duration)
+	if not VFXFolder then return end
+	local template = VFXFolder:FindFirstChild(effectName)
+	if not template then return end
+
+	local vfx = template:Clone()
+
+	if vfx:IsA("Model") then
+		vfx:PivotTo(CFrame.new(position))
+	elseif vfx:IsA("BasePart") then
+		vfx.Position = position
+	end
+
+	for _, obj in ipairs(vfx:GetDescendants()) do
+		if obj:IsA("BasePart") then
+			obj.Anchored = true
+			obj.Transparency = 1
+			obj.CanCollide = false
+			obj.CastShadow = false
+		end
+	end
+	if vfx:IsA("BasePart") then
+		vfx.Anchored = true
+		vfx.Transparency = 1
+		vfx.CanCollide = false
+		vfx.CastShadow = false
+	end
+
+	vfx.Parent = workspace
+
+	for _, emitter in ipairs(vfx:GetDescendants()) do
+		if emitter:IsA("ParticleEmitter") then
+			emitter.Enabled = true
+		end
+	end
+	for _, emitter in ipairs(vfx:GetDescendants()) do
+		if emitter:IsA("ParticleEmitter") then
+			emitter:Emit(emitter:GetAttribute("BurstCount") or 15)
+		end
+	end
+
+	task.delay((duration or 1.0) * 0.5, function()
+		if vfx and vfx.Parent then
+			for _, emitter in ipairs(vfx:GetDescendants()) do
+				if emitter:IsA("ParticleEmitter") then
+					emitter.Enabled = false
+				end
+			end
+		end
+	end)
+
+	Debris:AddItem(vfx, duration or 1.5)
+end
+
+-- ✨ PROGRESSION STATS (These can be updated later by shop upgrades!)
+local playerMultSpeed = 1.0  -- 1.0 is base speed
+local playerMaxMult = 5.0    -- The highest tier they can reach
+local baseGrowthPerSecond = 0.8 -- At 0.8, it takes exactly 5 seconds to hit 5.0x
+
+local function GetCurrentMultiplier()
+	if not holding or not holdStart then return 1.0, 1 end
+
+	local holdTime = tick() - holdStart
+	local effectiveTime = holdTime * playerMultSpeed 
+
+	local currentTier = 1
+	local nextTier = 1
+
+	-- 1. Find which tier we are currently in
+	for i = 1, playerMaxTier do
+		if effectiveTime >= MilestoneData[i].time then
+			currentTier = i
+			nextTier = math.min(i + 1, playerMaxTier)
+		end
+	end
+
+	-- 2. If we hit the max tier, lock it at that multiplier
+	if currentTier == playerMaxTier then
+		return MilestoneData[currentTier].mult, currentTier
+	end
+
+	-- 3. SMOOTH MATH: Calculate the exact decimal between the current and next tier
+	local timePassedInTier = effectiveTime - MilestoneData[currentTier].time
+	local timeNeededForNext = MilestoneData[nextTier].time - MilestoneData[currentTier].time
+	local progressRatio = timePassedInTier / timeNeededForNext
+
+	local currentMult = MilestoneData[currentTier].mult
+	local nextMult = MilestoneData[nextTier].mult
+	local smoothMult = currentMult + ((nextMult - currentMult) * progressRatio)
+
+	return smoothMult, currentTier
+end
+
+-- ✨ PASTE THIS NEW FUNCTION RIGHT HERE
+local function PlayMilestoneSound(soundValue)
+	if not soundValue or soundValue == "" then return end
+	local sfxToPlay = nil
+
+	if string.find(soundValue, "rbxassetid://") then
+		sfxToPlay = Instance.new("Sound")
+		sfxToPlay.SoundId = soundValue
+		sfxToPlay.Volume = 0.6
+	else
+		local sfxFolder = ReplicatedStorage:FindFirstChild("SFX") or ReplicatedStorage:FindFirstChild("Sounds")
+		if sfxFolder then
+			local foundSound = sfxFolder:FindFirstChild(soundValue)
+			if foundSound then
+				sfxToPlay = foundSound:Clone()
+				sfxToPlay.Volume = 0.6
+			else
+				warn("⚠️ Could not find sound named '" .. soundValue .. "' in ReplicatedStorage.SFX!")
+			end
+		end
+	end
+
+	if sfxToPlay then
+		sfxToPlay.Parent = game:GetService("SoundService")
+		sfxToPlay:Play()
+		local duration = sfxToPlay.TimeLength > 0 and sfxToPlay.TimeLength or 3
+		Debris:AddItem(sfxToPlay, duration)
+	end
+end
+
+local function SpawnMilestonePopup(multFloor)
+	local data = MilestoneData[multFloor]
+	if not data then return end 
+
+	PlayMilestoneSound(data.sound)
+
+	local pop = Instance.new("TextLabel")
+	pop.Text = data.name .. " (" .. string.format("%.1f", data.mult) .. "x)"
+	pop.Font = Enum.Font.FredokaOne 
+	pop.TextScaled = true
+	pop.TextColor3 = data.color
+	pop.BackgroundTransparency = 1
+	pop.AnchorPoint = Vector2.new(0.5, 0.5)
+
+	-- ✨ MOBILE FIX 1: Starts floating 15% above the button instead of 120 pixels
+	pop.Position = UDim2.new(
+		ClickButton.Position.X.Scale, ClickButton.Position.X.Offset, 
+		ClickButton.Position.Y.Scale - 0.15, ClickButton.Position.Y.Offset
+	)
+	pop.Parent = ClickButton.Parent
+
+	local stroke = Instance.new("UIStroke", pop)
+	stroke.Thickness = 3
+	stroke.Color = Color3.fromRGB(0, 0, 0)
+
+	-- ✨ MOBILE FIX 2: Tiny starting size using Scale instead of flat pixels
+	pop.Size = UDim2.new(0.1, 0, 0.02, 0) 
+
+	-- ✨ MOBILE FIX 3: Grows to 35% of the screen width, and floats up an extra 10%
+	TweenService:Create(pop, TweenInfo.new(0.4, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+		Size = UDim2.new(0.35, 0, 0.08, 0),
+		Position = UDim2.new(
+			pop.Position.X.Scale, pop.Position.X.Offset, 
+			ClickButton.Position.Y.Scale - 0.25, ClickButton.Position.Y.Offset
+		)
+	}):Play()
+
+	task.delay(0.6, function()
+		TweenService:Create(pop, TweenInfo.new(0.3), {TextTransparency = 1}):Play()
+		TweenService:Create(stroke, TweenInfo.new(0.3), {Transparency = 1}):Play()
+		task.delay(0.3, function() pop:Destroy() end)
+	end)
+end
+
+local function GetColorForMultiplier(multValue)
+	local floorMult = math.floor(multValue)
+	local highestTier = 1
+	local chosenColor = Color3.fromRGB(255, 0, 0) -- Default Red for Tier 1
+
+	for tier, data in pairs(MilestoneData) do
+		if floorMult >= tier and tier >= highestTier then
+			highestTier = tier
+			chosenColor = data.color
+		end
+	end
+	return chosenColor
+end
+
+local function UpdateButtonVisual()
+	local col
+	local mult = 1
+	local currentTierIndex = 1
+
+	if habitatFull then
+		col = Color3.fromRGB(180, 60, 60)
+	elseif not holding then
+		col = Color3.fromRGB(255, 0, 0)
+	else
+		-- Get both the exact multiplier and the Tier Index (1-5)
+		mult, currentTierIndex = GetCurrentMultiplier()
+		col = MilestoneData[currentTierIndex].color
+		UpdateMultiplier:Fire(mult)
+	end
+
+	-- ✨ SCREEN EFFECT: Warp speed camera FOV!
+	local targetFOV = defaultFOV + (mult * 1.2)
+	if not holding then targetFOV = defaultFOV end
+	TweenService:Create(Camera, TweenInfo.new(0.3, Enum.EasingStyle.Sine), {FieldOfView = targetFOV}):Play()
+
+	-- ✨ BULLETPROOF MILESTONE POPUPS
+	if holding then
+		if currentTierIndex > lastTierIndex then
+			-- If they upgraded tiers, spawn the popup for the new tier!
+			-- We skip tier 1 ("NORMAL") so it doesn't pop up immediately on click.
+			if currentTierIndex > 1 then
+				SpawnMilestonePopup(currentTierIndex)
+			end
+			lastTierIndex = currentTierIndex
+		end
+	else
+		lastTierIndex = 1
+	end
+
+	TweenService:Create(ClickButton, TweenInfo.new(0.2), { BackgroundColor3 = col }):Play()
+
+	-- ... (Keep your alternating tilt/shake code below here exactly as it is!)
+
+	if holding and not habitatFull then
+		-- Flip the tilt direction every single time it fires
+		tiltSide = tiltSide * -1 
+
+		if mult >= 5.0 then 
+			-- ✨ LEGENDARY: Violent alternating rotation (8 degrees)
+			TweenService:Create(ClickButton, TweenInfo.new(0.05, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, 0, true), {
+				Rotation = 8 * tiltSide
+			}):Play()
+
+			-- Fast, aggressive golden energy bleed
+			clickStroke.Thickness = 12
+			clickStroke.Transparency = 0
+			TweenService:Create(clickStroke, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Thickness = 0, Transparency = 1}):Play()
+		else
+			-- ✨ NORMAL: Gentle alternating tilt (3 degrees)
+			TweenService:Create(ClickButton, TweenInfo.new(0.08, Enum.EasingStyle.Sine, Enum.EasingDirection.Out, 0, true), {
+				Rotation = 3 * tiltSide
+			}):Play()
+		end
+	elseif not holding then
+		-- Reset rotation and scale safely when let go
+		TweenService:Create(ClickButton, TweenInfo.new(0.15, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Rotation = 0}):Play()
+		TweenService:Create(clickScale, TweenInfo.new(0.15), {Scale = 1}):Play()
+	end
+end
+
+-- 3. UpdateHatcheryBar
+local function UpdateHatcheryBar(current, max)
+	local ratio = math.clamp(current / max, 0, 1)
+	TweenService:Create(HatcheryFill, TweenInfo.new(0.1), {
+		Size = UDim2.new(ratio, 0, 1, 0)
+	}):Play()
+	local color
+	if ratio > 0.5 then color = Color3.fromRGB(80, 220, 80)
+	elseif ratio > 0.25 then color = Color3.fromRGB(255, 200, 0)
+	else color = Color3.fromRGB(255, 60, 60) end
+	TweenService:Create(HatcheryFill, TweenInfo.new(0.1), { BackgroundColor3 = color }):Play()
+	HatcheryLabel.Text = "Hatchery: " .. math.floor(current) .. " / " .. max
+	hatcheryEmpty = (current <= 0)
+end
+
+-- 4. FlashEmpty
+local function FlashEmpty()
+	TweenService:Create(HatcheryFill, TweenInfo.new(0.1), {
+		BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+	}):Play()
+	task.delay(0.1, function()
+		TweenService:Create(HatcheryFill, TweenInfo.new(0.1), {
+			BackgroundColor3 = Color3.fromRGB(255, 60, 60)
+		}):Play()
+	end)
+end
+
+-- 5. ShowTierPopup
+local function ShowTierPopup(position, tierName, tierColor)
+	local anchor = Instance.new("Part")
+	anchor.Size = Vector3.new(0.1, 0.1, 0.1)
+	anchor.Anchored = true
+	anchor.Transparency = 1
+	anchor.CanCollide = false
+	anchor.Position = position + Vector3.new(0, 3, 0)
+	anchor.Parent = workspace
+
+	local bb = Instance.new("BillboardGui")
+	bb.Size = UDim2.new(0, 120, 0, 40)
+	bb.StudsOffset = Vector3.new(0, 2, 0)
+	bb.AlwaysOnTop = false
+	bb.Adornee = anchor
+	bb.Parent = anchor
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(1, 0, 1, 0)
+	label.BackgroundTransparency = 1
+	label.Text = tierName:upper()
+	label.TextColor3 = tierColor
+	label.TextScaled = true
+	label.Font = Enum.Font.GothamBold
+	label.TextStrokeTransparency = 0.3
+	label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+	label.Parent = bb
+
+	TweenService:Create(bb,
+		TweenInfo.new(1.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{ StudsOffset = Vector3.new(0, 6, 0) }
+	):Play()
+	TweenService:Create(label,
+		TweenInfo.new(1.5, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+		{ TextTransparency = 1, TextStrokeTransparency = 1 }
+	):Play()
+
+	Debris:AddItem(anchor, 2)
+end
+
+-- 6. ShowCubeValue
+local function ShowCubeValue(position, value, color)
+	local anchor = Instance.new("Part")
+	anchor.Size = Vector3.new(0.1, 0.1, 0.1)
+	anchor.Anchored = true
+	anchor.Transparency = 1
+	anchor.CanCollide = false
+	anchor.Position = position + Vector3.new(math.random(-1, 1), 2, math.random(-1, 1))
+	anchor.Parent = workspace
+
+	local bb = Instance.new("BillboardGui")
+	bb.Size = UDim2.new(0, 80, 0, 25)
+	bb.StudsOffset = Vector3.new(0, 0, 0)
+	bb.AlwaysOnTop = false
+	bb.Adornee = anchor
+	bb.Parent = anchor
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(1, 0, 1, 0)
+	label.BackgroundTransparency = 1
+	label.Text = "$" .. FormatNumber(value)  -- CHANGED: was tostring(value)
+	label.TextColor3 = color
+	label.TextScaled = true
+	label.Font = Enum.Font.Gotham
+	label.TextStrokeTransparency = 0.4
+	label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+	label.Parent = bb
+
+	TweenService:Create(bb,
+		TweenInfo.new(1.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{ StudsOffset = Vector3.new(0, 4, 0) }
+	):Play()
+	TweenService:Create(label,
+		TweenInfo.new(1.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+		{ TextTransparency = 1, TextStrokeTransparency = 1 }
+	):Play()
+
+	Debris:AddItem(anchor, 1.5)
+end
+
+---------------------------------------------------------------
+-- 8 & 9. HOLD STATE EVALUATION (MOBILE FIX & SPACEBAR)
+---------------------------------------------------------------
+local trackedInputs = {}
+
+local function EvaluateHolding()
+	local hasInput = false
+	for _, _ in pairs(trackedInputs) do
+		hasInput = true
+		break
+	end
+
+	if hasInput and not holding then
+		-- Start Holding
+		if hatcheryEmpty then FlashEmpty() return end
+		if habitatFull then return end
+		holding = true
+		holdStart = tick()
+
+		-- ✨ TACTILE PRESS: Heavy center squish before the rotations start
+		TweenService:Create(clickScale, TweenInfo.new(0.1, Enum.EasingStyle.Sine), {Scale = 0.9}):Play()
+
+		ProduceAura:FireServer("start")
+	elseif not hasInput and holding then
+		-- Stop Holding
+		holding = false
+		holdStart = nil
+		ProduceAura:FireServer("stop")
+		UpdateButtonVisual()
+		UpdateMultiplier:Fire(1.0)
+	end
+end
+
+---------------------------------------------------------------
+-- 10. INPUT CONNECTIONS
+---------------------------------------------------------------
+ClickButton.InputBegan:Connect(function(input)
+	-- Track the exact touch or click
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		trackedInputs[input] = true
+		EvaluateHolding()
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	-- Only stop holding if the EXACT touch/click/key that started it has been released
+	if trackedInputs[input] then
+		trackedInputs[input] = nil
+		EvaluateHolding()
+	end
+end)
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	-- Spacebar support (Allows jumping because it doesn't block the input!)
+	if input.KeyCode == Enum.KeyCode.Space then
+		if not UserInputService:GetFocusedTextBox() then -- Ignores Spacebar if typing in chat
+			trackedInputs[input] = true
+			EvaluateHolding()
+		end
+	end
+end)
+
+-- Prevents the button getting "stuck" if the player alt-tabs out of Roblox
+UserInputService.WindowFocusReleased:Connect(function()
+	table.clear(trackedInputs)
+	EvaluateHolding()
+end)
+
+ForceStopHold.OnClientEvent:Connect(function()
+	table.clear(trackedInputs)
+	EvaluateHolding()
+end)
+
+HabitatFull.OnClientEvent:Connect(function()
+	habitatFull = true
+	HabitatFullEvent:Fire(true)
+	table.clear(trackedInputs)
+	EvaluateHolding()
+end)
+
+HabitatFullEvent.Event:Connect(function(isFull)
+	if not isFull then
+		habitatFull = false
+		UpdateButtonVisual()
+	end
+end)
+
+UpdateHatchery.OnClientEvent:Connect(function(info)
+	UpdateHatcheryBar(info.current, info.max)
+end)
+
+local UpdateHUDEvent = ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHUD")
+UpdateHUDEvent.OnClientEvent:Connect(function(stats)
+	-- 1. Check Habitat
+	if stats.pendingAuras and stats.habitatCapacity then
+		if stats.pendingAuras < stats.habitatCapacity and habitatFull then
+			habitatFull = false
+			HabitatFullEvent:Fire(false)
+			UpdateButtonVisual()
+		end
+	end
+
+	-- ✨ THE FIX: Constantly check upgrades so the client never forgets!
+	if stats.upgrades then
+		-- ✨ THE SCALABLE TIER UNLOCK SYSTEM (Now syncing correctly on HUD update!)
+		local tierUnlocks = {
+			{ upgradeId = "unlockOmniMult",      tier = 10 },
+			{ upgradeId = "unlockUniversalMult", tier = 9 },
+			{ upgradeId = "unlockGodlyMult",     tier = 8 },
+			{ upgradeId = "unlockCosmicMult",    tier = 7 },
+			{ upgradeId = "unlockMythicMult",    tier = 6 },
+		}
+
+		local calculatedMaxTier = 5 -- Default max tier (Legendary) if they bought nothing
+
+		-- Check upgrades from top to bottom
+		for _, data in ipairs(tierUnlocks) do
+			local upgData = stats.upgrades[data.upgradeId]
+			local level = (typeof(upgData) == "table" and upgData.level) or (typeof(upgData) == "number" and upgData) or 0
+
+			if level > 0 then
+				calculatedMaxTier = data.tier
+				break -- We found their highest unlock, so stop checking!
+			end
+		end
+
+		-- Apply the properly calculated cap
+		playerMaxTier = calculatedMaxTier
+
+		-- Sync the Speed Multiplier
+		local speedData = stats.upgrades["multiplierSpeed"]
+		local speedLevel = (typeof(speedData) == "table" and speedData.level) or (typeof(speedData) == "number" and speedData) or 0
+		playerMultSpeed = 1.0 + (speedLevel * 0.05) 
+	end
+end)
+
+-- 11. Fire loop
+task.spawn(function()
+	while true do
+		if holding then
+			if hatcheryEmpty or habitatFull then
+				-- ✨ THE FIX: Properly tell the new input system to stop holding
+				table.clear(trackedInputs)
+				EvaluateHolding()
+			else
+				ProduceAura:FireServer()
+				UpdateButtonVisual()
+			end
+		end
+		task.wait(fireRate)
+	end
+end)
+
+---------------------------------------------------------------
+-- 12. AuraSpawned
+---------------------------------------------------------------
+AuraSpawned.OnClientEvent:Connect(function(info)
+	local instance, isCustom = SpawnAuraInstance(info.tier, info.color, info.glow, info.spawnPos)
+
+	instance:SetAttribute("AuraCube", true)
+	ScaleAura(instance, info.tier, false)
+	ShowCubeValue(info.spawnPos, info.value, info.color)
+	PlayVFX("Spawn", info.spawnPos, 1.0)
+
+	if info.tier == "Legendary" then
+		ShowTierPopup(info.spawnPos, "Legendary", Color3.fromRGB(255, 200, 0))
+		PlayVFX("Legendary", info.spawnPos, 2.0)
+	end
+
+	if info.cubeId then
+		cubeDataMap[info.cubeId] = {
+			instance = instance,
+			tierName = info.tier,
+			isCustom = isCustom,
+		}
+
+		if instance:IsA("Model") then
+			instance.AncestryChanged:Connect(function(_, parent)
+				if not parent then cubeDataMap[info.cubeId] = nil end
+			end)
+		else
+			instance.AncestryChanged:Connect(function(_, parent)
+				if not parent then cubeDataMap[info.cubeId] = nil end
+			end)
+		end
+	end
+end)
+
+CubeMutatedBatch.OnClientEvent:Connect(function(batchData)
+	-- Loop through every mutation the server sent in this batch
+	for _, info in ipairs(batchData) do
+
+		local cubeData = cubeDataMap[info.cubeId]
+		if not cubeData then continue end -- CHANGED: Use continue instead of return
+
+		local instance = cubeData.instance
+		if not instance or not instance.Parent then continue end -- CHANGED
+
+		local rootPart = GetRootPart(instance)
+		if not rootPart then continue end -- CHANGED
+		local position = rootPart.Position
+
+		if info.mutationType == "tierUpgrade" then
+			PlayVFX("TierUpgrade", position, 1.5)
+			if info.tierName == "Legendary" then
+				PlayVFX("Legendary", position, 2.0)
+			end
+
+			local oldTierName = cubeData.tierName
+			local newAura = CloneAuraModel(info.tierName)
+			if newAura then
+				newAura:PivotTo(CFrame.new(position))
+				newAura.Parent = workspace
+				newAura:SetAttribute("AuraCube", true)
+				ScaleAura(newAura, info.tierName, true, oldTierName)
+
+				if newAura.PrimaryPart then
+					newAura.PrimaryPart.Anchored = false
+					newAura.PrimaryPart.CanCollide = true
+				end
+
+				instance:Destroy()
+
+				cubeData.instance = newAura
+				cubeData.tierName = info.tierName
+				cubeData.isCustom = true
+
+				newAura.AncestryChanged:Connect(function(_, parent)
+					if not parent then cubeDataMap[info.cubeId] = nil end
+				end)
+			else
+				if rootPart:IsA("BasePart") then
+					TweenService:Create(rootPart, TweenInfo.new(0.5, Enum.EasingStyle.Quad), {
+						Color = info.newColor
+					}):Play()
+
+					if info.newGlow then
+						local light = rootPart:FindFirstChildOfClass("PointLight")
+						if not light then
+							light = Instance.new("PointLight")
+							light.Parent = rootPart
+						end
+						TweenService:Create(light, TweenInfo.new(0.5), {
+							Brightness = 3,
+							Range = 8,
+							Color = info.newColor,
+						}):Play()
+					end
+
+					ScaleAura(instance, info.tierName, true, oldTierName)
+				end
+
+				cubeData.tierName = info.tierName
+			end
+
+			ShowTierPopup(position, info.tierName, info.newColor)
+
+		elseif info.mutationType == "valueBonus" then
+			-- Silent
+		end
+	end
+end)
+
+---------------------------------------------------------------
+-- HUD BUTTON POLISH
+---------------------------------------------------------------
+local function AddBasicJuice(btn)
+	if not btn then return end
+	local scale = btn:FindFirstChildOfClass("UIScale") or Instance.new("UIScale", btn)
+	btn.MouseEnter:Connect(function() TweenService:Create(scale, TweenInfo.new(0.15), {Scale = 1.08}):Play() end)
+	btn.MouseLeave:Connect(function() TweenService:Create(scale, TweenInfo.new(0.15), {Scale = 1}):Play() end)
+	btn.MouseButton1Down:Connect(function() TweenService:Create(scale, TweenInfo.new(0.1), {Scale = 0.9}):Play() end)
+	btn.MouseButton1Up:Connect(function() TweenService:Create(scale, TweenInfo.new(0.2, Enum.EasingStyle.Bounce), {Scale = 1.08}):Play() end)
+end
+
+AddBasicJuice(playerGui:WaitForChild("MainHUD"):FindFirstChild("ModeToggle"))
+AddBasicJuice(playerGui:WaitForChild("MainHUD"):FindFirstChild("SendButton"))
+
+ReplicatedStorage.RemoteEvents.UpgradeUpdated.OnClientEvent:Connect(function(info)
+	if not info or not info.upgrades then return end
+
+	-- 1. Setup Speed
+	local speedData = info.upgrades["multiplierSpeed"]
+	local speedLevel = (typeof(speedData) == "table" and speedData.level) or (typeof(speedData) == "number" and speedData) or 0
+	playerMultSpeed = 1.0 + (speedLevel * 0.05) 
+
+	-- ✨ 2. THE NEW SCALABLE TIER UNLOCK SYSTEM
+	-- List your highest upgrades at the top, down to the lowest.
+	local tierUnlocks = {
+		{ upgradeId = "unlockOmniMult",      tier = 10 },
+		{ upgradeId = "unlockUniversalMult", tier = 9 },
+		{ upgradeId = "unlockGodlyMult",     tier = 8 },
+		{ upgradeId = "unlockCosmicMult",    tier = 7 },
+		{ upgradeId = "unlockMythicMult",    tier = 6 },
+	}
+
+	local calculatedMaxTier = 5 -- Default max tier (Legendary) if they bought nothing
+
+	-- Check upgrades from top to bottom. The first one they own becomes their max tier!
+	for _, data in ipairs(tierUnlocks) do
+		local upgData = info.upgrades[data.upgradeId]
+		local level = (typeof(upgData) == "table" and upgData.level) or (typeof(upgData) == "number" and upgData) or 0
+
+		if level > 0 then
+			calculatedMaxTier = data.tier
+			break -- We found their highest unlock, so stop checking!
+		end
+	end
+
+	-- Apply the newly calculated cap
+	playerMaxTier = calculatedMaxTier
+end)
+	local effectiveFireRate = AdminConfig.FireRate / (rushMult * weatherSpawnMult)
+	if lastFire[uid] then
+		local timeSinceLast = now - lastFire[uid]
+		if timeSinceLast > 3 then clickSessionStart[uid] = now end
+		if not clickSessionStart[uid] then clickSessionStart[uid] = now end
+		local sessionLength = now - clickSessionStart[uid]
+		if sessionLength > 300 then effectiveFireRate *= 2 end
+		if sessionLength > 600 then effectiveFireRate *= 4 end
+		if timeSinceLast < effectiveFireRate then return end
+	else
+		clickSessionStart[uid] = now
+	end
+	lastFire[uid] = now
+
+	local data    = GameManager.GetData(uid)
+	local runtime = GameManager.GetRuntime(uid)
+	if not data or not runtime then return end
+	if runtime.cubeCount >= GetHabitatCapacity(data) then HabitatFull:FireClient(player); return end
+
+	local holdTime = now - holdStart[uid]
+	local holdMult, luckBonus = GetHoldMultiplier(holdTime, data)
+	SpawnAura(player, data, runtime, holdMult, luckBonus)
+	SendHUDUpdate(player)
+	UpdateHatchery:FireClient(player, { current=hatchery[uid], max=GetHatcheryMax(data) })
+end)
