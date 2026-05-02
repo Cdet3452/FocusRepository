@@ -1,803 +1,624 @@
--- AuraSpawner
--- Location: ServerScriptService > AuraSpawner
+-- PortalController
+-- Location: StarterPlayer > StarterPlayerScripts > PortalController
 
-local Players             = game:GetService("Players")
-local ReplicatedStorage   = game:GetService("ReplicatedStorage")
-local ServerScriptService = game:GetService("ServerScriptService")
-
-local TierConfig     = require(ReplicatedStorage.Modules.TierConfig)
-local UpgradeConfig  = require(ReplicatedStorage.Modules.UpgradeConfig)
-local PrestigeModule = require(ReplicatedStorage.Modules.PrestigeModule)
-local AdminConfig    = require(ReplicatedStorage.Modules.AdminConfig)
-local MutationConfig = require(ReplicatedStorage.Modules.MutationConfig)
-local AreaRegistry   = require(ReplicatedStorage.Modules.AreaRegistry)
-local GameManager    = require(ServerScriptService.GameManager)
-local BoostManager   = require(ServerScriptService.BoostManager)
-local WeatherManager = require(ServerScriptService.WeatherManager) 
-
-local AuraSpawned    = ReplicatedStorage.RemoteEvents:WaitForChild("AuraSpawned")
-local ProduceAura    = ReplicatedStorage.RemoteEvents:WaitForChild("ProduceAura")
-local UpdateHatchery = ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHatchery")
-local UpdateHUD      = ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHUD")
-local HabitatFull    = ReplicatedStorage.RemoteEvents:WaitForChild("HabitatFull")
-local CubeMutated    = ReplicatedStorage.RemoteEvents:WaitForChild("CubeMutated")
-
-local HABITAT_HOLDER = workspace:WaitForChild("HabitatHolder")
-local HABITAT_PART = HABITAT_HOLDER:WaitForChild("Position")
-local lastFire          = {}
-local holdStart         = {}
-local hatchery          = {}
-local clickSessionStart = {}
-
-local function GetHatcheryMax(data)
-	local cfg = UpgradeConfig.GetUpgradeConfig("hatcheryCapacity")
-	return (cfg and cfg.apply) and cfg.apply(data) or AdminConfig.HatcheryMax
-end
-
-local function GetHabitatCapacity(data)
-	local cfg = UpgradeConfig.GetUpgradeConfig("habitatCapacity")
-	return (cfg and cfg.apply) and cfg.apply(data) or AdminConfig.BaseHabitatCapacity
-end
-
-local function GetMutationSpeedMult(data)
-	local cfg = UpgradeConfig.GetUpgradeConfig("mutationSpeed")
-	return (cfg and cfg.apply) and cfg.apply(data) or 1
-end
-
-Players.PlayerAdded:Connect(function(p)
-	hatchery[p.UserId] = AdminConfig.HatcheryMax
-	clickSessionStart[p.UserId] = nil
-end)
-Players.PlayerRemoving:Connect(function(p)
-	hatchery[p.UserId]=nil; holdStart[p.UserId]=nil
-	lastFire[p.UserId]=nil; clickSessionStart[p.UserId]=nil
-end)
-
-task.spawn(function()
-	local PR = ServerScriptService:WaitForChild("PrestigeReset", 30)
-	if PR then
-		PR.Event:Connect(function(player)
-			local uid = player.UserId
-			local data = GameManager.GetData(uid)
-			hatchery[uid] = data and GetHatcheryMax(data) or AdminConfig.HatcheryMax
-			holdStart[uid]=nil; lastFire[uid]=nil; clickSessionStart[uid]=nil
-		end)
-	end
-end)
-
-task.spawn(function()
-	while true do
-		task.wait(0.1)
-		for _, player in ipairs(Players:GetPlayers()) do
-			local uid = player.UserId
-			local data = GameManager.GetData(uid)
-			local hatchMax = data and GetHatcheryMax(data) or AdminConfig.HatcheryMax
-			local prev = hatchery[uid] or hatchMax
-			if holdStart[uid] then
-				hatchery[uid] = math.max(0, prev - AdminConfig.HatcheryDrainRate * 0.1)
-			else
-				hatchery[uid] = math.min(hatchMax, prev + AdminConfig.HatcheryRefillRate * 0.1)
-			end
-			if hatchery[uid] ~= prev then
-				UpdateHatchery:FireClient(player, { current=hatchery[uid], max=hatchMax })
-			end
-			if hatchery[uid] <= 0 and holdStart[uid] then
-				holdStart[uid] = nil
-				ReplicatedStorage.RemoteEvents.ForceStopHold:FireClient(player)
-			end
-		end
-	end
-end)
-
-local function GetAFKSpeed(runtime)
-	local idleTime = tick() - runtime.lastActiveTime
-	local speed = MutationConfig.AFKDecay[1].speed
-	for _, e in ipairs(MutationConfig.AFKDecay) do
-		if idleTime >= e.time then speed = e.speed end
-	end
-	return speed
-end
-
-local function SendHUDUpdate(player)
-	local uid = player.UserId
-	local data = GameManager.GetData(uid)
-	local runtime = GameManager.GetRuntime(uid)
-	if not data or not runtime then return end
-	local totalMV = runtime.totalMutatedValue or 0
-	local pending = runtime.cubeCount
-	local avgVal  = pending > 0 and (totalMV/pending) or AdminConfig.BaseAuraValue
-	local rate    = math.floor(pending * avgVal)
-	local passTickCfg = UpgradeConfig.GetUpgradeConfig("passiveTickSpeed")
-
-	local passInt = (passTickCfg and passTickCfg.apply) and passTickCfg.apply(data) or AdminConfig.PassiveInterval
-	local displayRate = math.floor(rate * BoostManager.GetValueMultiplier(uid) * BoostManager.GetSpawnRateMultiplier(uid))
-	UpdateHUD:FireClient(player, {
-		currency=data.currency, pendingAuras=pending,
-		habitatCapacity=GetHabitatCapacity(data), rate=displayRate,
-		passiveInterval=passInt, totalEarned=data.totalEarned or 0,
-		soulAuras=data.soulAuras or 0, farmEvaluation=data.farmEvaluation or 0,
-		goldenAuras=data.goldenAuras or 0, boostInventory=data.boostInventory or {},
-		prestigeCount=data.prestigeCount or 0,
-		upgrades=data.upgrades or {},
-		totalCubesProduced = data.totalCubesProduced or 0,
-		currentArea        = data.currentArea or 1,
-	})
-end
-
-task.spawn(function()
-	while true do
-		local tickInterval = AdminConfig.MutationTickInterval or MutationConfig.CheckInterval
-		task.wait(tickInterval)
-		for _, player in ipairs(Players:GetPlayers()) do
-			local uid = player.UserId
-			local data = GameManager.GetData(uid)
-			local runtime = GameManager.GetRuntime(uid)
-			if not data or not runtime then continue end
-
-			local dt = tickInterval * GetAFKSpeed(runtime) * GetMutationSpeedMult(data) * (AdminConfig.MutationSpeedMultiplier or 1)
-
-			local mutationBatch = {}
-
-			for cubeId, cube in pairs(runtime.cubes) do
-				local oldMutatedValue = MutationConfig.GetMutatedValue(cube)
-				local mutated = false
-
-				local prev = cube.effectiveElapsed
-				cube.effectiveElapsed += dt
-				local pl = MutationConfig.GetValueBonusLevel(prev)
-				local nl = MutationConfig.GetValueBonusLevel(cube.effectiveElapsed)
-
-				if nl > pl then
-					mutated = true
-					local be = MutationConfig.ValueBonuses[nl]
-					table.insert(mutationBatch, { 
-						cubeId = cubeId, 
-						mutationType = "valueBonus",
-						bonusLevel = nl, 
-						bonusPercent = be and math.floor(be.bonus * 100) or 0 
-					})
-				end
-
-				local maxTier = AdminConfig.MutationMaxTierIndex or 3
-				local upgrades = 0
-
-				while cube.tierIndex < maxTier and cube.tierIndex < #TierConfig.Tiers and upgrades < 5 do
-					local timeSince = cube.effectiveElapsed - (cube.lastUpgradeElapsed or 0)
-					local bestChance, bestTime = 0, 0
-
-					for _, threshold in ipairs(MutationConfig.TierUpgrades) do
-						if timeSince >= threshold.time then 
-							bestChance = threshold.chance
-							bestTime = threshold.time 
-						end
-					end
-
-					if bestChance <= 0 then break end
-
-					if math.random() <= bestChance then
-						local oldTier = TierConfig.Tiers[cube.tierIndex]
-						cube.tierIndex += 1
-						local newTier = TierConfig.Tiers[cube.tierIndex]
-
-						cube.baseValue = math.floor(cube.baseValue * (newTier.multiplier/oldTier.multiplier))
-						cube.color = newTier.color
-						cube.glow = newTier.glow
-						cube.tierName = newTier.name
-						cube.lastUpgradeElapsed = (cube.lastUpgradeElapsed or 0) + bestTime
-						upgrades += 1
-						mutated = true
-
-						table.insert(mutationBatch, { 
-							cubeId = cubeId, 
-							mutationType = "tierUpgrade",
-							newColor = newTier.color, 
-							newGlow = newTier.glow, 
-							tierName = newTier.name 
-						})
-
-						if newTier.name == "Legendary" then
-							data.totalLegendaryCubes = (data.totalLegendaryCubes or 0) + 1
-						end
-					else 
-						break 
-					end
-				end
-
-				if mutated then
-					local newMutatedValue = MutationConfig.GetMutatedValue(cube)
-					runtime.totalMutatedValue = (runtime.totalMutatedValue or 0) + (newMutatedValue - oldMutatedValue)
-				end
-			end
-
-			if #mutationBatch > 0 then
-				ReplicatedStorage.RemoteEvents.CubeMutatedBatch:FireClient(player, mutationBatch)
-			end
-
-			SendHUDUpdate(player)
-		end
-	end
-end)
-
-local function GetHoldMultiplier(holdTime, data)
-	local upgrades = data and data.upgrades or {}
-
-	local speedData = upgrades["multiplierSpeed"]
-	local speedLevel = (typeof(speedData) == "table" and speedData.level) or (typeof(speedData) == "number" and speedData) or 0
-	local playerMultSpeed = 1.0 + (speedLevel * 0.05)
-
-	local playerMaxTier = 5
-	local mythicData = upgrades["unlockMythicMult"]
-	local mythicLevel = (typeof(mythicData) == "table" and mythicData.level) or (typeof(mythicData) == "number" and mythicData) or 0
-	if mythicLevel > 0 then playerMaxTier = 6 end
-
-	local effectiveTime = holdTime * playerMultSpeed
-	local currentTier = 1
-
-	for i = 1, playerMaxTier do
-		if AdminConfig.MilestoneData[i] and effectiveTime >= AdminConfig.MilestoneData[i].time then
-			currentTier = i
-		end
-	end
-
-	local nextTier = math.min(currentTier + 1, playerMaxTier)
-	if currentTier == playerMaxTier then
-		return AdminConfig.MilestoneData[currentTier].mult, AdminConfig.MilestoneData[currentTier].luck
-	end
-
-	local timePassed = effectiveTime - AdminConfig.MilestoneData[currentTier].time
-	local timeNeeded = AdminConfig.MilestoneData[nextTier].time - AdminConfig.MilestoneData[currentTier].time
-	local ratio = timePassed / timeNeeded
-
-	local cMult = AdminConfig.MilestoneData[currentTier].mult
-	local nMult = AdminConfig.MilestoneData[nextTier].mult
-	local smoothMult = cMult + ((nMult - cMult) * ratio)
-
-	return smoothMult, AdminConfig.MilestoneData[currentTier].luck
-end
-
-local function RollWithLuck(luckBonus)
-	local tiers = TierConfig.Tiers
-	local adjusted, total = {}, 0
-	for _, tier in ipairs(tiers) do
-		local chance = tier.chance
-		if tier.name ~= "Common" then chance += luckBonus/(#tiers-1) end
-		table.insert(adjusted, { tier=tier, chance=chance }); total += chance
-	end
-	local r, cum = math.random()*total, 0
-	for _, e in ipairs(adjusted) do
-		cum += e.chance; if r <= cum then return e.tier end
-	end
-	return tiers[1]
-end
-
-local function SpawnAura(player, data, runtime, holdMult, luckBonus)
-	local uid  = player.UserId
-	local tier = RollWithLuck(luckBonus)
-	local tierIndex = 1
-	for i, t in ipairs(TierConfig.Tiers) do if t.name == tier.name then tierIndex=i; break end end
-
-	local totalValueMultiplier = 1.0 
-	local valueUpgrades = {
-		"blockValue", "blockValueT2", "auraValueT3", 
-		"auraValueT4", "auraValueT6", "auraValueT8", "auraValueT10"
-	}
-
-	for _, upgradeId in ipairs(valueUpgrades) do
-		local cfg = UpgradeConfig.GetUpgradeConfig(upgradeId)
-		if cfg and cfg.apply then
-			totalValueMultiplier += cfg.apply(data) 
-		end
-	end
-
-	local prestigeMult    = PrestigeModule.GetMultiplier(data.soulAuras)
-	local areaMult        = AreaRegistry.GetMultiplier(data.currentArea or 1)
-	local boostValueMult  = BoostManager.GetValueMultiplier(uid)
-	local _, weatherValueMult = WeatherManager.GetMultipliers(uid)
-
-	local baseValue  = math.floor(AdminConfig.BaseAuraValue * tier.multiplier * totalValueMultiplier * prestigeMult * areaMult * boostValueMult * weatherValueMult)
-	local totalValue = baseValue + math.floor(baseValue * (holdMult - 1))
-
-	local spawnPos = HABITAT_PART.Position + Vector3.new(math.random(-3,3), 10, math.random(-3,3))	
-	local cubeRecord = {
-		spawnTime=tick(), effectiveElapsed=0, lastUpgradeElapsed=0,
-		baseValue=totalValue, tierIndex=tierIndex,
-		tierName=tier.name, color=tier.color, glow=tier.glow,
-	}
-	if AdminConfig.MutationInstantMax then
-		local mb = MutationConfig.ValueBonuses[#MutationConfig.ValueBonuses]
-		if mb then cubeRecord.effectiveElapsed = mb.time + 1 end
-	end
-
-	local cubeId = GameManager.AddCube(uid, cubeRecord)
-	if not cubeId then return end
-	data.totalCubesProduced = (data.totalCubesProduced or 0) + 1
-	if tier.name == "Legendary" then data.totalLegendaryCubes = (data.totalLegendaryCubes or 0) + 1 end
-	runtime.lastActiveTime = tick()
-
-	AuraSpawned:FireClient(player, {
-		cubeId=cubeId, tier=tier.name, color=tier.color,
-		glow=tier.glow, value=totalValue, spawnPos=spawnPos,
-	})
-end
-
-ProduceAura.OnServerEvent:Connect(function(player, action)
-	local uid = player.UserId
-	local now = tick()
-	local data    = GameManager.GetData(uid)
-	local runtime = GameManager.GetRuntime(uid)
-
-	if action == "start" then 
-		if data and runtime and runtime.cubeCount >= GetHabitatCapacity(data) then
-			HabitatFull:FireClient(player)
-			return
-		end
-
-		-- ✨ Require at least 0.5 juice to start holding so it doesn't instantly die
-		if (hatchery[uid] or 0) > 0.5 then 
-			holdStart[uid] = now 
-		else
-			UpdateHatchery:FireClient(player, { current = 0, max = data and GetHatcheryMax(data) or AdminConfig.HatcheryMax })
-		end
-		return 
-	end
-
-	if action == "stop" then 
-		holdStart[uid] = nil
-		return 
-	end
-
-	if not data or not runtime then return end
-
-	if runtime.cubeCount >= GetHabitatCapacity(data) then 
-		HabitatFull:FireClient(player)
-		return 
-	end
-
-	if (hatchery[uid] or 0) <= 0.5 then 
-		UpdateHatchery:FireClient(player, { current = 0, max = data and GetHatcheryMax(data) or AdminConfig.HatcheryMax })
-		return 
-	end
-
-	if not holdStart[uid] then return end
-
-	local rushMult = BoostManager.GetSpawnRateMultiplier(uid)
-	local weatherSpawnMult, _ = WeatherManager.GetMultipliers(uid)
-	local effectiveFireRate = AdminConfig.FireRate / (rushMult * weatherSpawnMult)
-	if lastFire[uid] then
-		local timeSinceLast = now - lastFire[uid]
-		if timeSinceLast > 3 then clickSessionStart[uid] = now end
-		if not clickSessionStart[uid] then clickSessionStart[uid] = now end
-		local sessionLength = now - clickSessionStart[uid]
-		if sessionLength > 300 then effectiveFireRate *= 2 end
-		if sessionLength > 600 then effectiveFireRate *= 4 end
-		if timeSinceLast < effectiveFireRate then return end
-	else
-		clickSessionStart[uid] = now
-	end
-	lastFire[uid] = now
-
-	local holdTime = now - holdStart[uid]
-	local holdMult, luckBonus = GetHoldMultiplier(holdTime, data)
-	SpawnAura(player, data, runtime, holdMult, luckBonus)
-	SendHUDUpdate(player)
-	UpdateHatchery:FireClient(player, { current=hatchery[uid], max=GetHatcheryMax(data) })
-end)
-
-local AdminConfig = require(game:GetService("ReplicatedStorage").Modules.AdminConfig)
-
-local TierConfig = {}
-
-TierConfig.Tiers = {
-	{ name = "Common",    chance = 0.75,   multiplier = 1,   color = Color3.fromRGB(220, 220, 220), glow = false },
-	{ name = "Uncommon",  chance = 0.17,   multiplier = 1.5, color = Color3.fromRGB(80, 200, 80),   glow = true  },
-	{ name = "Rare",      chance = 0.06,   multiplier = 3,   color = Color3.fromRGB(60, 120, 255),  glow = true  },
-	{ name = "Epic",      chance = 0.018,  multiplier = 8,   color = Color3.fromRGB(180, 60, 255),  glow = true  },
-	{ name = "Legendary", chance = 0.002,  multiplier = 25,  color = Color3.fromRGB(255, 200, 0),   glow = true  },
-}
-
-if AdminConfig.TierOverride then
-	TierConfig.Tiers = AdminConfig.TierOverride
-end
-
-function TierConfig.Roll()
-	local r = math.random()
-	local cumulative = 0
-	for _, tier in ipairs(TierConfig.Tiers) do
-		cumulative += tier.chance
-		if r <= cumulative then return tier end
-	end
-	return TierConfig.Tiers[1]
-end
-
-return TierConfig
-
--- GameManager
--- Location: ServerScriptService > GameManager (ModuleScript)
---
--- FIXES:
---   hasPrestigedThisArea now resets in WipePrestigeOnLoad AND WipeAreaOnLoad
---   AND WipeMoneyOnLoad. Any wipe = fresh prestige state.
---   All Phase 4 fields in DefaultData + safety net after wipes.
---   TutorialStepComplete handler at bottom.
-
-local DataStoreService  = game:GetService("DataStoreService")
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService        = game:GetService("RunService")
+local TweenService      = game:GetService("TweenService")
 
-local PlayerDB      = DataStoreService:GetDataStore("PlayerData_v1")
-local AdminConfig   = require(ReplicatedStorage.Modules.AdminConfig)
-local UpgradeConfig = require(ReplicatedStorage.Modules.UpgradeConfig)
-local MutationConfig = require(ReplicatedStorage.Modules.MutationConfig)
+local AreaRegistry = require(ReplicatedStorage.Modules.AreaRegistry)
+local SoundConfig  = require(ReplicatedStorage.Modules.SoundConfig)
+local T            = require(ReplicatedStorage.Modules.UITheme).Get()
+local C            = require(ReplicatedStorage.Modules.UIConfig)
+local Formatter    = require(ReplicatedStorage.Modules.NumberFormatter) 
+local UITheme = require(game:GetService("ReplicatedStorage"):WaitForChild("Modules"):WaitForChild("UITheme"))
+local T = UITheme.Get("Custom")
+local AreaUpdated      = ReplicatedStorage.RemoteEvents:WaitForChild("AreaUpdated")
+local AreaUnlocked     = ReplicatedStorage.RemoteEvents:WaitForChild("AreaUnlocked")
+local EnterPortal      = ReplicatedStorage.RemoteEvents:WaitForChild("EnterPortal")
+local TravelToArea     = ReplicatedStorage.RemoteEvents:WaitForChild("TravelToArea")
+local AreaChanged      = ReplicatedStorage.RemoteEvents:WaitForChild("AreaChanged")
+local PrestigeComplete = ReplicatedStorage.RemoteEvents:WaitForChild("PrestigeComplete")
+local UpdateHUD        = ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHUD")
 
-local SAVE_COOLDOWN = 7
+local player    = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local mainHUD   = playerGui:WaitForChild("MainHUD")
 
-local function DefaultData()
-	return {
-		currency      = 0,
-		totalEarned   = 0,
-		soulAuras     = 0,
-		prestigeCount = 0,
+local PositionPart = workspace:WaitForChild("AuraHolder"):WaitForChild("Position")
 
-		pendingAuras        = 0,
-		pendingPayout       = 0,
-		pendingBonusPayout  = 0,
-		lastPayout          = 0,
+local promptAdded   = false
+local currentArea   = 1
+local portalReady   = false
+local panelOpen     = false
+local browseIndex   = 1
+local liveFarmEval  = 0
+local unlockedAreas = { 1 }
+local MAX_AREA      = AreaRegistry.GetMaxArea()
 
-		upgrades = {
-			dropRate           = 0,
-			blockValue         = 0,
-			habitatCapacity    = 0,
-			autoShipper        = 0,
-			mutationSpeed      = 0,
-			mutationTierChance = 0,
-			passiveTickSpeed   = 0,
-			hatcheryCapacity   = 0,
-		},
+local PW = C.Panels.AreaTravelW
+local PH = C.Panels.AreaTravelH
+local PR = C.Panels.CornerRadius
+local BW = C.Banners.AreaBannerW
+local BY = C.Banners.AreaBannerY
+local BR = C.Banners.CornerRadius
 
-		piggyBank       = 0,
-		piggyBankBroken = 0,
-
-		totalCubesProduced    = 0,
-		totalPlatformsShipped = 0,
-		totalLegendaryCubes   = 0,
-
-		missions = {},
-
-		settings = {
-			sfxEnabled   = true,
-			musicEnabled = true,
-		},
-
-		farmEvaluation = 0,
-		currentArea    = 1,
-		unlockedAreas  = { 1 },
-
-		goldenAuras = AdminConfig.GoldenAuraStart or 10,
-
-		boostInventory = {
-			AuraRush   = 0,
-			SpawnBoost = 0,
-			SoulBoost  = 0,
-		},
-
-		hasPrestigedThisArea = false,
-		epicUpgrades         = {},
-		tutorialProgress     = {},
-		tutorialComplete     = false,
-		claimedMail          = {},
-		unlockedMail         = {},
-	}
+local function PlayUI(id)
+	if shared.PlayUISound then shared.PlayUISound(id) end
 end
 
-local function DefaultRuntime()
-	return {
-		cubes          = {},
-		cubeOrder      = {},
-		cubeCount      = 0,
-		nextCubeId     = 1,
-		totalMutatedValue = 0, -- NEW: Track the total value instantly
-		lastActiveTime = tick(),
-		sessionStart   = tick(),
-	}
+local function IsUnlocked(idx)
+	for _, v in ipairs(unlockedAreas) do if v == idx then return true end end
+	return false
 end
 
-local PlayerData    = {}
-local PlayerRuntime = {}
-local lastSaveTick  = {}
-local pendingSave   = {}
+local AreaAssets = ReplicatedStorage:WaitForChild("AreaAssets")
+local previewRotationConn, previewModelInViewport = nil, nil
 
-local function DeepMerge(saved, defaults)
-	for key, defaultValue in pairs(defaults) do
-		if saved[key] == nil then
-			saved[key] = defaultValue
-		elseif type(defaultValue) == "table" and type(saved[key]) == "table"
-			and not getmetatable(saved[key]) then
-			if defaultValue[1] == nil then
-				DeepMerge(saved[key], defaultValue)
-			end
-		end
+-- ✨ FLIPBOOK ANIMATION SYSTEM
+local flipbookConnection = nil
+local currentFlipbook = nil
+local flipbookFrame = 1
+local flipbookTime = 0
+
+local function StopFlipbook()
+	if flipbookConnection then
+		flipbookConnection:Disconnect()
+		flipbookConnection = nil
 	end
+	currentFlipbook = nil
 end
 
-local function EnsureUnlockedAreas(data)
-	if type(data.unlockedAreas) ~= "table" then data.unlockedAreas = { 1 } end
-	local has1, hasCurrent = false, false
-	for _, v in ipairs(data.unlockedAreas) do
-		if v == 1 then has1 = true end
-		if v == data.currentArea then hasCurrent = true end
-	end
-	if not has1 then table.insert(data.unlockedAreas, 1) end
-	if not hasCurrent and data.currentArea ~= 1 then
-		table.insert(data.unlockedAreas, data.currentArea)
-	end
-end
-
-local function SaveData(player)
-	local uid  = player.UserId
-	local data = PlayerData[uid]
-	if not data then return end
-	local now, last = tick(), lastSaveTick[uid] or 0
-	if now - last >= SAVE_COOLDOWN then
-		lastSaveTick[uid] = now
-		local ok, err = pcall(function() PlayerDB:SetAsync("Player_" .. uid, data) end)
-		if not ok then warn("[GameManager] SaveData failed for", player.Name, ":", err) end
-	else
-		if not pendingSave[uid] then
-			pendingSave[uid] = true
-			task.delay(SAVE_COOLDOWN - (now - last) + 0.5, function()
-				pendingSave[uid] = nil
-				if player and player.Parent and PlayerData[uid] then
-					local ok, err = pcall(function() PlayerDB:SetAsync("Player_" .. uid, PlayerData[uid]) end)
-					lastSaveTick[uid] = tick()
-					if not ok then warn("[GameManager] Deferred save failed for", player.Name, ":", err) end
-				end
-			end)
-		end
-	end
-end
-
-local function LoadData(player)
-	local key      = "Player_" .. player.UserId
-	local ok, data = pcall(function() return PlayerDB:GetAsync(key) end)
-
-	if ok and data then
-		DeepMerge(data, DefaultData())
-		PlayerData[player.UserId] = data
-	else
-		PlayerData[player.UserId] = DefaultData()
-	end
-
-	EnsureUnlockedAreas(PlayerData[player.UserId])
-	PlayerRuntime[player.UserId] = DefaultRuntime()
-
-	local d = PlayerData[player.UserId]
-
-	if AdminConfig.WipeMoneyOnLoad then
-		d.currency           = 0
-		d.totalEarned        = 0
-		d.pendingAuras       = 0
-		d.pendingPayout      = 0
-		d.pendingBonusPayout = 0
-		d.lastPayout         = 0
-		for k in pairs(d.upgrades) do d.upgrades[k] = 0 end
-		d.totalCubesProduced    = 0
-		d.totalPlatformsShipped = 0
-		d.totalLegendaryCubes   = 0
-		d.piggyBank             = 0
-		d.piggyBankBroken       = 0
-		d.farmEvaluation        = 0
-		d.goldenAuras           = AdminConfig.GoldenAuraStart or 10
-		d.boostInventory        = { AuraRush = 0, SpawnBoost = 0, SoulBoost = 0 }
-		d.hasPrestigedThisArea  = false   -- FIX: reset on money wipe
-		d.claimedMail = {}           -- ADD THIS: reset claimed mail
-		d.tutorialProgress = {}      -- ADD THIS: reset tutorial popups
-		d.tutorialComplete = false   -- ADD THIS: reset tutorial lockout
-	end
-
-	if AdminConfig.WipePrestigeOnLoad then
-		d.soulAuras            = 0
-		d.prestigeCount        = 0
-		d.hasPrestigedThisArea = false   -- FIX: reset on prestige wipe
-	end
-
-	if AdminConfig.WipeAreaOnLoad then
-		d.currentArea          = 1
-		d.farmEvaluation       = 0
-		d.unlockedAreas        = { 1 }
-		d.hasPrestigedThisArea = false   -- FIX: reset on area wipe
-	end
+local function StartFlipbook(areaIdx)
+	StopFlipbook()
 	
-	if AdminConfig.WipeEpicOnLoad then
-		d.GoldenAuras = 0
-		d.epicUpgrades = {}
-	end
+	local flipbookData = AreaRegistry.GetFlipbook(areaIdx)
+	if not flipbookData then return end
 	
-	if AdminConfig.WipeAchievementsOnLoad then
-		d.totalCubesProduced = 0
-		d.totalLegendaryCubes = 0
-		d.totalPlatformsShipped = 0
-	end
-
-	-- Safety: Phase 4 fields always exist, never wiped
-	if not d.epicUpgrades     then d.epicUpgrades     = {} end
-	if not d.tutorialProgress then d.tutorialProgress = {} end
-	if d.tutorialComplete == nil then d.tutorialComplete = false end
-	if not d.claimedMail      then d.claimedMail      = {} end
-	if not d.unlockedMail     then d.unlockedMail     = {} end
-	if d.hasPrestigedThisArea == nil then d.hasPrestigedThisArea = false end
-
-	task.wait(1)
-
-	local habCfg = UpgradeConfig.GetUpgradeConfig("habitatCapacity")
-	local habCap  = (habCfg and habCfg.apply) and habCfg.apply(d) or AdminConfig.BaseHabitatCapacity
-	local tickCfg = UpgradeConfig.GetUpgradeConfig("passiveTickSpeed")
-	local passInt = (tickCfg and tickCfg.apply) and tickCfg.apply(d) or AdminConfig.PassiveInterval
-
-	-- ✨ FIX: Build upgrades table for ClickHandler tier unlock checks
-	local upgradesState = {}
-	for upgradeId, level in pairs(d.upgrades or {}) do
-		upgradesState[upgradeId] = { level = level }
-	end
-
-	ReplicatedStorage.RemoteEvents.UpdateHUD:FireClient(player, {
-		currency             = d.currency,
-		pendingAuras         = 0,
-		habitatCapacity      = habCap,
-		rate                 = 0,
-		passiveInterval      = passInt,
-		totalEarned          = d.totalEarned        or 0,
-		soulAuras            = d.soulAuras          or 0,
-		farmEvaluation       = d.farmEvaluation     or 0,
-		goldenAuras          = d.goldenAuras        or 0,
-		boostInventory       = d.boostInventory     or {},
-		settings             = d.settings           or {},
-		prestigeCount        = d.prestigeCount      or 0,
-		hasPrestigedThisArea = d.hasPrestigedThisArea or false,
-		tutorialProgress     = d.tutorialProgress   or {},
-		tutorialComplete     = d.tutorialComplete   or false,
-		epicUpgrades         = d.epicUpgrades       or {},
-		totalCubesProduced   = d.totalCubesProduced or 0,
-		currentArea          = d.currentArea or 1,
-		upgrades             = upgradesState,  -- ✨ FIX: was missing - needed for tier unlocks!
-	})
-
-	-- FIX: Send UpgradeUpdated fullState so ShopController has data on join
-	-- This fires AFTER UpdateHUD so the shop has both currency AND upgrade state
-	-- FIX: Send UpgradeUpdated fullState so ShopController has data on join
-	task.delay(0.5, function()
-		if not player or not player.Parent then return end
-		local resetState = {}
-
-		-- SURGICAL FIX: Use Tiered Loop and New CalculateCost function
-		for tierNum, tierData in ipairs(UpgradeConfig.Tiers) do
-			for upgradeId, cfg in pairs(tierData.upgrades) do
-				local lv = d.upgrades[upgradeId] or 0
-				local maxed = lv >= cfg.maxLevel
-
-				resetState[upgradeId] = {
-					level    = lv,
-					maxLevel = cfg.maxLevel,
-					cost     = maxed and 0 or UpgradeConfig.CalculateCost(upgradeId, lv),
-					maxed    = maxed,
-				}
+	currentFlipbook = flipbookData
+	flipbookFrame = 1
+	flipbookTime = 0
+	
+	local AreaIcon = AreaBrowser:FindFirstChild("AreaIcon")
+	if not AreaIcon then return end
+	
+	-- Set up the image for flipbook
+	AreaIcon.Image = flipbookData.image
+	AreaIcon.ImageRectSize = Vector2.new(flipbookData.frameW, flipbookData.frameH)
+	AreaIcon.ImageRectOffset = Vector2.new(0, 0)
+	
+	-- Animation loop
+	flipbookConnection = RunService.RenderStepped:Connect(function(dt)
+		flipbookTime += dt
+		local frameTime = 1 / flipbookData.fps
+		
+		if flipbookTime >= frameTime then
+			flipbookTime = flipbookTime % frameTime
+			flipbookFrame = flipbookFrame + 1
+			
+			if flipbookFrame > flipbookData.frames then
+				flipbookFrame = 1
 			end
-		end
-
-		local UpgradeUpdated = ReplicatedStorage.RemoteEvents:FindFirstChild("UpgradeUpdated")
-		if UpgradeUpdated then
-			UpgradeUpdated:FireClient(player, {
-				type     = "fullState",
-				upgrades = resetState,
-				currency = d.currency,
-			})
+			
+			-- Calculate frame position in sprite sheet
+			local col = (flipbookFrame - 1) % flipbookData.columns
+			local row = math.floor((flipbookFrame - 1) / flipbookData.columns)
+			local offsetX = col * flipbookData.frameW
+			local offsetY = row * flipbookData.frameH
+			
+			AreaIcon.ImageRectOffset = Vector2.new(offsetX, offsetY)
 		end
 	end)
 end
 
-Players.PlayerAdded:Connect(LoadData)
-Players.PlayerRemoving:Connect(function(player)
-	local uid  = player.UserId
-	local data = PlayerData[uid]
-	if data then pcall(function() PlayerDB:SetAsync("Player_" .. uid, data) end) end
-	pendingSave[uid]   = nil
-	lastSaveTick[uid]  = nil
-	PlayerData[uid]    = nil
-	PlayerRuntime[uid] = nil
-end)
-
-local lastPeriodicSave = tick()
-game:GetService("RunService").Heartbeat:Connect(function()
-	if tick() - lastPeriodicSave >= 60 then
-		lastPeriodicSave = tick()
-		for _, p in ipairs(Players:GetPlayers()) do SaveData(p) end
+local function LoadAreaPreview(viewport, worldModel, areaIndex)
+	if previewRotationConn then previewRotationConn:Disconnect(); previewRotationConn = nil end
+	previewModelInViewport = nil; worldModel:ClearAllChildren()
+	local auraFolder = AreaAssets:FindFirstChild("Area" .. areaIndex)
+	auraFolder = auraFolder and auraFolder:FindFirstChild("Auras")
+	local auraModel = auraFolder and auraFolder:FindFirstChildWhichIsA("Model")
+	local displayModel
+	if auraModel then
+		displayModel = auraModel:Clone(); displayModel.Parent = worldModel
+	else
+		local areaData = AreaRegistry.Get(areaIndex)
+		local color = (areaData and areaData.auraPreviewColor) or Color3.fromRGB(200,200,200)
+		local sphere = Instance.new("Part")
+		sphere.Shape = Enum.PartType.Ball; sphere.Size = Vector3.new(3,3,3)
+		sphere.Color = color; sphere.Material = Enum.Material.Neon
+		sphere.Anchored = true; sphere.CastShadow = false; sphere.Position = Vector3.new(0,0,0)
+		local glow = Instance.new("PointLight"); glow.Brightness=3; glow.Range=10; glow.Color=color; glow.Parent=sphere
+		local model = Instance.new("Model"); model.Name="PreviewModel"; model.PrimaryPart=sphere
+		sphere.Parent = model; model.Parent = worldModel; displayModel = model
 	end
-end)
-
----------------------------------------------------------------
--- TutorialStepComplete handler
----------------------------------------------------------------
-task.spawn(function()
-	local TutorialStepComplete = ReplicatedStorage.RemoteEvents:WaitForChild("TutorialStepComplete", 10)
-	if not TutorialStepComplete then return end
-	TutorialStepComplete.OnServerEvent:Connect(function(player, stepId)
-		local uid  = player.UserId
-		local data = PlayerData[uid]
-		if not data then return end
-		if not data.tutorialProgress then data.tutorialProgress = {} end
-		if stepId == "__tutorialComplete__" then
-			data.tutorialComplete = true
-		elseif type(stepId) == "string" and #stepId < 100 then
-			data.tutorialProgress[stepId] = true
+	local cf, size = displayModel:GetBoundingBox()
+	local center, radius = cf.Position, math.max(size.X, size.Y, size.Z)
+	local camera = Instance.new("Camera"); camera.FieldOfView = 45
+	camera.CFrame = CFrame.new(center + Vector3.new(0, radius*0.2, radius*2.2), center)
+	camera.Parent = worldModel; viewport.CurrentCamera = camera
+	previewModelInViewport = displayModel
+	local angle = 0
+	previewRotationConn = RunService.RenderStepped:Connect(function(dt)
+		if not previewModelInViewport or not previewModelInViewport.Parent then
+			previewRotationConn:Disconnect(); previewRotationConn = nil; return
 		end
+		angle += dt * 40
+		local p = previewModelInViewport:GetBoundingBox()
+		previewModelInViewport:PivotTo(CFrame.new(p.Position) * CFrame.Angles(0, math.rad(angle), 0))
 	end)
+end
+
+local StatsPanel = Instance.new("Frame")
+StatsPanel.Name="StatsPanel"; StatsPanel.Size = UDim2.new(0.88, 0, 0.82, 0)
+StatsPanel.Position = UDim2.new(0.5, 0, 0.5, 0)
+StatsPanel.AnchorPoint = Vector2.new(0.5, 0.5)
+StatsPanel.BackgroundColor3=T.panelBG; StatsPanel.BorderSizePixel=0
+StatsPanel.Visible=false; StatsPanel.ZIndex=30; StatsPanel.ClipsDescendants=true
+StatsPanel.Parent=mainHUD
+Instance.new("UICorner",StatsPanel).CornerRadius=UDim.new(0,PR)
+
+local sizeConstraint = Instance.new("UISizeConstraint")
+sizeConstraint.MaxSize = Vector2.new(PW, PH) 
+sizeConstraint.Parent = StatsPanel
+
+local panelStroke=Instance.new("UIStroke"); panelStroke.Color=T.panelStroke; panelStroke.Thickness=2; panelStroke.Parent=StatsPanel
+
+local HeaderBar=Instance.new("Frame"); HeaderBar.Size=UDim2.new(1,0,0,46); HeaderBar.BackgroundColor3=T.headerBG
+HeaderBar.BorderSizePixel=0; HeaderBar.ZIndex=31; HeaderBar.Parent=StatsPanel
+Instance.new("UICorner",HeaderBar).CornerRadius=UDim.new(0,PR)
+local HeaderLabel=Instance.new("TextLabel"); HeaderLabel.Size=UDim2.new(1,-50,1,0); HeaderLabel.Position=UDim2.new(0,16,0,0)
+HeaderLabel.BackgroundTransparency=1; HeaderLabel.Text="AREA TRAVEL"; HeaderLabel.TextColor3=T.headerText
+HeaderLabel.TextScaled=true; HeaderLabel.Font=T.font; HeaderLabel.TextXAlignment=Enum.TextXAlignment.Left
+HeaderLabel.ZIndex=32; HeaderLabel.Parent=HeaderBar
+local CloseBtn=Instance.new("TextButton"); CloseBtn.Size=UDim2.new(0,32,0,32); CloseBtn.Position=UDim2.new(1,-40,0.5,-16)
+CloseBtn.BackgroundColor3=T.buttonRed; CloseBtn.BorderSizePixel=0; CloseBtn.Text="X"; CloseBtn.TextColor3=T.bodyText
+CloseBtn.TextScaled=true; CloseBtn.Font=T.font; CloseBtn.ZIndex=33; CloseBtn.Parent=HeaderBar
+CloseBtn:SetAttribute("TutorialTarget", "PortalCloseBtn")
+Instance.new("UICorner",CloseBtn).CornerRadius=UDim.new(0,6)
+
+local ScrollContainer = Instance.new("ScrollingFrame")
+ScrollContainer.Name = "ScrollContainer"
+ScrollContainer.Size = UDim2.new(1, 0, 1, -46) 
+ScrollContainer.Position = UDim2.new(0, 0, 0, 46) 
+ScrollContainer.BackgroundTransparency = 1
+ScrollContainer.BorderSizePixel = 0
+ScrollContainer.CanvasSize = UDim2.new(0, 0, 0, 0)
+ScrollContainer.AutomaticCanvasSize = Enum.AutomaticSize.Y 
+ScrollContainer.ScrollBarThickness = 6
+ScrollContainer.Parent = StatsPanel
+
+local listLayout = Instance.new("UIListLayout")
+listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+listLayout.Padding = UDim.new(0, 10) 
+listLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center 
+listLayout.Parent = ScrollContainer
+
+local topPadding = Instance.new("UIPadding")
+topPadding.PaddingTop = UDim.new(0, 10)
+topPadding.PaddingBottom = UDim.new(0, 10)
+topPadding.Parent = ScrollContainer
+
+
+local GoalSection=Instance.new("Frame"); GoalSection.Size=UDim2.new(1,-24,0,90)
+GoalSection.BackgroundColor3=T.cardBG; GoalSection.BorderSizePixel=0; GoalSection.ZIndex=31; GoalSection.Parent=ScrollContainer
+Instance.new("UICorner",GoalSection).CornerRadius=UDim.new(0,8)
+local FarmEvalTitle=Instance.new("TextLabel"); FarmEvalTitle.Size=UDim2.new(1,-12,0,16); FarmEvalTitle.Position=UDim2.new(0,12,0,6)
+FarmEvalTitle.BackgroundTransparency=1; FarmEvalTitle.Text="FARM EVALUATION"; FarmEvalTitle.TextColor3=T.subText
+FarmEvalTitle.TextScaled=true; FarmEvalTitle.Font=T.font; FarmEvalTitle.TextXAlignment=Enum.TextXAlignment.Left
+FarmEvalTitle.ZIndex=32; FarmEvalTitle.Parent=GoalSection
+local FarmEvalNumber=Instance.new("TextLabel"); FarmEvalNumber.Name="FarmEvalNumber"
+FarmEvalNumber.Size=UDim2.new(1,-12,0,28); FarmEvalNumber.Position=UDim2.new(0,12,0,22)
+FarmEvalNumber.BackgroundTransparency=1; FarmEvalNumber.Text="$0"; FarmEvalNumber.TextColor3=T.accentGreen
+FarmEvalNumber.TextScaled=true; FarmEvalNumber.Font=T.font; FarmEvalNumber.TextXAlignment=Enum.TextXAlignment.Left
+FarmEvalNumber.ZIndex=32; FarmEvalNumber.Parent=GoalSection
+local ProgressBG=Instance.new("Frame"); ProgressBG.Size=UDim2.new(1,-24,0,8); ProgressBG.Position=UDim2.new(0,12,0,54)
+ProgressBG.BackgroundColor3=Color3.fromRGB(40,50,70); ProgressBG.BorderSizePixel=0; ProgressBG.ZIndex=32; ProgressBG.Parent=GoalSection
+Instance.new("UICorner",ProgressBG).CornerRadius=UDim.new(0,4)
+local ProgressFill=Instance.new("Frame"); ProgressFill.Name="ProgressFill"; ProgressFill.Size=UDim2.new(0,0,1,0)
+ProgressFill.BackgroundColor3=T.accentGreen; ProgressFill.BorderSizePixel=0; ProgressFill.ZIndex=33; ProgressFill.Parent=ProgressBG
+Instance.new("UICorner",ProgressFill).CornerRadius=UDim.new(0,4)
+local ProgressLabel=Instance.new("TextLabel"); ProgressLabel.Name="ProgressLabel"
+ProgressLabel.Size=UDim2.new(1,-12,0,14); ProgressLabel.Position=UDim2.new(0,12,0,66)
+ProgressLabel.BackgroundTransparency=1; ProgressLabel.Text=""; ProgressLabel.TextColor3=T.subText
+ProgressLabel.TextScaled=true; ProgressLabel.Font=T.fontBody; ProgressLabel.TextXAlignment=Enum.TextXAlignment.Left
+ProgressLabel.ZIndex=32; ProgressLabel.Parent=GoalSection
+
+local AreaBrowser=Instance.new("Frame"); AreaBrowser.Size=UDim2.new(1,-24,0,260)
+AreaBrowser.BackgroundColor3=T.cardBG; AreaBrowser.BorderSizePixel=0; AreaBrowser.ZIndex=31; AreaBrowser.Parent=ScrollContainer
+Instance.new("UICorner",AreaBrowser).CornerRadius=UDim.new(0,8)
+local BrowseAreaName=Instance.new("TextLabel"); BrowseAreaName.Size=UDim2.new(0.6, 0, 0, 24)
+BrowseAreaName.AnchorPoint=Vector2.new(0.5, 0)
+BrowseAreaName.Position=UDim2.new(0.5, 0, 0, 8)
+BrowseAreaName.BackgroundTransparency=1; BrowseAreaName.Text="Starter Area"; BrowseAreaName.TextColor3=T.accentBlue
+BrowseAreaName.TextScaled=true; BrowseAreaName.Font=T.font; BrowseAreaName.TextXAlignment=Enum.TextXAlignment.Center
+BrowseAreaName.ZIndex=32; BrowseAreaName.Parent=AreaBrowser
+local AreaIndexLabel=Instance.new("TextLabel"); AreaIndexLabel.Size=UDim2.new(0,60,0,20); AreaIndexLabel.Position=UDim2.new(1,-66,0,10)
+AreaIndexLabel.BackgroundTransparency=1; AreaIndexLabel.Text="1/5"; AreaIndexLabel.TextColor3=T.subText
+AreaIndexLabel.TextScaled=true; AreaIndexLabel.Font=T.fontBody; AreaIndexLabel.TextXAlignment=Enum.TextXAlignment.Right
+AreaIndexLabel.ZIndex=32; AreaIndexLabel.Parent=AreaBrowser
+local BrowseAreaMult=Instance.new("TextLabel"); BrowseAreaMult.Size=UDim2.new(1,-20,0,18); BrowseAreaMult.Position=UDim2.new(0,10,0,34)
+BrowseAreaMult.BackgroundTransparency=1; BrowseAreaMult.Text="Cube Value: 1.0x base"; BrowseAreaMult.TextColor3=T.accentGold
+BrowseAreaMult.TextScaled=true; BrowseAreaMult.Font=T.fontBody; BrowseAreaMult.TextXAlignment=Enum.TextXAlignment.Center
+BrowseAreaMult.ZIndex=32; BrowseAreaMult.Parent=AreaBrowser
+local LeftArrow=Instance.new("TextButton"); LeftArrow.Size=UDim2.new(0,36,0,36); LeftArrow.Position=UDim2.new(0,8,0,62)
+LeftArrow.BackgroundColor3=T.headerBG; LeftArrow.BorderSizePixel=0; LeftArrow.Text="<"; LeftArrow.TextColor3=T.bodyText
+LeftArrow.TextScaled=true; LeftArrow.Font=T.font; LeftArrow.ZIndex=33; LeftArrow.Parent=AreaBrowser
+Instance.new("UICorner",LeftArrow).CornerRadius=UDim.new(0,18)
+local RightArrow=Instance.new("TextButton"); RightArrow.Size=UDim2.new(0,36,0,36); RightArrow.Position=UDim2.new(1,-44,0,62)
+RightArrow.BackgroundColor3=T.headerBG; RightArrow.BorderSizePixel=0; RightArrow.Text=">"; RightArrow.TextColor3=T.bodyText
+RightArrow.TextScaled=true; RightArrow.Font=T.font; RightArrow.ZIndex=33; RightArrow.Parent=AreaBrowser
+RightArrow:SetAttribute("TutorialTarget", "ArrowBtn")
+Instance.new("UICorner",RightArrow).CornerRadius=UDim.new(0,18)
+local AreaIcon = Instance.new("ImageLabel")
+AreaIcon.Name = "AreaIcon" 
+AreaIcon.AnchorPoint = Vector2.new(0.5, 0)
+AreaIcon.Size = UDim2.new(0, 110, 0, 110)
+AreaIcon.Position = UDim2.new(0.5, 0, 0, 54)
+AreaIcon.BackgroundTransparency = 1
+AreaIcon.BorderSizePixel = 0
+AreaIcon.ZIndex = 33
+AreaIcon.Image = "" 
+AreaIcon.Parent = AreaBrowser
+local BrowseStatus=Instance.new("TextLabel"); BrowseStatus.Size=UDim2.new(1,-24,0,20); BrowseStatus.Position=UDim2.new(0,12,0,172)
+BrowseStatus.BackgroundTransparency=1; BrowseStatus.Text="CURRENT AREA"; BrowseStatus.TextColor3=T.subText
+BrowseStatus.TextScaled=true; BrowseStatus.Font=T.font; BrowseStatus.TextXAlignment=Enum.TextXAlignment.Center
+BrowseStatus.ZIndex=32; BrowseStatus.Parent=AreaBrowser
+local BrowseProgress=Instance.new("TextLabel"); BrowseProgress.Size=UDim2.new(1,-24,0,28); BrowseProgress.Position=UDim2.new(0,12,0,194)
+BrowseProgress.BackgroundTransparency=1; BrowseProgress.Text=""; BrowseProgress.TextColor3=T.subText
+BrowseProgress.TextScaled=true; BrowseProgress.Font=T.fontBody; BrowseProgress.TextWrapped=true
+BrowseProgress.TextXAlignment=Enum.TextXAlignment.Center; BrowseProgress.ZIndex=32; BrowseProgress.Parent=AreaBrowser
+local TravelBtn=Instance.new("TextButton"); TravelBtn.Size=UDim2.new(1,-24,0,38); TravelBtn.Position=UDim2.new(0,12,0,220)
+TravelBtn.BackgroundColor3=T.buttonGreen; TravelBtn.BorderSizePixel=0; TravelBtn.Text="TRAVEL"; TravelBtn.TextColor3=T.bodyText
+TravelBtn.TextScaled=true; TravelBtn.Font=T.font; TravelBtn.Visible=false; TravelBtn.ZIndex=33; TravelBtn.Parent=AreaBrowser
+TravelBtn:SetAttribute("TutorialTarget", "TravelBtn")
+Instance.new("UICorner",TravelBtn).CornerRadius=UDim.new(0,8)
+
+local function AddButtonJuice(btn)
+	local scale = btn:FindFirstChildOfClass("UIScale")
+	if not scale then
+		scale = Instance.new("UIScale")
+		scale.Parent = btn
+	end
+
+	btn.MouseEnter:Connect(function()
+		TweenService:Create(scale, TweenInfo.new(0.15, Enum.EasingStyle.Sine), {Scale = 1.08}):Play()
+	end)
+
+	btn.MouseLeave:Connect(function()
+		TweenService:Create(scale, TweenInfo.new(0.15, Enum.EasingStyle.Sine), {Scale = 1}):Play()
+	end)
+
+	btn.MouseButton1Down:Connect(function()
+		TweenService:Create(scale, TweenInfo.new(0.1, Enum.EasingStyle.Sine), {Scale = 0.9}):Play()
+	end)
+
+	btn.MouseButton1Up:Connect(function()
+		TweenService:Create(scale, TweenInfo.new(0.2, Enum.EasingStyle.Bounce), {Scale = 1.08}):Play()
+	end)
+end
+
+AddButtonJuice(LeftArrow)
+AddButtonJuice(RightArrow)
+AddButtonJuice(TravelBtn)
+AddButtonJuice(CloseBtn)
+
+TravelBtn.MouseButton1Down:Connect(function()
+	if browseIndex == currentArea then return end
+	TravelToArea:FireServer(browseIndex)
 end)
 
----------------------------------------------------------------
--- Public API
----------------------------------------------------------------
-local GameManager = {}
-
-function GameManager.GetData(uid)    return PlayerData[uid]    end
-function GameManager.GetRuntime(uid) return PlayerRuntime[uid] end
-function GameManager.SavePlayer(p)   SaveData(p)               end
-
-function GameManager.AddCube(uid, cubeRecord)
-	local runtime = PlayerRuntime[uid]
-	if not runtime then return nil end
-	local id = runtime.nextCubeId
-	runtime.nextCubeId += 1	
-	runtime.cubes[id] = cubeRecord
-	runtime.totalMutatedValue += MutationConfig.GetMutatedValue(cubeRecord)
-	table.insert(runtime.cubeOrder, id)
-	runtime.cubeCount += 1
-	return id
+local function UpdateGoalSection()
+	FarmEvalNumber.Text = "$" .. Formatter.Format(liveFarmEval)
+	local nextGoalArea, nextGoalThreshold = nil, nil
+	for i = currentArea + 1, MAX_AREA do
+		local area = AreaRegistry.Get(i)
+		if area and liveFarmEval < (area.threshold or 0) then
+			nextGoalArea = i; nextGoalThreshold = area.threshold; break
+		end
+	end
+	if nextGoalThreshold and nextGoalThreshold > 0 then
+		local pct = math.clamp(liveFarmEval / nextGoalThreshold, 0, 1)
+		TweenService:Create(ProgressFill, TweenInfo.new(0.3), { Size = UDim2.new(pct,0,1,0) }):Play()
+		ProgressFill.BackgroundColor3 = pct >= 1 and Color3.fromRGB(80,255,160) or T.accentGreen
+		local needed = math.max(0, nextGoalThreshold - liveFarmEval)
+		ProgressLabel.Text = needed <= 0
+			and "New areas available! Browse below."
+			or "$" .. Formatter.Format(needed) .. " to unlock " .. AreaRegistry.GetName(nextGoalArea)
+		ProgressLabel.TextColor3 = needed <= 0 and T.accentTeal or T.subText
+	elseif portalReady then
+		ProgressFill.Size = UDim2.new(1,0,1,0); ProgressFill.BackgroundColor3 = T.accentTeal
+		ProgressLabel.Text = "Areas available! Pick a destination."; ProgressLabel.TextColor3 = T.accentTeal
+	elseif currentArea >= MAX_AREA then
+		ProgressFill.Size = UDim2.new(1,0,1,0); ProgressFill.BackgroundColor3 = T.accentGold
+		ProgressLabel.Text = "Maximum area reached."; ProgressLabel.TextColor3 = T.accentGold
+	end
 end
 
-function GameManager.RemoveCube(uid, cubeId)
-	local runtime = PlayerRuntime[uid]
-	if not runtime or not runtime.cubes[cubeId] then return end
-	runtime.cubes[cubeId] = nil
-	runtime.cubeCount -= 1
-end
+local function RefreshBrowser()
+	local idx = browseIndex
+	local areaData = AreaRegistry.Get(idx)	
+	if not areaData then return end
+	local AreaIcon = AreaBrowser:FindFirstChild("AreaIcon")
+	if not AreaIcon then return end
+	AreaIndexLabel.Text = idx .. " / " .. MAX_AREA
+	LeftArrow.Visible  = idx > 1
+	RightArrow.Visible = AreaRegistry.Get(idx+1) ~= nil
 
-function GameManager.CollectOldestCubes(uid, count)
-	local runtime = PlayerRuntime[uid]
-	if not runtime then return {}, {} end
-	local collected, collectedCubes, newOrder = {}, {}, {}
-	local needed = count
-	for _, cubeId in ipairs(runtime.cubeOrder) do
-		if runtime.cubes[cubeId] then
-			if needed > 0 then
-				table.insert(collected, cubeId)
-				table.insert(collectedCubes, runtime.cubes[cubeId])
+	local highestUnlocked = 1
+	for _, v in ipairs(unlockedAreas) do
+		if v > highestUnlocked then highestUnlocked = v end
+	end
 
-				-- 1. Grab the value BEFORE deleting it!
-				local valToRemove = MutationConfig.GetMutatedValue(runtime.cubes[cubeId])
-				runtime.totalMutatedValue -= valToRemove
+	local unlockReq = areaData.threshold or 0
+	local discReq = areaData.discoveryThreshold or (unlockReq * 0.25) 
 
-				-- 2. NOW delete it
-				runtime.cubes[cubeId] = nil
-				runtime.cubeCount -= 1
-				needed -= 1
+	if idx <= highestUnlocked then
+		-- ✨ Check for flipbook animation first
+		local flipbookData = AreaRegistry.GetFlipbook(idx)
+		if flipbookData then
+			StartFlipbook(idx)
+			AreaIcon.ImageColor3 = Color3.fromRGB(255, 255, 255)
+		else
+			StopFlipbook()
+			AreaIcon.Image = areaData.auraPreviewImage or ""
+			AreaIcon.ImageRectSize = Vector2.new(0, 0)
+			AreaIcon.ImageRectOffset = Vector2.new(0, 0)
+			AreaIcon.ImageColor3 = Color3.fromRGB(255, 255, 255)
+		end
+		BrowseAreaName.Text = AreaRegistry.GetName(idx)
+		BrowseAreaMult.Text = "Cube Value: " .. string.format("%.1f", AreaRegistry.GetMultiplier(idx)) .. "x base"
+
+		if idx == currentArea then
+			BrowseStatus.Text = "CURRENT AREA"; BrowseStatus.TextColor3 = T.accentGreen
+			BrowseProgress.Text = "This is your active farm."
+			BrowseProgress.TextColor3 = T.accentTeal
+			TravelBtn.Visible = false
+		else
+			BrowseStatus.Text = "PREVIOUS AREA"; BrowseStatus.TextColor3 = T.accentGreen
+			BrowseProgress.Text = "Travel back for free (no reset)."
+			BrowseProgress.TextColor3 = T.accentGreen
+			TravelBtn.Visible = true; TravelBtn.Text = "Travel"
+			TravelBtn.BackgroundColor3 = Color3.fromRGB(60,100,60)
+		end
+
+	elseif idx == highestUnlocked + 1 then
+		if liveFarmEval >= unlockReq then
+			-- ✨ Check for flipbook animation
+			local flipbookData = AreaRegistry.GetFlipbook(idx)
+			if flipbookData then
+				StartFlipbook(idx)
+				AreaIcon.ImageColor3 = Color3.fromRGB(255, 255, 255)
 			else
-				table.insert(newOrder, cubeId)
+				StopFlipbook()
+				AreaIcon.Image = areaData.auraPreviewImage or ""
+				AreaIcon.ImageRectSize = Vector2.new(0, 0)
+				AreaIcon.ImageRectOffset = Vector2.new(0, 0)
+				AreaIcon.ImageColor3 = Color3.fromRGB(255, 255, 255)
 			end
+			BrowseAreaName.Text = AreaRegistry.GetName(idx)
+			BrowseAreaMult.Text = "Cube Value: " .. string.format("%.1f", AreaRegistry.GetMultiplier(idx)) .. "x base"
+			BrowseStatus.Text = "UNLOCKED"; BrowseStatus.TextColor3 = T.accentTeal
+			BrowseProgress.Text = "Travel here (resets current run)."
+			BrowseProgress.TextColor3 = T.accentTeal
+			TravelBtn.Visible = true; TravelBtn.Text = "TRAVEL"
+			TravelBtn.BackgroundColor3 = T.buttonGreen
+
+		elseif liveFarmEval >= discReq then
+			-- ✨ Check for flipbook animation (dimmed for discovered)
+			local flipbookData = AreaRegistry.GetFlipbook(idx)
+			if flipbookData then
+				StartFlipbook(idx)
+				AreaIcon.ImageColor3 = Color3.fromRGB(180, 180, 180)
+			else
+				StopFlipbook()
+				AreaIcon.Image = areaData.auraPreviewImage or ""
+				AreaIcon.ImageRectSize = Vector2.new(0, 0)
+				AreaIcon.ImageRectOffset = Vector2.new(0, 0)
+				AreaIcon.ImageColor3 = Color3.fromRGB(255, 255, 255)
+			end
+			BrowseAreaName.Text = AreaRegistry.GetName(idx)
+			BrowseAreaMult.Text = "Cube Value: " .. string.format("%.1f", AreaRegistry.GetMultiplier(idx)) .. "x base"
+			BrowseStatus.Text = "DISCOVERED"; BrowseStatus.TextColor3 = T.accentPurple
+
+			local needed = math.max(0, unlockReq - liveFarmEval)
+			BrowseProgress.Text = "Requires $"..Formatter.Format(unlockReq).." Farm Eval\n$"..Formatter.Format(needed).." remaining"
+			BrowseProgress.TextColor3 = T.subText
+			TravelBtn.Visible = false
+
+		else
+			StopFlipbook()
+			AreaIcon.Image = areaData.auraPreviewImage or ""
+			AreaIcon.ImageRectSize = Vector2.new(0, 0)
+			AreaIcon.ImageRectOffset = Vector2.new(0, 0)
+			AreaIcon.ImageColor3 = Color3.fromRGB(0, 0, 0) 
+			BrowseAreaName.Text = "???"
+			BrowseAreaMult.Text = "???x base"
+			BrowseStatus.Text = "UNDISCOVERED"; BrowseStatus.TextColor3 = T.subText
+
+			local needed = math.max(0, discReq - liveFarmEval)
+			BrowseProgress.Text = "Keep growing to discover what's next.\n$"..Formatter.Format(needed).." to Discover"
+			BrowseProgress.TextColor3 = T.subText
+			TravelBtn.Visible = false
 		end
+
+	else
+		StopFlipbook()
+		AreaIcon.Image = areaData.auraPreviewImage or ""
+		AreaIcon.ImageRectSize = Vector2.new(0, 0)
+		AreaIcon.ImageRectOffset = Vector2.new(0, 0)
+		AreaIcon.ImageColor3 = Color3.fromRGB(0, 0, 0)
+		BrowseAreaName.Text = "???"
+		BrowseAreaMult.Text = "???x base"
+		BrowseStatus.Text = "LOCKED"; BrowseStatus.TextColor3 = T.subText
+		BrowseProgress.Text = "Unlock previous areas first."
+		BrowseProgress.TextColor3 = T.subText
+		TravelBtn.Visible = false
 	end
-	runtime.cubeOrder = newOrder
-	return collected, collectedCubes
 end
 
-game:BindToClose(function()
-	print("[GameManager] Server shutting down. Forcing final save for all players...")
-	for _, player in ipairs(Players:GetPlayers()) do
-		SaveData(player)
-	end
-	task.wait(2) -- Give DataStoreService a moment to flush the queues
+LeftArrow.MouseButton1Down:Connect(function()
+	if browseIndex > 1 then browseIndex -= 1; PlayUI(SoundConfig.UIArrow); RefreshBrowser() end
+end)
+RightArrow.MouseButton1Down:Connect(function()
+	if AreaRegistry.Get(browseIndex+1) then browseIndex += 1; PlayUI(SoundConfig.UIArrow); RefreshBrowser() end
 end)
 
-return GameManager
+local StatsBtn=Instance.new("TextButton"); StatsBtn.Name="NextAreaButton"
+StatsBtn.Size=UDim2.new(0,C.HUD.NextAreaButtonW,0,C.HUD.NextAreaButtonH)
+StatsBtn.Position=UDim2.new(0,156,1,C.HUD.BottomButtonY)
+StatsBtn.BackgroundColor3=T.headerBG; StatsBtn.BorderSizePixel=0
+StatsBtn.Text="Next Area"; StatsBtn.TextColor3=T.bodyText; StatsBtn.TextScaled=true; StatsBtn.Font=T.font
+StatsBtn.Visible = false
+StatsBtn.ZIndex=10; StatsBtn.Parent=mainHUD
+StatsBtn:SetAttribute("TutorialTarget", "AreaTravelButton")
+Instance.new("UICorner",StatsBtn).CornerRadius=UDim.new(0,8)
+AddButtonJuice(StatsBtn)
 
+local function OpenPanel()
+	panelOpen=true; browseIndex=currentArea; UpdateGoalSection(); RefreshBrowser()
+	StatsPanel.Visible=true
+	StatsPanel.Size=UDim2.new(0.88, 0, 0, 0)
+	TweenService:Create(StatsPanel, TweenInfo.new(0.35,Enum.EasingStyle.Back,Enum.EasingDirection.Out),
+		{ Size=UDim2.new(0.88, 0, 0.82, 0) }):Play()
+	UITheme.SetMenuVisible(true)
+end
+
+local function ClosePanel()
+	panelOpen=false; StopFlipbook(); PlayUI(SoundConfig.UIClose)
+	TweenService:Create(StatsPanel, TweenInfo.new(0.25,Enum.EasingStyle.Quad,Enum.EasingDirection.In),
+		{ Size=UDim2.new(0.88, 0, 0, 0) }):Play()
+	UITheme.SetMenuVisible(false)
+	task.delay(0.3, function() StatsPanel.Visible=false end)
+end
+StatsBtn.MouseButton1Down:Connect(function() if panelOpen then ClosePanel() else OpenPanel() end end)
+CloseBtn.MouseButton1Down:Connect(ClosePanel)
+
+local function ShowAreaBanner(info)
+	if info.travelType == "backward" then return end
+	local areaIndex = info.newArea or 2
+	local areaData = AreaRegistry.Get(areaIndex)
+	local areaName = info.areaName or AreaRegistry.GetName(areaIndex)
+	local multText = "Cube Value: "..string.format("%.1f", info.areaMultiplier or 1.0).."x"
+	local saText = (info.newSoulAuras and info.newSoulAuras > 0)
+		and ("+"..Formatter.Format(info.newSoulAuras).." Soul Auras") or nil
+	local accentColor = (areaData and areaData.auraHolderGlow) or T.accentTeal
+	local bannerH = saText and 82 or 64
+	local banner=Instance.new("Frame"); banner.Size=UDim2.new(0,BW,0,bannerH)
+	banner.Position=UDim2.new(0,-(BW+10),0,BY); banner.BackgroundColor3=T.panelBG; banner.BorderSizePixel=0
+	banner.ZIndex=55; banner.ClipsDescendants=true; banner.Parent=mainHUD
+	Instance.new("UICorner",banner).CornerRadius=UDim.new(0,BR)
+	local bs=Instance.new("UIStroke"); bs.Color=accentColor; bs.Thickness=1.5; bs.Parent=banner
+	local nameLabel=Instance.new("TextLabel"); nameLabel.Size=UDim2.new(1,-12,0,22); nameLabel.Position=UDim2.new(0,10,0,6)
+	nameLabel.BackgroundTransparency=1; nameLabel.Text=areaName; nameLabel.TextColor3=accentColor
+	nameLabel.TextScaled=true; nameLabel.Font=T.font; nameLabel.TextXAlignment=Enum.TextXAlignment.Left
+	nameLabel.ZIndex=56; nameLabel.Parent=banner
+	local multLabel=Instance.new("TextLabel"); multLabel.Size=UDim2.new(1,-12,0,18); multLabel.Position=UDim2.new(0,10,0,30)
+	multLabel.BackgroundTransparency=1; multLabel.Text=multText; multLabel.TextColor3=T.accentGold
+	multLabel.TextScaled=true; multLabel.Font=T.fontBody; multLabel.TextXAlignment=Enum.TextXAlignment.Left
+	multLabel.ZIndex=56; multLabel.Parent=banner
+	if saText then
+		local saLabel=Instance.new("TextLabel"); saLabel.Size=UDim2.new(1,-12,0,16); saLabel.Position=UDim2.new(0,10,0,52)
+		saLabel.BackgroundTransparency=1; saLabel.Text=saText; saLabel.TextColor3=T.accentPurple
+		saLabel.TextScaled=true; saLabel.Font=T.fontBody; saLabel.TextXAlignment=Enum.TextXAlignment.Left
+		saLabel.ZIndex=56; saLabel.Parent=banner
+	end
+	TweenService:Create(banner, TweenInfo.new(0.4,Enum.EasingStyle.Back,Enum.EasingDirection.Out),
+		{ Position=UDim2.new(0,10,0,BY) }):Play()
+	task.delay(4, function()
+		TweenService:Create(banner, TweenInfo.new(0.35,Enum.EasingStyle.Quad,Enum.EasingDirection.In),
+			{ Position=UDim2.new(0,-(BW+10),0,BY) }):Play()
+		task.delay(0.4, function() if banner and banner.Parent then banner:Destroy() end end)
+	end)
+end
+
+UpdateHUD.OnClientEvent:Connect(function(stats)
+	if stats.farmEvaluation ~= nil then liveFarmEval = stats.farmEvaluation end
+	if panelOpen then UpdateGoalSection(); RefreshBrowser() end
+end)
+
+AreaUpdated.OnClientEvent:Connect(function(info)
+	currentArea = info.currentArea or 1
+	if currentArea > 1 then player:SetAttribute("TutorialCompleted", true) end
+	portalReady = info.portalReady == true
+	if info.unlockedAreas then unlockedAreas = info.unlockedAreas end
+	MAX_AREA = info.maxArea or AreaRegistry.GetMaxArea()
+	if info.portalReady then AddPortalPrompt() else RemovePortalPrompt() end
+	if panelOpen then UpdateGoalSection(); RefreshBrowser() end
+end)
+
+AreaUnlocked.OnClientEvent:Connect(function(info)
+	portalReady = true; AddPortalPrompt()
+	if info.unlockedAreas then unlockedAreas = info.unlockedAreas end
+	local count = info.newAreasCount or 1
+	local highestName = info.highestNewName or "New Area"
+	local PBW = C.Banners.PortalBannerW; local PBH = C.Banners.PortalBannerH
+	local banner=Instance.new("Frame"); banner.Size=UDim2.new(0,PBW,0,PBH)
+	banner.Position=UDim2.new(0.5,-PBW/2,0,-PBH-10); banner.BackgroundColor3=T.panelBG; banner.BorderSizePixel=0
+	banner.ZIndex=60; banner.Parent=mainHUD
+	Instance.new("UICorner",banner).CornerRadius=UDim.new(0,BR)
+	local bStroke=Instance.new("UIStroke"); bStroke.Color=T.accentTeal; bStroke.Thickness=2; bStroke.Parent=banner
+	local bLabel=Instance.new("TextLabel"); bLabel.Size=UDim2.new(1,-20,1,0); bLabel.Position=UDim2.new(0,10,0,0)
+	bLabel.BackgroundTransparency=1
+	bLabel.Text = count == 1
+		and (highestName.." unlocked! Open Area Travel.")
+		or (count.." new areas unlocked! Open Area Travel to choose.")
+	bLabel.TextColor3=T.accentTeal; bLabel.TextScaled=true; bLabel.Font=T.font; bLabel.ZIndex=61; bLabel.Parent=banner
+	TweenService:Create(banner, TweenInfo.new(0.4,Enum.EasingStyle.Back,Enum.EasingDirection.Out),
+		{ Position=UDim2.new(0.5,-PBW/2,0,14) }):Play()
+	task.delay(5, function()
+		TweenService:Create(banner, TweenInfo.new(0.35,Enum.EasingStyle.Quad,Enum.EasingDirection.In),
+			{ Position=UDim2.new(0.5,-PBW/2,0,-PBH-10) }):Play()
+		task.delay(0.4, function() if banner and banner.Parent then banner:Destroy() end end)
+	end)
+end)
+
+PrestigeComplete.OnClientEvent:Connect(function(info)
+	if info.isPortalEntry then
+		portalReady=false; liveFarmEval=0; RemovePortalPrompt()
+		if panelOpen then ClosePanel() end
+	end
+end)
+
+AreaChanged.OnClientEvent:Connect(function(info)
+	currentArea = info.newArea or currentArea; browseIndex = currentArea; portalReady = false
+	if info.unlockedAreas then unlockedAreas = info.unlockedAreas end
+	if panelOpen then ClosePanel() end
+	ShowAreaBanner(info)
+end)
+
+function AddPortalPrompt()
+	if promptAdded then return end; promptAdded = true
+	local prompt=Instance.new("ProximityPrompt"); prompt.Name="PortalPrompt"; prompt.ObjectText="Portal"
+	prompt.ActionText="Open Area Travel"; prompt.HoldDuration=0.5; prompt.MaxActivationDistance=12
+	prompt.Parent=PositionPart
+	prompt.Triggered:Connect(function(p) if p == player and not panelOpen then OpenPanel() end end)
+end
+function RemovePortalPrompt()
+	promptAdded=false; local e=PositionPart:FindFirstChild("PortalPrompt"); if e then e:Destroy() end
+end
+
+local function RefreshLook()
+	UITheme.Apply(StatsPanel, "Panel")
+	UITheme.Apply(HeaderBar, "TitleBar")
+	UITheme.Apply(GoalSection, "ShopCard")
+	UITheme.Apply(AreaBrowser, "ShopCard")
+	UITheme.Apply(HeaderBar, "Panel")
+	UITheme.Apply(RightArrow, "Panel")
+	UITheme.Apply(LeftArrow, "Panel")
+	UITheme.Apply(StatsBtn, "Panel")
+	UITheme.ApplyShine(AreaBrowser)
+	UITheme.ApplyShine(GoalSection)
+	UITheme.ApplyShine(StatsPanel)
+	GoalSection.BackgroundColor3 = T.cardBG 
+	AreaBrowser.BackgroundColor3 = T.cardBG
+	local outerStroke = StatsPanel:FindFirstChildWhichIsA("UIStroke")
+	if outerStroke then
+		outerStroke.Color = Color3.fromRGB(255, 255, 255) 
+	end
+end
+
+task.wait(2)
+RefreshLook()
 -- ClickHandler
 -- Location: StarterPlayer > StarterPlayerScripts > ClickHandler
 -- CHANGES: Added local FormatNumber (K/M/B/T/Q)
@@ -1659,624 +1480,387 @@ ReplicatedStorage.RemoteEvents.UpgradeUpdated.OnClientEvent:Connect(function(inf
 	playerMaxTier = calculatedMaxTier
 end)
 
--- PortalController
--- Location: StarterPlayer > StarterPlayerScripts > PortalController
+-- AuraSpawner
+-- Location: ServerScriptService > AuraSpawner
 
-local Players           = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService        = game:GetService("RunService")
-local TweenService      = game:GetService("TweenService")
+local Players             = game:GetService("Players")
+local ReplicatedStorage   = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
 
-local AreaRegistry = require(ReplicatedStorage.Modules.AreaRegistry)
-local SoundConfig  = require(ReplicatedStorage.Modules.SoundConfig)
-local T            = require(ReplicatedStorage.Modules.UITheme).Get()
-local C            = require(ReplicatedStorage.Modules.UIConfig)
-local Formatter    = require(ReplicatedStorage.Modules.NumberFormatter) 
-local UITheme = require(game:GetService("ReplicatedStorage"):WaitForChild("Modules"):WaitForChild("UITheme"))
-local T = UITheme.Get("Custom")
-local AreaUpdated      = ReplicatedStorage.RemoteEvents:WaitForChild("AreaUpdated")
-local AreaUnlocked     = ReplicatedStorage.RemoteEvents:WaitForChild("AreaUnlocked")
-local EnterPortal      = ReplicatedStorage.RemoteEvents:WaitForChild("EnterPortal")
-local TravelToArea     = ReplicatedStorage.RemoteEvents:WaitForChild("TravelToArea")
-local AreaChanged      = ReplicatedStorage.RemoteEvents:WaitForChild("AreaChanged")
-local PrestigeComplete = ReplicatedStorage.RemoteEvents:WaitForChild("PrestigeComplete")
-local UpdateHUD        = ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHUD")
+local TierConfig     = require(ReplicatedStorage.Modules.TierConfig)
+local UpgradeConfig  = require(ReplicatedStorage.Modules.UpgradeConfig)
+local PrestigeModule = require(ReplicatedStorage.Modules.PrestigeModule)
+local AdminConfig    = require(ReplicatedStorage.Modules.AdminConfig)
+local MutationConfig = require(ReplicatedStorage.Modules.MutationConfig)
+local AreaRegistry   = require(ReplicatedStorage.Modules.AreaRegistry)
+local GameManager    = require(ServerScriptService.GameManager)
+local BoostManager   = require(ServerScriptService.BoostManager)
+local WeatherManager = require(ServerScriptService.WeatherManager) 
 
-local player    = Players.LocalPlayer
-local playerGui = player:WaitForChild("PlayerGui")
-local mainHUD   = playerGui:WaitForChild("MainHUD")
+local AuraSpawned    = ReplicatedStorage.RemoteEvents:WaitForChild("AuraSpawned")
+local ProduceAura    = ReplicatedStorage.RemoteEvents:WaitForChild("ProduceAura")
+local UpdateHatchery = ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHatchery")
+local UpdateHUD      = ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHUD")
+local HabitatFull    = ReplicatedStorage.RemoteEvents:WaitForChild("HabitatFull")
+local CubeMutated    = ReplicatedStorage.RemoteEvents:WaitForChild("CubeMutated")
 
-local PositionPart = workspace:WaitForChild("AuraHolder"):WaitForChild("Position")
+local HABITAT_HOLDER = workspace:WaitForChild("HabitatHolder")
+local HABITAT_PART = HABITAT_HOLDER:WaitForChild("Position")
+local lastFire          = {}
+local holdStart         = {}
+local hatchery          = {}
+local clickSessionStart = {}
 
-local promptAdded   = false
-local currentArea   = 1
-local portalReady   = false
-local panelOpen     = false
-local browseIndex   = 1
-local liveFarmEval  = 0
-local unlockedAreas = { 1 }
-local MAX_AREA      = AreaRegistry.GetMaxArea()
-
-local PW = C.Panels.AreaTravelW
-local PH = C.Panels.AreaTravelH
-local PR = C.Panels.CornerRadius
-local BW = C.Banners.AreaBannerW
-local BY = C.Banners.AreaBannerY
-local BR = C.Banners.CornerRadius
-
-local function PlayUI(id)
-	if shared.PlayUISound then shared.PlayUISound(id) end
+local function GetHatcheryMax(data)
+	local cfg = UpgradeConfig.GetUpgradeConfig("hatcheryCapacity")
+	return (cfg and cfg.apply) and cfg.apply(data) or AdminConfig.HatcheryMax
 end
 
-local function IsUnlocked(idx)
-	for _, v in ipairs(unlockedAreas) do if v == idx then return true end end
-	return false
+local function GetHabitatCapacity(data)
+	local cfg = UpgradeConfig.GetUpgradeConfig("habitatCapacity")
+	return (cfg and cfg.apply) and cfg.apply(data) or AdminConfig.BaseHabitatCapacity
 end
 
-local AreaAssets = ReplicatedStorage:WaitForChild("AreaAssets")
-local previewRotationConn, previewModelInViewport = nil, nil
-
--- ✨ FLIPBOOK ANIMATION SYSTEM
-local flipbookConnection = nil
-local currentFlipbook = nil
-local flipbookFrame = 1
-local flipbookTime = 0
-
-local function StopFlipbook()
-	if flipbookConnection then
-		flipbookConnection:Disconnect()
-		flipbookConnection = nil
-	end
-	currentFlipbook = nil
+local function GetMutationSpeedMult(data)
+	local cfg = UpgradeConfig.GetUpgradeConfig("mutationSpeed")
+	return (cfg and cfg.apply) and cfg.apply(data) or 1
 end
 
-local function StartFlipbook(areaIdx)
-	StopFlipbook()
-	
-	local flipbookData = AreaRegistry.GetFlipbook(areaIdx)
-	if not flipbookData then return end
-	
-	currentFlipbook = flipbookData
-	flipbookFrame = 1
-	flipbookTime = 0
-	
-	local AreaIcon = AreaBrowser:FindFirstChild("AreaIcon")
-	if not AreaIcon then return end
-	
-	-- Set up the image for flipbook
-	AreaIcon.Image = flipbookData.image
-	AreaIcon.ImageRectSize = Vector2.new(flipbookData.frameW, flipbookData.frameH)
-	AreaIcon.ImageRectOffset = Vector2.new(0, 0)
-	
-	-- Animation loop
-	flipbookConnection = RunService.RenderStepped:Connect(function(dt)
-		flipbookTime += dt
-		local frameTime = 1 / flipbookData.fps
-		
-		if flipbookTime >= frameTime then
-			flipbookTime = flipbookTime % frameTime
-			flipbookFrame = flipbookFrame + 1
-			
-			if flipbookFrame > flipbookData.frames then
-				flipbookFrame = 1
-			end
-			
-			-- Calculate frame position in sprite sheet
-			local col = (flipbookFrame - 1) % flipbookData.columns
-			local row = math.floor((flipbookFrame - 1) / flipbookData.columns)
-			local offsetX = col * flipbookData.frameW
-			local offsetY = row * flipbookData.frameH
-			
-			AreaIcon.ImageRectOffset = Vector2.new(offsetX, offsetY)
-		end
-	end)
-end
-
-local function LoadAreaPreview(viewport, worldModel, areaIndex)
-	if previewRotationConn then previewRotationConn:Disconnect(); previewRotationConn = nil end
-	previewModelInViewport = nil; worldModel:ClearAllChildren()
-	local auraFolder = AreaAssets:FindFirstChild("Area" .. areaIndex)
-	auraFolder = auraFolder and auraFolder:FindFirstChild("Auras")
-	local auraModel = auraFolder and auraFolder:FindFirstChildWhichIsA("Model")
-	local displayModel
-	if auraModel then
-		displayModel = auraModel:Clone(); displayModel.Parent = worldModel
-	else
-		local areaData = AreaRegistry.Get(areaIndex)
-		local color = (areaData and areaData.auraPreviewColor) or Color3.fromRGB(200,200,200)
-		local sphere = Instance.new("Part")
-		sphere.Shape = Enum.PartType.Ball; sphere.Size = Vector3.new(3,3,3)
-		sphere.Color = color; sphere.Material = Enum.Material.Neon
-		sphere.Anchored = true; sphere.CastShadow = false; sphere.Position = Vector3.new(0,0,0)
-		local glow = Instance.new("PointLight"); glow.Brightness=3; glow.Range=10; glow.Color=color; glow.Parent=sphere
-		local model = Instance.new("Model"); model.Name="PreviewModel"; model.PrimaryPart=sphere
-		sphere.Parent = model; model.Parent = worldModel; displayModel = model
-	end
-	local cf, size = displayModel:GetBoundingBox()
-	local center, radius = cf.Position, math.max(size.X, size.Y, size.Z)
-	local camera = Instance.new("Camera"); camera.FieldOfView = 45
-	camera.CFrame = CFrame.new(center + Vector3.new(0, radius*0.2, radius*2.2), center)
-	camera.Parent = worldModel; viewport.CurrentCamera = camera
-	previewModelInViewport = displayModel
-	local angle = 0
-	previewRotationConn = RunService.RenderStepped:Connect(function(dt)
-		if not previewModelInViewport or not previewModelInViewport.Parent then
-			previewRotationConn:Disconnect(); previewRotationConn = nil; return
-		end
-		angle += dt * 40
-		local p = previewModelInViewport:GetBoundingBox()
-		previewModelInViewport:PivotTo(CFrame.new(p.Position) * CFrame.Angles(0, math.rad(angle), 0))
-	end)
-end
-
-local StatsPanel = Instance.new("Frame")
-StatsPanel.Name="StatsPanel"; StatsPanel.Size = UDim2.new(0.88, 0, 0.82, 0)
-StatsPanel.Position = UDim2.new(0.5, 0, 0.5, 0)
-StatsPanel.AnchorPoint = Vector2.new(0.5, 0.5)
-StatsPanel.BackgroundColor3=T.panelBG; StatsPanel.BorderSizePixel=0
-StatsPanel.Visible=false; StatsPanel.ZIndex=30; StatsPanel.ClipsDescendants=true
-StatsPanel.Parent=mainHUD
-Instance.new("UICorner",StatsPanel).CornerRadius=UDim.new(0,PR)
-
-local sizeConstraint = Instance.new("UISizeConstraint")
-sizeConstraint.MaxSize = Vector2.new(PW, PH) 
-sizeConstraint.Parent = StatsPanel
-
-local panelStroke=Instance.new("UIStroke"); panelStroke.Color=T.panelStroke; panelStroke.Thickness=2; panelStroke.Parent=StatsPanel
-
-local HeaderBar=Instance.new("Frame"); HeaderBar.Size=UDim2.new(1,0,0,46); HeaderBar.BackgroundColor3=T.headerBG
-HeaderBar.BorderSizePixel=0; HeaderBar.ZIndex=31; HeaderBar.Parent=StatsPanel
-Instance.new("UICorner",HeaderBar).CornerRadius=UDim.new(0,PR)
-local HeaderLabel=Instance.new("TextLabel"); HeaderLabel.Size=UDim2.new(1,-50,1,0); HeaderLabel.Position=UDim2.new(0,16,0,0)
-HeaderLabel.BackgroundTransparency=1; HeaderLabel.Text="AREA TRAVEL"; HeaderLabel.TextColor3=T.headerText
-HeaderLabel.TextScaled=true; HeaderLabel.Font=T.font; HeaderLabel.TextXAlignment=Enum.TextXAlignment.Left
-HeaderLabel.ZIndex=32; HeaderLabel.Parent=HeaderBar
-local CloseBtn=Instance.new("TextButton"); CloseBtn.Size=UDim2.new(0,32,0,32); CloseBtn.Position=UDim2.new(1,-40,0.5,-16)
-CloseBtn.BackgroundColor3=T.buttonRed; CloseBtn.BorderSizePixel=0; CloseBtn.Text="X"; CloseBtn.TextColor3=T.bodyText
-CloseBtn.TextScaled=true; CloseBtn.Font=T.font; CloseBtn.ZIndex=33; CloseBtn.Parent=HeaderBar
-CloseBtn:SetAttribute("TutorialTarget", "PortalCloseBtn")
-Instance.new("UICorner",CloseBtn).CornerRadius=UDim.new(0,6)
-
-local ScrollContainer = Instance.new("ScrollingFrame")
-ScrollContainer.Name = "ScrollContainer"
-ScrollContainer.Size = UDim2.new(1, 0, 1, -46) 
-ScrollContainer.Position = UDim2.new(0, 0, 0, 46) 
-ScrollContainer.BackgroundTransparency = 1
-ScrollContainer.BorderSizePixel = 0
-ScrollContainer.CanvasSize = UDim2.new(0, 0, 0, 0)
-ScrollContainer.AutomaticCanvasSize = Enum.AutomaticSize.Y 
-ScrollContainer.ScrollBarThickness = 6
-ScrollContainer.Parent = StatsPanel
-
-local listLayout = Instance.new("UIListLayout")
-listLayout.SortOrder = Enum.SortOrder.LayoutOrder
-listLayout.Padding = UDim.new(0, 10) 
-listLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center 
-listLayout.Parent = ScrollContainer
-
-local topPadding = Instance.new("UIPadding")
-topPadding.PaddingTop = UDim.new(0, 10)
-topPadding.PaddingBottom = UDim.new(0, 10)
-topPadding.Parent = ScrollContainer
-
-
-local GoalSection=Instance.new("Frame"); GoalSection.Size=UDim2.new(1,-24,0,90)
-GoalSection.BackgroundColor3=T.cardBG; GoalSection.BorderSizePixel=0; GoalSection.ZIndex=31; GoalSection.Parent=ScrollContainer
-Instance.new("UICorner",GoalSection).CornerRadius=UDim.new(0,8)
-local FarmEvalTitle=Instance.new("TextLabel"); FarmEvalTitle.Size=UDim2.new(1,-12,0,16); FarmEvalTitle.Position=UDim2.new(0,12,0,6)
-FarmEvalTitle.BackgroundTransparency=1; FarmEvalTitle.Text="FARM EVALUATION"; FarmEvalTitle.TextColor3=T.subText
-FarmEvalTitle.TextScaled=true; FarmEvalTitle.Font=T.font; FarmEvalTitle.TextXAlignment=Enum.TextXAlignment.Left
-FarmEvalTitle.ZIndex=32; FarmEvalTitle.Parent=GoalSection
-local FarmEvalNumber=Instance.new("TextLabel"); FarmEvalNumber.Name="FarmEvalNumber"
-FarmEvalNumber.Size=UDim2.new(1,-12,0,28); FarmEvalNumber.Position=UDim2.new(0,12,0,22)
-FarmEvalNumber.BackgroundTransparency=1; FarmEvalNumber.Text="$0"; FarmEvalNumber.TextColor3=T.accentGreen
-FarmEvalNumber.TextScaled=true; FarmEvalNumber.Font=T.font; FarmEvalNumber.TextXAlignment=Enum.TextXAlignment.Left
-FarmEvalNumber.ZIndex=32; FarmEvalNumber.Parent=GoalSection
-local ProgressBG=Instance.new("Frame"); ProgressBG.Size=UDim2.new(1,-24,0,8); ProgressBG.Position=UDim2.new(0,12,0,54)
-ProgressBG.BackgroundColor3=Color3.fromRGB(40,50,70); ProgressBG.BorderSizePixel=0; ProgressBG.ZIndex=32; ProgressBG.Parent=GoalSection
-Instance.new("UICorner",ProgressBG).CornerRadius=UDim.new(0,4)
-local ProgressFill=Instance.new("Frame"); ProgressFill.Name="ProgressFill"; ProgressFill.Size=UDim2.new(0,0,1,0)
-ProgressFill.BackgroundColor3=T.accentGreen; ProgressFill.BorderSizePixel=0; ProgressFill.ZIndex=33; ProgressFill.Parent=ProgressBG
-Instance.new("UICorner",ProgressFill).CornerRadius=UDim.new(0,4)
-local ProgressLabel=Instance.new("TextLabel"); ProgressLabel.Name="ProgressLabel"
-ProgressLabel.Size=UDim2.new(1,-12,0,14); ProgressLabel.Position=UDim2.new(0,12,0,66)
-ProgressLabel.BackgroundTransparency=1; ProgressLabel.Text=""; ProgressLabel.TextColor3=T.subText
-ProgressLabel.TextScaled=true; ProgressLabel.Font=T.fontBody; ProgressLabel.TextXAlignment=Enum.TextXAlignment.Left
-ProgressLabel.ZIndex=32; ProgressLabel.Parent=GoalSection
-
-local AreaBrowser=Instance.new("Frame"); AreaBrowser.Size=UDim2.new(1,-24,0,260)
-AreaBrowser.BackgroundColor3=T.cardBG; AreaBrowser.BorderSizePixel=0; AreaBrowser.ZIndex=31; AreaBrowser.Parent=ScrollContainer
-Instance.new("UICorner",AreaBrowser).CornerRadius=UDim.new(0,8)
-local BrowseAreaName=Instance.new("TextLabel"); BrowseAreaName.Size=UDim2.new(0.6, 0, 0, 24)
-BrowseAreaName.AnchorPoint=Vector2.new(0.5, 0)
-BrowseAreaName.Position=UDim2.new(0.5, 0, 0, 8)
-BrowseAreaName.BackgroundTransparency=1; BrowseAreaName.Text="Starter Area"; BrowseAreaName.TextColor3=T.accentBlue
-BrowseAreaName.TextScaled=true; BrowseAreaName.Font=T.font; BrowseAreaName.TextXAlignment=Enum.TextXAlignment.Center
-BrowseAreaName.ZIndex=32; BrowseAreaName.Parent=AreaBrowser
-local AreaIndexLabel=Instance.new("TextLabel"); AreaIndexLabel.Size=UDim2.new(0,60,0,20); AreaIndexLabel.Position=UDim2.new(1,-66,0,10)
-AreaIndexLabel.BackgroundTransparency=1; AreaIndexLabel.Text="1/5"; AreaIndexLabel.TextColor3=T.subText
-AreaIndexLabel.TextScaled=true; AreaIndexLabel.Font=T.fontBody; AreaIndexLabel.TextXAlignment=Enum.TextXAlignment.Right
-AreaIndexLabel.ZIndex=32; AreaIndexLabel.Parent=AreaBrowser
-local BrowseAreaMult=Instance.new("TextLabel"); BrowseAreaMult.Size=UDim2.new(1,-20,0,18); BrowseAreaMult.Position=UDim2.new(0,10,0,34)
-BrowseAreaMult.BackgroundTransparency=1; BrowseAreaMult.Text="Cube Value: 1.0x base"; BrowseAreaMult.TextColor3=T.accentGold
-BrowseAreaMult.TextScaled=true; BrowseAreaMult.Font=T.fontBody; BrowseAreaMult.TextXAlignment=Enum.TextXAlignment.Center
-BrowseAreaMult.ZIndex=32; BrowseAreaMult.Parent=AreaBrowser
-local LeftArrow=Instance.new("TextButton"); LeftArrow.Size=UDim2.new(0,36,0,36); LeftArrow.Position=UDim2.new(0,8,0,62)
-LeftArrow.BackgroundColor3=T.headerBG; LeftArrow.BorderSizePixel=0; LeftArrow.Text="<"; LeftArrow.TextColor3=T.bodyText
-LeftArrow.TextScaled=true; LeftArrow.Font=T.font; LeftArrow.ZIndex=33; LeftArrow.Parent=AreaBrowser
-Instance.new("UICorner",LeftArrow).CornerRadius=UDim.new(0,18)
-local RightArrow=Instance.new("TextButton"); RightArrow.Size=UDim2.new(0,36,0,36); RightArrow.Position=UDim2.new(1,-44,0,62)
-RightArrow.BackgroundColor3=T.headerBG; RightArrow.BorderSizePixel=0; RightArrow.Text=">"; RightArrow.TextColor3=T.bodyText
-RightArrow.TextScaled=true; RightArrow.Font=T.font; RightArrow.ZIndex=33; RightArrow.Parent=AreaBrowser
-RightArrow:SetAttribute("TutorialTarget", "ArrowBtn")
-Instance.new("UICorner",RightArrow).CornerRadius=UDim.new(0,18)
-local AreaIcon = Instance.new("ImageLabel")
-AreaIcon.Name = "AreaIcon" 
-AreaIcon.AnchorPoint = Vector2.new(0.5, 0)
-AreaIcon.Size = UDim2.new(0, 110, 0, 110)
-AreaIcon.Position = UDim2.new(0.5, 0, 0, 54)
-AreaIcon.BackgroundTransparency = 1
-AreaIcon.BorderSizePixel = 0
-AreaIcon.ZIndex = 33
-AreaIcon.Image = "" 
-AreaIcon.Parent = AreaBrowser
-local BrowseStatus=Instance.new("TextLabel"); BrowseStatus.Size=UDim2.new(1,-24,0,20); BrowseStatus.Position=UDim2.new(0,12,0,172)
-BrowseStatus.BackgroundTransparency=1; BrowseStatus.Text="CURRENT AREA"; BrowseStatus.TextColor3=T.subText
-BrowseStatus.TextScaled=true; BrowseStatus.Font=T.font; BrowseStatus.TextXAlignment=Enum.TextXAlignment.Center
-BrowseStatus.ZIndex=32; BrowseStatus.Parent=AreaBrowser
-local BrowseProgress=Instance.new("TextLabel"); BrowseProgress.Size=UDim2.new(1,-24,0,28); BrowseProgress.Position=UDim2.new(0,12,0,194)
-BrowseProgress.BackgroundTransparency=1; BrowseProgress.Text=""; BrowseProgress.TextColor3=T.subText
-BrowseProgress.TextScaled=true; BrowseProgress.Font=T.fontBody; BrowseProgress.TextWrapped=true
-BrowseProgress.TextXAlignment=Enum.TextXAlignment.Center; BrowseProgress.ZIndex=32; BrowseProgress.Parent=AreaBrowser
-local TravelBtn=Instance.new("TextButton"); TravelBtn.Size=UDim2.new(1,-24,0,38); TravelBtn.Position=UDim2.new(0,12,0,220)
-TravelBtn.BackgroundColor3=T.buttonGreen; TravelBtn.BorderSizePixel=0; TravelBtn.Text="TRAVEL"; TravelBtn.TextColor3=T.bodyText
-TravelBtn.TextScaled=true; TravelBtn.Font=T.font; TravelBtn.Visible=false; TravelBtn.ZIndex=33; TravelBtn.Parent=AreaBrowser
-TravelBtn:SetAttribute("TutorialTarget", "TravelBtn")
-Instance.new("UICorner",TravelBtn).CornerRadius=UDim.new(0,8)
-
-local function AddButtonJuice(btn)
-	local scale = btn:FindFirstChildOfClass("UIScale")
-	if not scale then
-		scale = Instance.new("UIScale")
-		scale.Parent = btn
-	end
-
-	btn.MouseEnter:Connect(function()
-		TweenService:Create(scale, TweenInfo.new(0.15, Enum.EasingStyle.Sine), {Scale = 1.08}):Play()
-	end)
-
-	btn.MouseLeave:Connect(function()
-		TweenService:Create(scale, TweenInfo.new(0.15, Enum.EasingStyle.Sine), {Scale = 1}):Play()
-	end)
-
-	btn.MouseButton1Down:Connect(function()
-		TweenService:Create(scale, TweenInfo.new(0.1, Enum.EasingStyle.Sine), {Scale = 0.9}):Play()
-	end)
-
-	btn.MouseButton1Up:Connect(function()
-		TweenService:Create(scale, TweenInfo.new(0.2, Enum.EasingStyle.Bounce), {Scale = 1.08}):Play()
-	end)
-end
-
-AddButtonJuice(LeftArrow)
-AddButtonJuice(RightArrow)
-AddButtonJuice(TravelBtn)
-AddButtonJuice(CloseBtn)
-
-TravelBtn.MouseButton1Down:Connect(function()
-	if browseIndex == currentArea then return end
-	TravelToArea:FireServer(browseIndex)
+Players.PlayerAdded:Connect(function(p)
+	hatchery[p.UserId] = AdminConfig.HatcheryMax
+	clickSessionStart[p.UserId] = nil
+end)
+Players.PlayerRemoving:Connect(function(p)
+	hatchery[p.UserId]=nil; holdStart[p.UserId]=nil
+	lastFire[p.UserId]=nil; clickSessionStart[p.UserId]=nil
 end)
 
-local function UpdateGoalSection()
-	FarmEvalNumber.Text = "$" .. Formatter.Format(liveFarmEval)
-	local nextGoalArea, nextGoalThreshold = nil, nil
-	for i = currentArea + 1, MAX_AREA do
-		local area = AreaRegistry.Get(i)
-		if area and liveFarmEval < (area.threshold or 0) then
-			nextGoalArea = i; nextGoalThreshold = area.threshold; break
-		end
+task.spawn(function()
+	local PR = ServerScriptService:WaitForChild("PrestigeReset", 30)
+	if PR then
+		PR.Event:Connect(function(player)
+			local uid = player.UserId
+			local data = GameManager.GetData(uid)
+			hatchery[uid] = data and GetHatcheryMax(data) or AdminConfig.HatcheryMax
+			holdStart[uid]=nil; lastFire[uid]=nil; clickSessionStart[uid]=nil
+		end)
 	end
-	if nextGoalThreshold and nextGoalThreshold > 0 then
-		local pct = math.clamp(liveFarmEval / nextGoalThreshold, 0, 1)
-		TweenService:Create(ProgressFill, TweenInfo.new(0.3), { Size = UDim2.new(pct,0,1,0) }):Play()
-		ProgressFill.BackgroundColor3 = pct >= 1 and Color3.fromRGB(80,255,160) or T.accentGreen
-		local needed = math.max(0, nextGoalThreshold - liveFarmEval)
-		ProgressLabel.Text = needed <= 0
-			and "New areas available! Browse below."
-			or "$" .. Formatter.Format(needed) .. " to unlock " .. AreaRegistry.GetName(nextGoalArea)
-		ProgressLabel.TextColor3 = needed <= 0 and T.accentTeal or T.subText
-	elseif portalReady then
-		ProgressFill.Size = UDim2.new(1,0,1,0); ProgressFill.BackgroundColor3 = T.accentTeal
-		ProgressLabel.Text = "Areas available! Pick a destination."; ProgressLabel.TextColor3 = T.accentTeal
-	elseif currentArea >= MAX_AREA then
-		ProgressFill.Size = UDim2.new(1,0,1,0); ProgressFill.BackgroundColor3 = T.accentGold
-		ProgressLabel.Text = "Maximum area reached."; ProgressLabel.TextColor3 = T.accentGold
-	end
-end
+end)
 
-local function RefreshBrowser()
-	local idx = browseIndex
-	local areaData = AreaRegistry.Get(idx)	
-	if not areaData then return end
-	local AreaIcon = AreaBrowser:FindFirstChild("AreaIcon")
-	if not AreaIcon then return end
-	AreaIndexLabel.Text = idx .. " / " .. MAX_AREA
-	LeftArrow.Visible  = idx > 1
-	RightArrow.Visible = AreaRegistry.Get(idx+1) ~= nil
-
-	local highestUnlocked = 1
-	for _, v in ipairs(unlockedAreas) do
-		if v > highestUnlocked then highestUnlocked = v end
-	end
-
-	local unlockReq = areaData.threshold or 0
-	local discReq = areaData.discoveryThreshold or (unlockReq * 0.25) 
-
-	if idx <= highestUnlocked then
-		-- ✨ Check for flipbook animation first
-		local flipbookData = AreaRegistry.GetFlipbook(idx)
-		if flipbookData then
-			StartFlipbook(idx)
-			AreaIcon.ImageColor3 = Color3.fromRGB(255, 255, 255)
-		else
-			StopFlipbook()
-			AreaIcon.Image = areaData.auraPreviewImage or ""
-			AreaIcon.ImageRectSize = Vector2.new(0, 0)
-			AreaIcon.ImageRectOffset = Vector2.new(0, 0)
-			AreaIcon.ImageColor3 = Color3.fromRGB(255, 255, 255)
-		end
-		BrowseAreaName.Text = AreaRegistry.GetName(idx)
-		BrowseAreaMult.Text = "Cube Value: " .. string.format("%.1f", AreaRegistry.GetMultiplier(idx)) .. "x base"
-
-		if idx == currentArea then
-			BrowseStatus.Text = "CURRENT AREA"; BrowseStatus.TextColor3 = T.accentGreen
-			BrowseProgress.Text = "This is your active farm."
-			BrowseProgress.TextColor3 = T.accentTeal
-			TravelBtn.Visible = false
-		else
-			BrowseStatus.Text = "PREVIOUS AREA"; BrowseStatus.TextColor3 = T.accentGreen
-			BrowseProgress.Text = "Travel back for free (no reset)."
-			BrowseProgress.TextColor3 = T.accentGreen
-			TravelBtn.Visible = true; TravelBtn.Text = "Travel"
-			TravelBtn.BackgroundColor3 = Color3.fromRGB(60,100,60)
-		end
-
-	elseif idx == highestUnlocked + 1 then
-		if liveFarmEval >= unlockReq then
-			-- ✨ Check for flipbook animation
-			local flipbookData = AreaRegistry.GetFlipbook(idx)
-			if flipbookData then
-				StartFlipbook(idx)
-				AreaIcon.ImageColor3 = Color3.fromRGB(255, 255, 255)
+task.spawn(function()
+	while true do
+		task.wait(0.1)
+		for _, player in ipairs(Players:GetPlayers()) do
+			local uid = player.UserId
+			local data = GameManager.GetData(uid)
+			local hatchMax = data and GetHatcheryMax(data) or AdminConfig.HatcheryMax
+			local prev = hatchery[uid] or hatchMax
+			if holdStart[uid] then
+				hatchery[uid] = math.max(0, prev - AdminConfig.HatcheryDrainRate * 0.1)
 			else
-				StopFlipbook()
-				AreaIcon.Image = areaData.auraPreviewImage or ""
-				AreaIcon.ImageRectSize = Vector2.new(0, 0)
-				AreaIcon.ImageRectOffset = Vector2.new(0, 0)
-				AreaIcon.ImageColor3 = Color3.fromRGB(255, 255, 255)
+				hatchery[uid] = math.min(hatchMax, prev + AdminConfig.HatcheryRefillRate * 0.1)
 			end
-			BrowseAreaName.Text = AreaRegistry.GetName(idx)
-			BrowseAreaMult.Text = "Cube Value: " .. string.format("%.1f", AreaRegistry.GetMultiplier(idx)) .. "x base"
-			BrowseStatus.Text = "UNLOCKED"; BrowseStatus.TextColor3 = T.accentTeal
-			BrowseProgress.Text = "Travel here (resets current run)."
-			BrowseProgress.TextColor3 = T.accentTeal
-			TravelBtn.Visible = true; TravelBtn.Text = "TRAVEL"
-			TravelBtn.BackgroundColor3 = T.buttonGreen
-
-		elseif liveFarmEval >= discReq then
-			-- ✨ Check for flipbook animation (dimmed for discovered)
-			local flipbookData = AreaRegistry.GetFlipbook(idx)
-			if flipbookData then
-				StartFlipbook(idx)
-				AreaIcon.ImageColor3 = Color3.fromRGB(180, 180, 180)
-			else
-				StopFlipbook()
-				AreaIcon.Image = areaData.auraPreviewImage or ""
-				AreaIcon.ImageRectSize = Vector2.new(0, 0)
-				AreaIcon.ImageRectOffset = Vector2.new(0, 0)
-				AreaIcon.ImageColor3 = Color3.fromRGB(255, 255, 255)
+			if hatchery[uid] ~= prev then
+				UpdateHatchery:FireClient(player, { current=hatchery[uid], max=hatchMax })
 			end
-			BrowseAreaName.Text = AreaRegistry.GetName(idx)
-			BrowseAreaMult.Text = "Cube Value: " .. string.format("%.1f", AreaRegistry.GetMultiplier(idx)) .. "x base"
-			BrowseStatus.Text = "DISCOVERED"; BrowseStatus.TextColor3 = T.accentPurple
+			if hatchery[uid] <= 0 and holdStart[uid] then
+				holdStart[uid] = nil
+				ReplicatedStorage.RemoteEvents.ForceStopHold:FireClient(player)
+			end
+		end
+	end
+end)
 
-			local needed = math.max(0, unlockReq - liveFarmEval)
-			BrowseProgress.Text = "Requires $"..Formatter.Format(unlockReq).." Farm Eval\n$"..Formatter.Format(needed).." remaining"
-			BrowseProgress.TextColor3 = T.subText
-			TravelBtn.Visible = false
+local function GetAFKSpeed(runtime)
+	local idleTime = tick() - runtime.lastActiveTime
+	local speed = MutationConfig.AFKDecay[1].speed
+	for _, e in ipairs(MutationConfig.AFKDecay) do
+		if idleTime >= e.time then speed = e.speed end
+	end
+	return speed
+end
 
-		else
-			StopFlipbook()
-			AreaIcon.Image = areaData.auraPreviewImage or ""
-			AreaIcon.ImageRectSize = Vector2.new(0, 0)
-			AreaIcon.ImageRectOffset = Vector2.new(0, 0)
-			AreaIcon.ImageColor3 = Color3.fromRGB(0, 0, 0) 
-			BrowseAreaName.Text = "???"
-			BrowseAreaMult.Text = "???x base"
-			BrowseStatus.Text = "UNDISCOVERED"; BrowseStatus.TextColor3 = T.subText
+local function SendHUDUpdate(player)
+	local uid = player.UserId
+	local data = GameManager.GetData(uid)
+	local runtime = GameManager.GetRuntime(uid)
+	if not data or not runtime then return end
+	local totalMV = runtime.totalMutatedValue or 0
+	local pending = runtime.cubeCount
+	local avgVal  = pending > 0 and (totalMV/pending) or AdminConfig.BaseAuraValue
+	local rate    = math.floor(pending * avgVal)
+	local passTickCfg = UpgradeConfig.GetUpgradeConfig("passiveTickSpeed")
 
-			local needed = math.max(0, discReq - liveFarmEval)
-			BrowseProgress.Text = "Keep growing to discover what's next.\n$"..Formatter.Format(needed).." to Discover"
-			BrowseProgress.TextColor3 = T.subText
-			TravelBtn.Visible = false
+	local passInt = (passTickCfg and passTickCfg.apply) and passTickCfg.apply(data) or AdminConfig.PassiveInterval
+	local displayRate = math.floor(rate * BoostManager.GetValueMultiplier(uid) * BoostManager.GetSpawnRateMultiplier(uid))
+	UpdateHUD:FireClient(player, {
+		currency=data.currency, pendingAuras=pending,
+		habitatCapacity=GetHabitatCapacity(data), rate=displayRate,
+		passiveInterval=passInt, totalEarned=data.totalEarned or 0,
+		soulAuras=data.soulAuras or 0, farmEvaluation=data.farmEvaluation or 0,
+		goldenAuras=data.goldenAuras or 0, boostInventory=data.boostInventory or {},
+		prestigeCount=data.prestigeCount or 0,
+		upgrades=data.upgrades or {},
+		totalCubesProduced = data.totalCubesProduced or 0,
+		currentArea        = data.currentArea or 1,
+	})
+end
+
+task.spawn(function()
+	while true do
+		local tickInterval = AdminConfig.MutationTickInterval or MutationConfig.CheckInterval
+		task.wait(tickInterval)
+		for _, player in ipairs(Players:GetPlayers()) do
+			local uid = player.UserId
+			local data = GameManager.GetData(uid)
+			local runtime = GameManager.GetRuntime(uid)
+			if not data or not runtime then continue end
+
+			local dt = tickInterval * GetAFKSpeed(runtime) * GetMutationSpeedMult(data) * (AdminConfig.MutationSpeedMultiplier or 1)
+
+			local mutationBatch = {}
+
+			for cubeId, cube in pairs(runtime.cubes) do
+				local oldMutatedValue = MutationConfig.GetMutatedValue(cube)
+				local mutated = false
+
+				local prev = cube.effectiveElapsed
+				cube.effectiveElapsed += dt
+				local pl = MutationConfig.GetValueBonusLevel(prev)
+				local nl = MutationConfig.GetValueBonusLevel(cube.effectiveElapsed)
+
+				if nl > pl then
+					mutated = true
+					local be = MutationConfig.ValueBonuses[nl]
+					table.insert(mutationBatch, { 
+						cubeId = cubeId, 
+						mutationType = "valueBonus",
+						bonusLevel = nl, 
+						bonusPercent = be and math.floor(be.bonus * 100) or 0 
+					})
+				end
+
+				local maxTier = AdminConfig.MutationMaxTierIndex or 3
+				local upgrades = 0
+
+				while cube.tierIndex < maxTier and cube.tierIndex < #TierConfig.Tiers and upgrades < 5 do
+					local timeSince = cube.effectiveElapsed - (cube.lastUpgradeElapsed or 0)
+					local bestChance, bestTime = 0, 0
+
+					for _, threshold in ipairs(MutationConfig.TierUpgrades) do
+						if timeSince >= threshold.time then 
+							bestChance = threshold.chance
+							bestTime = threshold.time 
+						end
+					end
+
+					if bestChance <= 0 then break end
+
+					if math.random() <= bestChance then
+						local oldTier = TierConfig.Tiers[cube.tierIndex]
+						cube.tierIndex += 1
+						local newTier = TierConfig.Tiers[cube.tierIndex]
+
+						cube.baseValue = math.floor(cube.baseValue * (newTier.multiplier/oldTier.multiplier))
+						cube.color = newTier.color
+						cube.glow = newTier.glow
+						cube.tierName = newTier.name
+						cube.lastUpgradeElapsed = (cube.lastUpgradeElapsed or 0) + bestTime
+						upgrades += 1
+						mutated = true
+
+						table.insert(mutationBatch, { 
+							cubeId = cubeId, 
+							mutationType = "tierUpgrade",
+							newColor = newTier.color, 
+							newGlow = newTier.glow, 
+							tierName = newTier.name 
+						})
+
+						if newTier.name == "Legendary" then
+							data.totalLegendaryCubes = (data.totalLegendaryCubes or 0) + 1
+						end
+					else 
+						break 
+					end
+				end
+
+				if mutated then
+					local newMutatedValue = MutationConfig.GetMutatedValue(cube)
+					runtime.totalMutatedValue = (runtime.totalMutatedValue or 0) + (newMutatedValue - oldMutatedValue)
+				end
+			end
+
+			if #mutationBatch > 0 then
+				ReplicatedStorage.RemoteEvents.CubeMutatedBatch:FireClient(player, mutationBatch)
+			end
+
+			SendHUDUpdate(player)
+		end
+	end
+end)
+
+local function GetHoldMultiplier(holdTime, data)
+	local upgrades = data and data.upgrades or {}
+
+	local speedData = upgrades["multiplierSpeed"]
+	local speedLevel = (typeof(speedData) == "table" and speedData.level) or (typeof(speedData) == "number" and speedData) or 0
+	local playerMultSpeed = 1.0 + (speedLevel * 0.05)
+
+	local playerMaxTier = 5
+	local mythicData = upgrades["unlockMythicMult"]
+	local mythicLevel = (typeof(mythicData) == "table" and mythicData.level) or (typeof(mythicData) == "number" and mythicData) or 0
+	if mythicLevel > 0 then playerMaxTier = 6 end
+
+	local effectiveTime = holdTime * playerMultSpeed
+	local currentTier = 1
+
+	for i = 1, playerMaxTier do
+		if AdminConfig.MilestoneData[i] and effectiveTime >= AdminConfig.MilestoneData[i].time then
+			currentTier = i
+		end
+	end
+
+	local nextTier = math.min(currentTier + 1, playerMaxTier)
+	if currentTier == playerMaxTier then
+		return AdminConfig.MilestoneData[currentTier].mult, AdminConfig.MilestoneData[currentTier].luck
+	end
+
+	local timePassed = effectiveTime - AdminConfig.MilestoneData[currentTier].time
+	local timeNeeded = AdminConfig.MilestoneData[nextTier].time - AdminConfig.MilestoneData[currentTier].time
+	local ratio = timePassed / timeNeeded
+
+	local cMult = AdminConfig.MilestoneData[currentTier].mult
+	local nMult = AdminConfig.MilestoneData[nextTier].mult
+	local smoothMult = cMult + ((nMult - cMult) * ratio)
+
+	return smoothMult, AdminConfig.MilestoneData[currentTier].luck
+end
+
+local function RollWithLuck(luckBonus)
+	local tiers = TierConfig.Tiers
+	local adjusted, total = {}, 0
+	for _, tier in ipairs(tiers) do
+		local chance = tier.chance
+		if tier.name ~= "Common" then chance += luckBonus/(#tiers-1) end
+		table.insert(adjusted, { tier=tier, chance=chance }); total += chance
+	end
+	local r, cum = math.random()*total, 0
+	for _, e in ipairs(adjusted) do
+		cum += e.chance; if r <= cum then return e.tier end
+	end
+	return tiers[1]
+end
+
+local function SpawnAura(player, data, runtime, holdMult, luckBonus)
+	local uid  = player.UserId
+	local tier = RollWithLuck(luckBonus)
+	local tierIndex = 1
+	for i, t in ipairs(TierConfig.Tiers) do if t.name == tier.name then tierIndex=i; break end end
+
+	local totalValueMultiplier = 1.0 
+	local valueUpgrades = {
+		"blockValue", "blockValueT2", "auraValueT3", 
+		"auraValueT4", "auraValueT6", "auraValueT8", "auraValueT10"
+	}
+
+	for _, upgradeId in ipairs(valueUpgrades) do
+		local cfg = UpgradeConfig.GetUpgradeConfig(upgradeId)
+		if cfg and cfg.apply then
+			totalValueMultiplier += cfg.apply(data) 
+		end
+	end
+
+	local prestigeMult    = PrestigeModule.GetMultiplier(data.soulAuras)
+	local areaMult        = AreaRegistry.GetMultiplier(data.currentArea or 1)
+	local boostValueMult  = BoostManager.GetValueMultiplier(uid)
+	local _, weatherValueMult = WeatherManager.GetMultipliers(uid)
+
+	local baseValue  = math.floor(AdminConfig.BaseAuraValue * tier.multiplier * totalValueMultiplier * prestigeMult * areaMult * boostValueMult * weatherValueMult)
+	local totalValue = baseValue + math.floor(baseValue * (holdMult - 1))
+
+	local spawnPos = HABITAT_PART.Position + Vector3.new(math.random(-3,3), 10, math.random(-3,3))	
+	local cubeRecord = {
+		spawnTime=tick(), effectiveElapsed=0, lastUpgradeElapsed=0,
+		baseValue=totalValue, tierIndex=tierIndex,
+		tierName=tier.name, color=tier.color, glow=tier.glow,
+	}
+	if AdminConfig.MutationInstantMax then
+		local mb = MutationConfig.ValueBonuses[#MutationConfig.ValueBonuses]
+		if mb then cubeRecord.effectiveElapsed = mb.time + 1 end
+	end
+
+	local cubeId = GameManager.AddCube(uid, cubeRecord)
+	if not cubeId then return end
+	data.totalCubesProduced = (data.totalCubesProduced or 0) + 1
+	if tier.name == "Legendary" then data.totalLegendaryCubes = (data.totalLegendaryCubes or 0) + 1 end
+	runtime.lastActiveTime = tick()
+
+	AuraSpawned:FireClient(player, {
+		cubeId=cubeId, tier=tier.name, color=tier.color,
+		glow=tier.glow, value=totalValue, spawnPos=spawnPos,
+	})
+end
+
+ProduceAura.OnServerEvent:Connect(function(player, action)
+	local uid = player.UserId
+	local now = tick()
+	local data    = GameManager.GetData(uid)
+	local runtime = GameManager.GetRuntime(uid)
+
+	if action == "start" then 
+		if data and runtime and runtime.cubeCount >= GetHabitatCapacity(data) then
+			HabitatFull:FireClient(player)
+			return
 		end
 
+		-- ✨ Require at least 0.5 juice to start holding so it doesn't instantly die
+		if (hatchery[uid] or 0) > 0.5 then 
+			holdStart[uid] = now 
+		else
+			UpdateHatchery:FireClient(player, { current = 0, max = data and GetHatcheryMax(data) or AdminConfig.HatcheryMax })
+		end
+		return 
+	end
+
+	if action == "stop" then 
+		holdStart[uid] = nil
+		return 
+	end
+
+	if not data or not runtime then return end
+
+	if runtime.cubeCount >= GetHabitatCapacity(data) then 
+		HabitatFull:FireClient(player)
+		return 
+	end
+
+	if (hatchery[uid] or 0) <= 0.5 then 
+		UpdateHatchery:FireClient(player, { current = 0, max = data and GetHatcheryMax(data) or AdminConfig.HatcheryMax })
+		return 
+	end
+
+	if not holdStart[uid] then return end
+
+	local rushMult = BoostManager.GetSpawnRateMultiplier(uid)
+	local weatherSpawnMult, _ = WeatherManager.GetMultipliers(uid)
+	local effectiveFireRate = AdminConfig.FireRate / (rushMult * weatherSpawnMult)
+	if lastFire[uid] then
+		local timeSinceLast = now - lastFire[uid]
+		if timeSinceLast > 3 then clickSessionStart[uid] = now end
+		if not clickSessionStart[uid] then clickSessionStart[uid] = now end
+		local sessionLength = now - clickSessionStart[uid]
+		if sessionLength > 300 then effectiveFireRate *= 2 end
+		if sessionLength > 600 then effectiveFireRate *= 4 end
+		if timeSinceLast < effectiveFireRate then return end
 	else
-		StopFlipbook()
-		AreaIcon.Image = areaData.auraPreviewImage or ""
-		AreaIcon.ImageRectSize = Vector2.new(0, 0)
-		AreaIcon.ImageRectOffset = Vector2.new(0, 0)
-		AreaIcon.ImageColor3 = Color3.fromRGB(0, 0, 0)
-		BrowseAreaName.Text = "???"
-		BrowseAreaMult.Text = "???x base"
-		BrowseStatus.Text = "LOCKED"; BrowseStatus.TextColor3 = T.subText
-		BrowseProgress.Text = "Unlock previous areas first."
-		BrowseProgress.TextColor3 = T.subText
-		TravelBtn.Visible = false
+		clickSessionStart[uid] = now
 	end
-end
+	lastFire[uid] = now
 
-LeftArrow.MouseButton1Down:Connect(function()
-	if browseIndex > 1 then browseIndex -= 1; PlayUI(SoundConfig.UIArrow); RefreshBrowser() end
+	local holdTime = now - holdStart[uid]
+	local holdMult, luckBonus = GetHoldMultiplier(holdTime, data)
+	SpawnAura(player, data, runtime, holdMult, luckBonus)
+	SendHUDUpdate(player)
+	UpdateHatchery:FireClient(player, { current=hatchery[uid], max=GetHatcheryMax(data) })
 end)
-RightArrow.MouseButton1Down:Connect(function()
-	if AreaRegistry.Get(browseIndex+1) then browseIndex += 1; PlayUI(SoundConfig.UIArrow); RefreshBrowser() end
-end)
-
-local StatsBtn=Instance.new("TextButton"); StatsBtn.Name="NextAreaButton"
-StatsBtn.Size=UDim2.new(0,C.HUD.NextAreaButtonW,0,C.HUD.NextAreaButtonH)
-StatsBtn.Position=UDim2.new(0,156,1,C.HUD.BottomButtonY)
-StatsBtn.BackgroundColor3=T.headerBG; StatsBtn.BorderSizePixel=0
-StatsBtn.Text="Next Area"; StatsBtn.TextColor3=T.bodyText; StatsBtn.TextScaled=true; StatsBtn.Font=T.font
-StatsBtn.Visible = false
-StatsBtn.ZIndex=10; StatsBtn.Parent=mainHUD
-StatsBtn:SetAttribute("TutorialTarget", "AreaTravelButton")
-Instance.new("UICorner",StatsBtn).CornerRadius=UDim.new(0,8)
-AddButtonJuice(StatsBtn)
-
-local function OpenPanel()
-	panelOpen=true; browseIndex=currentArea; UpdateGoalSection(); RefreshBrowser()
-	StatsPanel.Visible=true
-	StatsPanel.Size=UDim2.new(0.88, 0, 0, 0)
-	TweenService:Create(StatsPanel, TweenInfo.new(0.35,Enum.EasingStyle.Back,Enum.EasingDirection.Out),
-		{ Size=UDim2.new(0.88, 0, 0.82, 0) }):Play()
-	UITheme.SetMenuVisible(true)
-end
-
-local function ClosePanel()
-	panelOpen=false; StopFlipbook(); PlayUI(SoundConfig.UIClose)
-	TweenService:Create(StatsPanel, TweenInfo.new(0.25,Enum.EasingStyle.Quad,Enum.EasingDirection.In),
-		{ Size=UDim2.new(0.88, 0, 0, 0) }):Play()
-	UITheme.SetMenuVisible(false)
-	task.delay(0.3, function() StatsPanel.Visible=false end)
-end
-StatsBtn.MouseButton1Down:Connect(function() if panelOpen then ClosePanel() else OpenPanel() end end)
-CloseBtn.MouseButton1Down:Connect(ClosePanel)
-
-local function ShowAreaBanner(info)
-	if info.travelType == "backward" then return end
-	local areaIndex = info.newArea or 2
-	local areaData = AreaRegistry.Get(areaIndex)
-	local areaName = info.areaName or AreaRegistry.GetName(areaIndex)
-	local multText = "Cube Value: "..string.format("%.1f", info.areaMultiplier or 1.0).."x"
-	local saText = (info.newSoulAuras and info.newSoulAuras > 0)
-		and ("+"..Formatter.Format(info.newSoulAuras).." Soul Auras") or nil
-	local accentColor = (areaData and areaData.auraHolderGlow) or T.accentTeal
-	local bannerH = saText and 82 or 64
-	local banner=Instance.new("Frame"); banner.Size=UDim2.new(0,BW,0,bannerH)
-	banner.Position=UDim2.new(0,-(BW+10),0,BY); banner.BackgroundColor3=T.panelBG; banner.BorderSizePixel=0
-	banner.ZIndex=55; banner.ClipsDescendants=true; banner.Parent=mainHUD
-	Instance.new("UICorner",banner).CornerRadius=UDim.new(0,BR)
-	local bs=Instance.new("UIStroke"); bs.Color=accentColor; bs.Thickness=1.5; bs.Parent=banner
-	local nameLabel=Instance.new("TextLabel"); nameLabel.Size=UDim2.new(1,-12,0,22); nameLabel.Position=UDim2.new(0,10,0,6)
-	nameLabel.BackgroundTransparency=1; nameLabel.Text=areaName; nameLabel.TextColor3=accentColor
-	nameLabel.TextScaled=true; nameLabel.Font=T.font; nameLabel.TextXAlignment=Enum.TextXAlignment.Left
-	nameLabel.ZIndex=56; nameLabel.Parent=banner
-	local multLabel=Instance.new("TextLabel"); multLabel.Size=UDim2.new(1,-12,0,18); multLabel.Position=UDim2.new(0,10,0,30)
-	multLabel.BackgroundTransparency=1; multLabel.Text=multText; multLabel.TextColor3=T.accentGold
-	multLabel.TextScaled=true; multLabel.Font=T.fontBody; multLabel.TextXAlignment=Enum.TextXAlignment.Left
-	multLabel.ZIndex=56; multLabel.Parent=banner
-	if saText then
-		local saLabel=Instance.new("TextLabel"); saLabel.Size=UDim2.new(1,-12,0,16); saLabel.Position=UDim2.new(0,10,0,52)
-		saLabel.BackgroundTransparency=1; saLabel.Text=saText; saLabel.TextColor3=T.accentPurple
-		saLabel.TextScaled=true; saLabel.Font=T.fontBody; saLabel.TextXAlignment=Enum.TextXAlignment.Left
-		saLabel.ZIndex=56; saLabel.Parent=banner
-	end
-	TweenService:Create(banner, TweenInfo.new(0.4,Enum.EasingStyle.Back,Enum.EasingDirection.Out),
-		{ Position=UDim2.new(0,10,0,BY) }):Play()
-	task.delay(4, function()
-		TweenService:Create(banner, TweenInfo.new(0.35,Enum.EasingStyle.Quad,Enum.EasingDirection.In),
-			{ Position=UDim2.new(0,-(BW+10),0,BY) }):Play()
-		task.delay(0.4, function() if banner and banner.Parent then banner:Destroy() end end)
-	end)
-end
-
-UpdateHUD.OnClientEvent:Connect(function(stats)
-	if stats.farmEvaluation ~= nil then liveFarmEval = stats.farmEvaluation end
-	if panelOpen then UpdateGoalSection(); RefreshBrowser() end
-end)
-
-AreaUpdated.OnClientEvent:Connect(function(info)
-	currentArea = info.currentArea or 1
-	if currentArea > 1 then player:SetAttribute("TutorialCompleted", true) end
-	portalReady = info.portalReady == true
-	if info.unlockedAreas then unlockedAreas = info.unlockedAreas end
-	MAX_AREA = info.maxArea or AreaRegistry.GetMaxArea()
-	if info.portalReady then AddPortalPrompt() else RemovePortalPrompt() end
-	if panelOpen then UpdateGoalSection(); RefreshBrowser() end
-end)
-
-AreaUnlocked.OnClientEvent:Connect(function(info)
-	portalReady = true; AddPortalPrompt()
-	if info.unlockedAreas then unlockedAreas = info.unlockedAreas end
-	local count = info.newAreasCount or 1
-	local highestName = info.highestNewName or "New Area"
-	local PBW = C.Banners.PortalBannerW; local PBH = C.Banners.PortalBannerH
-	local banner=Instance.new("Frame"); banner.Size=UDim2.new(0,PBW,0,PBH)
-	banner.Position=UDim2.new(0.5,-PBW/2,0,-PBH-10); banner.BackgroundColor3=T.panelBG; banner.BorderSizePixel=0
-	banner.ZIndex=60; banner.Parent=mainHUD
-	Instance.new("UICorner",banner).CornerRadius=UDim.new(0,BR)
-	local bStroke=Instance.new("UIStroke"); bStroke.Color=T.accentTeal; bStroke.Thickness=2; bStroke.Parent=banner
-	local bLabel=Instance.new("TextLabel"); bLabel.Size=UDim2.new(1,-20,1,0); bLabel.Position=UDim2.new(0,10,0,0)
-	bLabel.BackgroundTransparency=1
-	bLabel.Text = count == 1
-		and (highestName.." unlocked! Open Area Travel.")
-		or (count.." new areas unlocked! Open Area Travel to choose.")
-	bLabel.TextColor3=T.accentTeal; bLabel.TextScaled=true; bLabel.Font=T.font; bLabel.ZIndex=61; bLabel.Parent=banner
-	TweenService:Create(banner, TweenInfo.new(0.4,Enum.EasingStyle.Back,Enum.EasingDirection.Out),
-		{ Position=UDim2.new(0.5,-PBW/2,0,14) }):Play()
-	task.delay(5, function()
-		TweenService:Create(banner, TweenInfo.new(0.35,Enum.EasingStyle.Quad,Enum.EasingDirection.In),
-			{ Position=UDim2.new(0.5,-PBW/2,0,-PBH-10) }):Play()
-		task.delay(0.4, function() if banner and banner.Parent then banner:Destroy() end end)
-	end)
-end)
-
-PrestigeComplete.OnClientEvent:Connect(function(info)
-	if info.isPortalEntry then
-		portalReady=false; liveFarmEval=0; RemovePortalPrompt()
-		if panelOpen then ClosePanel() end
-	end
-end)
-
-AreaChanged.OnClientEvent:Connect(function(info)
-	currentArea = info.newArea or currentArea; browseIndex = currentArea; portalReady = false
-	if info.unlockedAreas then unlockedAreas = info.unlockedAreas end
-	if panelOpen then ClosePanel() end
-	ShowAreaBanner(info)
-end)
-
-function AddPortalPrompt()
-	if promptAdded then return end; promptAdded = true
-	local prompt=Instance.new("ProximityPrompt"); prompt.Name="PortalPrompt"; prompt.ObjectText="Portal"
-	prompt.ActionText="Open Area Travel"; prompt.HoldDuration=0.5; prompt.MaxActivationDistance=12
-	prompt.Parent=PositionPart
-	prompt.Triggered:Connect(function(p) if p == player and not panelOpen then OpenPanel() end end)
-end
-function RemovePortalPrompt()
-	promptAdded=false; local e=PositionPart:FindFirstChild("PortalPrompt"); if e then e:Destroy() end
-end
-
-local function RefreshLook()
-	UITheme.Apply(StatsPanel, "Panel")
-	UITheme.Apply(HeaderBar, "TitleBar")
-	UITheme.Apply(GoalSection, "ShopCard")
-	UITheme.Apply(AreaBrowser, "ShopCard")
-	UITheme.Apply(HeaderBar, "Panel")
-	UITheme.Apply(RightArrow, "Panel")
-	UITheme.Apply(LeftArrow, "Panel")
-	UITheme.Apply(StatsBtn, "Panel")
-	UITheme.ApplyShine(AreaBrowser)
-	UITheme.ApplyShine(GoalSection)
-	UITheme.ApplyShine(StatsPanel)
-	GoalSection.BackgroundColor3 = T.cardBG 
-	AreaBrowser.BackgroundColor3 = T.cardBG
-	local outerStroke = StatsPanel:FindFirstChildWhichIsA("UIStroke")
-	if outerStroke then
-		outerStroke.Color = Color3.fromRGB(255, 255, 255) 
-	end
-end
-
-task.wait(2)
-RefreshLook()
