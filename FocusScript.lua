@@ -556,8 +556,6 @@ end
 task.wait(2)
 RefreshLook()
 
-
-
 -- AreaTransitionController
 -- Location: StarterPlayer > StarterPlayerScripts > AreaTransitionController
 --
@@ -578,6 +576,9 @@ local TweenService      = game:GetService("TweenService")
 local Lighting          = game:GetService("Lighting")
 
 local AreaRegistry = require(ReplicatedStorage.Modules.AreaRegistry)
+
+-- ✨ NEW: Import the custom VFX API
+local VFX_API = require(ReplicatedStorage:WaitForChild("vfx"))
 
 local AreaChanged = ReplicatedStorage.RemoteEvents:WaitForChild("AreaChanged")
 local AreaUpdated = ReplicatedStorage.RemoteEvents:WaitForChild("AreaUpdated")
@@ -702,13 +703,13 @@ local function SwapAuraHolder(areaIndex, instant)
 	local yOffset   = AreaRegistry.GetYOffset(areaIndex)
 	local yRotation = AreaRegistry.GetYRotation(areaIndex)
 
-	--print("[AreaTransition] Swapping aura → Area" .. areaIndex
-	--	.. " (yOffset=" .. yOffset .. ", yRotation=" .. yRotation .. "°)"
-	--	.. (instant and " [instant]" or " [tween]"))
-
 	if instant then
 		for _, child in ipairs(AuraHolder:GetChildren()) do
-			if child ~= PositionPart then child:Destroy() end
+			if child ~= PositionPart then 
+				-- ✨ NEW: Disable old custom VFX before destroying the part
+				pcall(function() VFX_API.disable(child) end)
+				child:Destroy() 
+			end
 		end
 		currentAuraModel = nil
 
@@ -717,6 +718,9 @@ local function SwapAuraHolder(areaIndex, instant)
 		PlaceAtPosition(newModel, yOffset, yRotation)
 		currentAuraModel = newModel
 
+		-- ✨ NEW: Instantly enable the custom VFX once placed in Workspace
+		pcall(function() VFX_API.enable(newModel) end)
+
 	else
 		if activeSwap and (tick() - swapStartedAt) < SWAP_TIMEOUT then return end
 		activeSwap    = true
@@ -724,6 +728,9 @@ local function SwapAuraHolder(areaIndex, instant)
 
 		task.spawn(function()
 			if currentAuraModel and currentAuraModel.Parent then
+				-- ✨ NEW: Disable old custom VFX smoothly as the model fades out
+				pcall(function() VFX_API.disable(currentAuraModel) end)
+
 				local outTweens = TweenTransparency(currentAuraModel, 1, FADE_DURATION)
 				if #outTweens > 0 then
 					outTweens[1].Completed:Wait()
@@ -743,6 +750,10 @@ local function SwapAuraHolder(areaIndex, instant)
 			PlaceAtPosition(newModel, yOffset, yRotation)
 			SetTransparency(newModel, 1)
 			currentAuraModel = newModel
+
+			-- ✨ NEW: Turn on the new custom VFX so it begins while fading in
+			pcall(function() VFX_API.enable(newModel) end)
+
 			TweenTransparency(newModel, 0, FADE_DURATION)
 
 			task.wait(FADE_DURATION)
@@ -864,7 +875,6 @@ local function ApplyLighting(areaIndex, instant)
 		SafeTween(Lighting, TweenInfo.new(TWEEN_DURATION, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut), props)
 	end
 
-	-- ✨ 2. Tween Atmosphere properties (The Smog Maker!)
 	-- ✨ 2. Tween Atmosphere properties
 	local atmosphere = Lighting:FindFirstChildOfClass("Atmosphere")
 	if atmosphere then
