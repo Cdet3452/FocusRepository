@@ -1,3 +1,281 @@
+-- AchievementController
+-- Location: StarterPlayer > StarterPlayerScripts > AchievementController
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService      = game:GetService("TweenService")
+
+local UITheme           = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("UITheme"))
+local T                 = UITheme.Get("Custom")
+local SoundConfig       = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("SoundConfig"))
+local AchievementConfig = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("AchievementConfig"))
+local TierConfig        = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("TierConfig"))
+local UpdateHUD         = ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHUD")
+
+local player    = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local mainHUD   = playerGui:WaitForChild("MainHUD")
+local Faded2 = mainHUD:WaitForChild("Faded2") 
+local panelOpen = false
+local activeTab = "Challenges"
+local activeTabText = "Boosts" -- For the hover label
+local latestStats = {}
+
+local function PlayUI(id) if shared.PlayUISound then shared.PlayUISound(id) end end
+
+---------------------------------------------------------------
+-- 1. THE CIRCULAR BUTTON (Right Side of Faded2)
+---------------------------------------------------------------
+local AchieveBtn = Instance.new("ImageButton", Faded2) -- ✨ PARENTED TO FADED2
+AchieveBtn.Name = "AchievementButton"
+AchieveBtn.Size = UDim2.new(0.85, 0, 0.85, 0) -- ✨ Takes up 85% of Faded2's height
+AchieveBtn.Position = UDim2.new(0.95, 0, 0.5, 0) -- ✨ Placed on the far right
+AchieveBtn.AnchorPoint = Vector2.new(1, 0.5) -- ✨ Anchored perfectly center-right
+AchieveBtn.BackgroundColor3 = T.buttonSecondary
+AchieveBtn.BorderSizePixel = 0
+AchieveBtn.AutoButtonColor = false
+AchieveBtn.ZIndex = 15
+Instance.new("UICorner", AchieveBtn).CornerRadius = UDim.new(0.5, 0)
+
+-- ✨ MOBILE FIX: Forces it to stay a perfect circle no matter the screen size!
+local achieveAspect = Instance.new("UIAspectRatioConstraint", AchieveBtn)
+achieveAspect.AspectRatio = 1.0 
+
+local btnStroke = Instance.new("UIStroke", AchieveBtn)
+btnStroke.Color = T.accentGold; btnStroke.Thickness = 1
+
+local btnIcon = Instance.new("ImageLabel", AchieveBtn)
+btnIcon.Size = UDim2.new(0.7, 0, 0.7, 0)
+btnIcon.Position = UDim2.new(0.15, 0, 0.15, 0)
+btnIcon.BackgroundTransparency = 1; btnIcon.ScaleType = Enum.ScaleType.Fit
+btnIcon.Image = "rbxassetid://14916846070"
+
+---------------------------------------------------------------
+-- 2. THE MAIN PANEL & HEADER
+---------------------------------------------------------------
+local Panel = Instance.new("Frame", mainHUD)
+Panel.Name = "AchievementPanel"; Panel.Size = UDim2.new(0.85, 0, 0.75, 0); Panel.Position = UDim2.new(0.5, 0, 0.5, 0); Panel.AnchorPoint = Vector2.new(0.5, 0.5)
+Panel.BackgroundColor3 = T.panelBG; Panel.BorderSizePixel = 0; Panel.Visible = false; Panel.ZIndex = 40; Panel.ClipsDescendants = true
+Instance.new("UICorner", Panel).CornerRadius = UDim.new(0, 12)
+local sizeConstraint = Instance.new("UISizeConstraint", Panel); sizeConstraint.MaxSize = Vector2.new(500, 550) 
+local panelStroke = Instance.new("UIStroke", Panel); panelStroke.Color = T.panelStroke; panelStroke.Thickness = 2
+
+local Header = Instance.new("Frame", Panel)
+Header.Size = UDim2.new(1, 0, 0, 44); Header.BackgroundColor3 = T.headerBG; Header.BorderSizePixel = 0; Header.ZIndex = 41
+local TitleLabel = Instance.new("TextLabel", Header); TitleLabel.Size = UDim2.new(1, -50, 1, 0); TitleLabel.Position = UDim2.new(0, 14, 0, 0); TitleLabel.BackgroundTransparency = 1; TitleLabel.Text = "PROGRESSION"; TitleLabel.TextColor3 = T.headerText; TitleLabel.TextScaled = true; TitleLabel.Font = T.font; TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+local CloseBtn = Instance.new("TextButton", Header); CloseBtn.Size = UDim2.new(0, 28, 0, 28); CloseBtn.Position = UDim2.new(1, -36, 0.5, -14); CloseBtn.BackgroundColor3 = T.buttonRed; CloseBtn.Text = "X"; CloseBtn.TextColor3 = T.headerText; CloseBtn.TextScaled = true; CloseBtn.Font = T.font; Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 5); CloseBtn.ZIndex = 9999
+
+
+---------------------------------------------------------------
+-- 3. CIRCULAR TABS & HOVER LABEL
+---------------------------------------------------------------
+local TabContainer = Instance.new("Frame", Panel)
+TabContainer.Size = UDim2.new(1, 0, 0, 75); TabContainer.Position = UDim2.new(0, 0, 0, 44); TabContainer.BackgroundTransparency = 1; TabContainer.ZIndex = 41
+
+local HoverLabel = Instance.new("TextLabel", TabContainer)
+HoverLabel.Size = UDim2.new(1, 0, 0, 20); HoverLabel.Position = UDim2.new(0, 0, 1, -15); HoverLabel.BackgroundTransparency = 1
+HoverLabel.Text = "Boosts"; HoverLabel.TextColor3 = T.bodyText; HoverLabel.TextScaled = true; HoverLabel.Font = T.font
+
+local TabButtonFrame = Instance.new("Frame", TabContainer)
+TabButtonFrame.Size = UDim2.new(1, 0, 1, -20); TabButtonFrame.Position = UDim2.new(0, 0, 0, 0); TabButtonFrame.BackgroundTransparency = 1
+local TabListLayout = Instance.new("UIListLayout", TabButtonFrame)
+TabListLayout.FillDirection = Enum.FillDirection.Horizontal; TabListLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center; TabListLayout.VerticalAlignment = Enum.VerticalAlignment.Center; TabListLayout.Padding = UDim.new(0, 20)
+
+local tabBtns = {}; local scrolls = {}
+
+local function MakeTab(name, hoverText, iconId)
+	local btn = Instance.new("ImageButton", TabButtonFrame)
+	btn.Size = UDim2.new(0, 45, 0, 45); btn.BackgroundColor3 = T.buttonSecondary; btn.AutoButtonColor = false
+	Instance.new("UICorner", btn).CornerRadius = UDim.new(0.5, 0)
+
+	-- ✨ TUTORIAL TAG! Now your tutorial config can target "ChallengesTab", "IndexTab", etc.
+	btn:SetAttribute("TutorialTarget", name .. "Tab")
+
+	local tStroke = Instance.new("UIStroke", btn)
+	tStroke.Color = T.panelStroke; tStroke.Thickness = 2
+
+	local icon = Instance.new("ImageLabel", btn)
+	icon.Size = UDim2.new(0.6, 0, 0.6, 0); icon.Position = UDim2.new(0.2, 0, 0.2, 0); icon.BackgroundTransparency = 1; icon.ScaleType = Enum.ScaleType.Fit; icon.Image = iconId
+	tabBtns[name] = {btn = btn, stroke = tStroke}
+
+	-- Mobile-responsive Scrolling Frame
+	local sf = Instance.new("ScrollingFrame", Panel)
+	sf.Size = UDim2.new(1, -20, 1, -135); sf.Position = UDim2.new(0, 10, 0, 125); sf.BackgroundTransparency = 1; sf.BorderSizePixel = 0; sf.ScrollBarThickness = 4; sf.Visible = false
+	local layout = Instance.new("UIListLayout", sf); layout.Padding = UDim.new(0, 8); layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+	layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function() sf.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + 10) end)
+	scrolls[name] = sf
+
+	-- Dynamic Hover Text Logic
+	btn.MouseEnter:Connect(function() HoverLabel.Text = hoverText end)
+	btn.MouseLeave:Connect(function() HoverLabel.Text = activeTabText end)
+
+	btn.MouseButton1Down:Connect(function()
+		PlayUI(SoundConfig.UIClick or "")
+		activeTab = name; activeTabText = hoverText; HoverLabel.Text = activeTabText
+		for k, t in pairs(tabBtns) do 
+			t.btn.BackgroundColor3 = (k == name) and T.accentGold or T.buttonSecondary 
+			t.stroke.Color = (k == name) and T.bodyText or T.panelStroke
+		end
+		for k, s in pairs(scrolls) do s.Visible = (k == name) end
+	end)
+end
+
+-- 🖼️ PLACEHOLDERS: Replace "rbxassetid://14916846070" with your actual icon IDs!
+MakeTab("Challenges", "Boosts", "rbxassetid://14916846070")
+MakeTab("Index", "Auras", "rbxassetid://14916846070")
+MakeTab("Badges", "Badges", "rbxassetid://14916846070")
+MakeTab("Leaderboard", "Top 10", "rbxassetid://14916846070")
+
+---------------------------------------------------------------
+-- 4. DYNAMIC CONTENT BUILDER (SMART UPDATES)
+---------------------------------------------------------------
+local function UpdateOrCreateRow(parent, id, title, desc, hoverDesc, iconImage, iconColor, statusText, statusColor)
+	-- Look for an existing row so we don't delete it while the player is hovering!
+	local row = parent:FindFirstChild(id)
+
+	if not row then
+		-- Create it for the first time
+		row = Instance.new("TextButton", parent) -- TextButtons track hovering much better than Frames!
+		row.Name = id; row.Text = ""; row.AutoButtonColor = false
+		row.Size = UDim2.new(1, -8, 0, 64); row.BackgroundColor3 = T.cardBG
+		Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
+
+		local stroke = Instance.new("UIStroke", row); stroke.Name = "Stroke"; stroke.Thickness = 1
+
+		local icon = Instance.new("ImageLabel", row); icon.Name = "Icon"; icon.Size = UDim2.new(0, 40, 0, 40); icon.Position = UDim2.new(0, 12, 0.5, -20); icon.ScaleType = Enum.ScaleType.Fit; Instance.new("UICorner", icon).CornerRadius = UDim.new(1, 0)
+
+		local tLbl = Instance.new("TextLabel", row); tLbl.Name = "Title"; tLbl.Size = UDim2.new(0.6, 0, 0, 20); tLbl.Position = UDim2.new(0, 64, 0, 10); tLbl.BackgroundTransparency = 1; tLbl.TextColor3 = T.bodyText; tLbl.TextScaled = true; tLbl.Font = T.font; tLbl.TextXAlignment = Enum.TextXAlignment.Left
+		local dLbl = Instance.new("TextLabel", row); dLbl.Name = "Desc"; dLbl.Size = UDim2.new(0.6, 0, 0, 16); dLbl.Position = UDim2.new(0, 64, 0, 32); dLbl.BackgroundTransparency = 1; tLbl.TextColor3 = T.subText; dLbl.TextScaled = true; dLbl.Font = T.fontBody; dLbl.TextXAlignment = Enum.TextXAlignment.Left
+		local sLbl = Instance.new("TextLabel", row); sLbl.Name = "Status"; sLbl.Size = UDim2.new(0, 80, 0, 24); sLbl.Position = UDim2.new(1, -90, 0.5, -12); sLbl.BackgroundTransparency = 1; sLbl.TextScaled = true; sLbl.Font = T.font; sLbl.TextXAlignment = Enum.TextXAlignment.Right
+
+		UITheme.Apply(row, "Card")
+
+		-- ✨ SMART HOVER LOGIC
+		row:SetAttribute("IsHovering", false)
+		row.MouseEnter:Connect(function() 
+			row:SetAttribute("IsHovering", true)
+			local hd = row:GetAttribute("HoverDesc")
+			if hd and hd ~= "" then
+				row.Desc.Text = hd; row.Desc.TextColor3 = T.accentGold
+			end
+		end)
+		row.MouseLeave:Connect(function() 
+			row:SetAttribute("IsHovering", false)
+			row.Desc.Text = row:GetAttribute("NormalDesc") or ""; row.Desc.TextColor3 = T.subText 
+		end)
+	end
+
+	-- ✨ UPDATE THE ROW LIVE (Without deleting it)
+	row:SetAttribute("NormalDesc", desc)
+	row:SetAttribute("HoverDesc", hoverDesc)
+
+	row.Title.Text = title
+	row.Status.Text = statusText
+	row.Status.TextColor3 = statusColor
+	row.Icon.Image = iconImage
+	row.Icon.BackgroundColor3 = iconColor
+	row.Stroke.Color = iconColor
+
+	-- Keep the correct text showing based on if their mouse is currently on it
+	if row:GetAttribute("IsHovering") and hoverDesc and hoverDesc ~= "" then
+		row.Desc.Text = hoverDesc; row.Desc.TextColor3 = T.accentGold
+	else
+		row.Desc.Text = desc; row.Desc.TextColor3 = T.subText
+	end
+end
+
+local function RefreshData()
+	-- 1. Build Challenges
+	for i, chal in ipairs(AchievementConfig.Challenges) do
+		local current = latestStats[chal.statKey] or 0
+		local isDone = current >= chal.goal
+		local statusText = isDone and "UNLOCKED" or (current .. " / " .. chal.goal)
+		local statusColor = isDone and T.buttonGreen or T.subText
+
+		local hoverReq = not isDone and ("Requires: " .. chal.desc) or "Boost Unlocked!"
+
+		UpdateOrCreateRow(scrolls["Challenges"], "Chal_"..i, chal.title, chal.rewardText, hoverReq, chal.iconId, T.accentBlue, statusText, statusColor)
+	end
+
+	-- 2. Build Aura Index
+	for i, tier in ipairs(TierConfig.Tiers) do
+		local discovered = (latestStats.totalCubesProduced or 0) > 0
+		if tier.name == "Legendary" then discovered = (latestStats.totalLegendaryCubes or 0) > 0 end
+		local statusText = discovered and "Found" or "???"
+		local statusColor = discovered and T.buttonGreen or T.buttonRed
+		UpdateOrCreateRow(scrolls["Index"], "Index_"..i, tier.name .. " Aura", "Multiplier: " .. tier.multiplier .. "x", nil, "rbxassetid://0", tier.color, statusText, statusColor)
+	end
+
+	-- 3. Build Badges
+	for i, badge in ipairs(AchievementConfig.Badges) do
+		UpdateOrCreateRow(scrolls["Badges"], "Badge_"..i, badge.title, badge.desc, nil, badge.iconId, T.accentGold, "BADGE", T.subText)
+	end
+
+	-- 4. Leaderboard Placeholder
+	UpdateOrCreateRow(scrolls["Leaderboard"], "Leader_1", "1. MoldySugar2205", "Total Earnings", nil, "rbxassetid://0", T.accentGold, "Top Player", T.accentGreen)
+end
+
+UpdateHUD.OnClientEvent:Connect(function(stats)
+	for key, value in pairs(stats) do latestStats[key] = value end
+	if panelOpen then RefreshData() end
+end)
+
+---------------------------------------------------------------
+-- 5. BUTTON JUICE & OPEN/CLOSE
+---------------------------------------------------------------
+local function AddButtonJuice(btn)
+	local scale = btn:FindFirstChildOfClass("UIScale") or Instance.new("UIScale", btn)
+	btn.MouseEnter:Connect(function() TweenService:Create(scale, TweenInfo.new(0.15), {Scale = 1.08}):Play() end)
+	btn.MouseLeave:Connect(function() TweenService:Create(scale, TweenInfo.new(0.15), {Scale = 1}):Play() end)
+	btn.MouseButton1Down:Connect(function() TweenService:Create(scale, TweenInfo.new(0.1), {Scale = 0.9}):Play() end)
+	btn.MouseButton1Up:Connect(function() TweenService:Create(scale, TweenInfo.new(0.2, Enum.EasingStyle.Bounce), {Scale = 1.08}):Play() end)
+end
+
+AddButtonJuice(AchieveBtn); AddButtonJuice(CloseBtn)
+
+-- Attach juice to the new circular tabs
+for _, t in pairs(tabBtns) do AddButtonJuice(t.btn) end
+
+AchieveBtn.MouseButton1Down:Connect(function()
+	if panelOpen then
+		-- Close Logic
+		PlayUI(SoundConfig.UIClose or "")
+		panelOpen = false
+		TweenService:Create(Panel, TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {Size = UDim2.new(0.85, 0, 0, 0)}):Play()
+		UITheme.SetMenuVisible(false)
+		task.delay(0.25, function() Panel.Visible = false end)
+	else
+		-- Open Logic
+		PlayUI(SoundConfig.UIOpen or "")
+		panelOpen = true; Panel.Visible = true; Panel.Size = UDim2.new(0.85, 0, 0, 0)
+
+		for k, t in pairs(tabBtns) do 
+			t.btn.BackgroundColor3 = (k == activeTab) and T.accentGold or T.buttonSecondary 
+			t.stroke.Color = (k == activeTab) and T.bodyText or T.panelStroke
+		end
+		scrolls[activeTab].Visible = true
+		HoverLabel.Text = activeTabText
+		RefreshData()
+
+		TweenService:Create(Panel, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Size = UDim2.new(0.85, 0, 0.75, 0)}):Play()
+		UITheme.SetMenuVisible(true)
+	end
+end)
+
+CloseBtn.MouseButton1Down:Connect(function()
+	PlayUI(SoundConfig.UIClose or ""); panelOpen = false
+	TweenService:Create(Panel, TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {Size = UDim2.new(0.85, 0, 0, 0)}):Play()
+	UITheme.SetMenuVisible(false); task.delay(0.25, function() Panel.Visible = false end)
+end)
+
+task.spawn(function()
+	task.wait(1)
+	UITheme.Apply(Panel, "Panel")
+	UITheme.Apply(Header, "TitleBar")
+	UITheme.ApplyShine(Panel)
+
+end)
+
 -- ClickHandler
 -- Location: StarterPlayer > StarterPlayerScripts > ClickHandler
 
@@ -21,7 +299,7 @@ local UpdateMultiplier = ReplicatedStorage:WaitForChild("UpdateMultiplier")
 local HabitatFullEvent = ReplicatedStorage:WaitForChild("HabitatFullEvent")
 local CubeMutatedBatch = ReplicatedStorage.RemoteEvents:WaitForChild("CubeMutatedBatch")
 local CubeSmushed = ReplicatedStorage.RemoteEvents:WaitForChild("CubeSmushed")
-local CubeStored = ReplicatedStorage.RemoteEvents:WaitForChild("CubeStored") -- ✨
+local CubeStored = ReplicatedStorage.RemoteEvents:WaitForChild("CubeStored") 
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
@@ -439,14 +717,14 @@ local function ShowCubeValue(position, value, color)
 	Debris:AddItem(anchor, 1.5)
 end
 
-local function AttachPermanentRateLabel(auraInstance, baseValue)
+local function AttachPermanentRateLabel(auraInstance, baseValue, auraColor)
 	local rootPart = GetRootPart(auraInstance)
 	if not rootPart then return end
 
 	local bb = Instance.new("BillboardGui")
 	bb.Name = "PermanentRateLabel"
 	bb.Size = UDim2.new(0, 90, 0, 25)
-	bb.StudsOffset = Vector3.new(0, 3.5, 0) 
+	bb.StudsOffset = Vector3.new(0, 0.5, 0) 
 	bb.AlwaysOnTop = false
 	bb.Adornee = rootPart
 
@@ -457,10 +735,11 @@ local function AttachPermanentRateLabel(auraInstance, baseValue)
 	local ratePerSec = baseValue / currentPassiveInterval
 	label.Text = "+$" .. FormatNumber(ratePerSec) .. "/sec"
 
-	label.TextColor3 = Color3.fromRGB(100, 255, 100) 
+	label.TextColor3 = auraColor or Color3.fromRGB(100, 255, 100) 
 	label.Font = Enum.Font.GothamBold
 	label.TextScaled = true
-	label.TextStrokeTransparency = 0.4
+	label.TextTransparency = 0.2 
+	label.TextStrokeTransparency = 0.6 
 	label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
 	label.Parent = bb
 
@@ -506,6 +785,33 @@ local function HookAuraModel(model)
 					end
 				end
 			end)
+		end
+
+		-- ✨ NEW: Force default Conveyor state on load (Forward ON, Backward OFF)
+		local conveyer = model:FindFirstChild("ConveyerPath", true)
+		if conveyer then
+			local forwardBeam = conveyer:FindFirstChild("Foward") or conveyer:FindFirstChild("Forward")
+			local backwardBeam = conveyer:FindFirstChild("Backward")
+
+			if forwardBeam then forwardBeam.Enabled = not habitatFull end
+			if backwardBeam then backwardBeam.Enabled = habitatFull end
+
+			if habitatFull then
+				conveyer.AssemblyLinearVelocity = Vector3.new(10, 0, 0)
+			else
+				conveyer.AssemblyLinearVelocity = Vector3.new(-5, 0, 0)
+			end
+		end
+
+		-- Ensure StorageBelt is always securely locked moving forward
+		local storageBelt = model:FindFirstChild("StorageBelt", true)
+		if not storageBelt then
+			local habModel = HabitatHolder:FindFirstChildWhichIsA("Model")
+			if habModel then storageBelt = habModel:FindFirstChild("StorageBelt", true) end
+		end
+
+		if storageBelt then
+			storageBelt.AssemblyLinearVelocity = Vector3.new(-5, 0, 0)
 		end
 	end)
 end
@@ -600,11 +906,29 @@ HabitatFullEvent.Event:Connect(function(isFull)
 	local conveyer = auraModel and auraModel:FindFirstChild("ConveyerPath", true)
 
 	if isFull then 
-		if conveyer then conveyer.AssemblyLinearVelocity = Vector3.new(12, 0, 0) end
+		if conveyer then 
+			conveyer.AssemblyLinearVelocity = Vector3.new(10, 0, 0) 
+
+			-- ✨ TOGGLE BEAMS (Enable Backward, Disable Forward)
+			local forwardBeam = conveyer:FindFirstChild("Foward") or conveyer:FindFirstChild("Forward")
+			local backwardBeam = conveyer:FindFirstChild("Backward")
+
+			if forwardBeam then forwardBeam.Enabled = false end
+			if backwardBeam then backwardBeam.Enabled = true end
+		end
 	else 
 		habitatFull = false; 
 		UpdateButtonVisual() 
-		if conveyer then conveyer.AssemblyLinearVelocity = Vector3.new(-3, 0, 0) end
+		if conveyer then 
+			conveyer.AssemblyLinearVelocity = Vector3.new(-5, 0, 0) 
+
+			-- ✨ TOGGLE BEAMS (Enable Forward, Disable Backward)
+			local forwardBeam = conveyer:FindFirstChild("Foward") or conveyer:FindFirstChild("Forward")
+			local backwardBeam = conveyer:FindFirstChild("Backward")
+
+			if forwardBeam then forwardBeam.Enabled = true end
+			if backwardBeam then backwardBeam.Enabled = false end
+		end
 	end
 end)
 
@@ -682,7 +1006,7 @@ AuraSpawned.OnClientEvent:Connect(function(info)
 	ShowCubeValue(info.spawnPos, info.value, info.color)
 	PlayVFX("Spawn", info.spawnPos, 1.0)
 
-	local permLabel = AttachPermanentRateLabel(instance, info.value)
+	local permLabel = AttachPermanentRateLabel(instance, info.value, info.color)
 
 	if info.tier == "Legendary" then
 		ShowTierPopup(info.spawnPos, "Legendary", Color3.fromRGB(255, 200, 0))
@@ -738,6 +1062,8 @@ CubeMutatedBatch.OnClientEvent:Connect(function(batchData)
 				if cubeData.rateLabel and cubeData.rateLabel.Parent then
 					cubeData.rateLabel.Adornee = GetRootPart(newAura)
 					cubeData.rateLabel.Parent = GetRootPart(newAura)
+
+					cubeData.rateLabel.TextColor3 = info.newColor or Color3.fromRGB(100, 255, 100)
 
 					if cubeData.isStored then
 						cubeData.rateLabel.Enabled = false
@@ -809,7 +1135,6 @@ ReplicatedStorage.RemoteEvents.UpgradeUpdated.OnClientEvent:Connect(function(inf
 	playerMaxTier = calculatedMaxTier
 end)
 
-
 -- AuraSpawner
 -- Location: ServerScriptService > AuraSpawner
 
@@ -835,13 +1160,14 @@ local HabitatFull    = ReplicatedStorage.RemoteEvents:WaitForChild("HabitatFull"
 local CubeMutated    = ReplicatedStorage.RemoteEvents:WaitForChild("CubeMutated")
 local CubeSmushed    = ReplicatedStorage.RemoteEvents:WaitForChild("CubeSmushed")
 
--- ✨ NEW: Ensure CubeStored RemoteEvent exists safely
+-- ✨ Ensure CubeStored RemoteEvent exists safely
 local RemoteEvents = ReplicatedStorage:WaitForChild("RemoteEvents")
 if not RemoteEvents:FindFirstChild("CubeStored") then
 	local ev = Instance.new("RemoteEvent")
 	ev.Name = "CubeStored"
 	ev.Parent = RemoteEvents
 end
+local CubeStored = RemoteEvents:WaitForChild("CubeStored")
 
 local HABITAT_HOLDER = workspace:WaitForChild("HabitatHolder")
 local HABITAT_PART   = HABITAT_HOLDER:WaitForChild("Position")
@@ -945,7 +1271,7 @@ local function SendHUDUpdate(player)
 	local runtime = GameManager.GetRuntime(uid)
 	if not data or not runtime then return end
 
-	-- ✨ NEW: Dynamically separate Stored vs Active auras!
+	-- ✨ NEW: Separates Stored vs Active auras!
 	local storedCount = 0
 	local activeMV = 0
 	local totalCubes = 0
@@ -962,7 +1288,6 @@ local function SendHUDUpdate(player)
 	runtime.cubeCount = totalCubes
 	runtime.storedCubeCount = storedCount
 
-	-- Only ACTIVE auras generate passive income now
 	local rate = math.floor(activeMV)
 	local passTickCfg = UpgradeConfig.GetUpgradeConfig("passiveTickSpeed")
 
@@ -971,7 +1296,7 @@ local function SendHUDUpdate(player)
 
 	UpdateHUD:FireClient(player, {
 		currency=data.currency, 
-		pendingAuras=storedCount, -- HUD Storage Bar ONLY shows stored!
+		pendingAuras=storedCount, -- ✨ ONLY affects the Habitat Bar
 		habitatCapacity=GetHabitatCapacity(data), 
 		rate=displayRate,
 		passiveInterval=passInt, 
@@ -1187,23 +1512,17 @@ local function SpawnAura(player, data, runtime, holdMult, luckBonus)
 	local baseValue = math.floor(AdminConfig.BaseAuraValue * tier.multiplier * calcMultFloat)
 	local totalValue = baseValue + math.floor(baseValue * (holdMult - 1))
 
-	-- ✨ BULLETPROOF SPAWN POINT LOCATOR (SERVER-SIDE) ✨
-	-- Default failsafe:
 	local spawnPos = HABITAT_PART.Position + Vector3.new(math.random(-3,3), 10, math.random(-3,3))	
 
-	-- Since the map loads LOCALLY for the player, the Server can't see the one in the Workspace.
-	-- Instead, the Server looks at the exact copy saved in ReplicatedStorage!
 	local areaFolder = ReplicatedStorage:FindFirstChild("AreaAssets") and ReplicatedStorage.AreaAssets:FindFirstChild("Area" .. currentArea)
 	if areaFolder then
 		local auraModel = areaFolder:FindFirstChild("AuraModel")
 		if auraModel then
 			local spawnPoint = auraModel:FindFirstChild("AuraSpawnPoint", true)
 			if spawnPoint and spawnPoint:IsA("BasePart") then
-				-- ✨ NEW: Spawn anywhere inside the exact dimensions of the stretched part!
 				local size = spawnPoint.Size
 				local randX = (math.random() - 0.5) * size.X
 				local randZ = (math.random() - 0.5) * size.Z
-
 				spawnPos = (spawnPoint.CFrame * CFrame.new(randX, 0, randZ)).Position
 			end
 		end
@@ -1213,6 +1532,7 @@ local function SpawnAura(player, data, runtime, holdMult, luckBonus)
 		spawnTime=tick(), effectiveElapsed=0, lastUpgradeElapsed=0,
 		baseValue=totalValue, tierIndex=tierIndex,
 		tierName=tier.name, color=tier.color, glow=tier.glow,
+		isStored=false -- ✨ NEW
 	}
 
 	if AdminConfig.MutationInstantMax then
@@ -1241,7 +1561,6 @@ ProduceAura.OnServerEvent:Connect(function(player, action)
 	local runtime = GameManager.GetRuntime(uid)
 
 	if action == "start" then 
-		-- ✨ NEW: Checks Stored Auras instead of Total Auras
 		if data and runtime then
 			local storedCount = runtime.storedCubeCount or 0
 			if storedCount >= GetHabitatCapacity(data) then
@@ -1264,7 +1583,6 @@ ProduceAura.OnServerEvent:Connect(function(player, action)
 
 	if not data or not runtime then return end
 
-	-- ✨ NEW: Safe Physics Limit + Accurate Storage Limits
 	local capacity = GetHabitatCapacity(data)
 	local storedCount = runtime.storedCubeCount or 0
 
@@ -1303,8 +1621,8 @@ ProduceAura.OnServerEvent:Connect(function(player, action)
 	UpdateHatchery:FireClient(player, { current=hatchery[uid], max=GetHatcheryMax(data) })
 end)
 
--- ✨ NEW: Process successfully Stored auras!
-RemoteEvents.CubeStored.OnServerEvent:Connect(function(player, cubeId)
+-- ✨ OFFICIAL STORAGE TRIGGER RESPONSE
+CubeStored.OnServerEvent:Connect(function(player, cubeId)
 	local uid = player.UserId
 	local runtime = GameManager.GetRuntime(uid)
 
@@ -1325,10 +1643,9 @@ CubeSmushed.OnServerEvent:Connect(function(player, cubeId)
 	local runtime = GameManager.GetRuntime(uid)
 
 	if runtime and runtime.cubes[cubeId] then
-		-- Completely purge the smushed cube
 		runtime.cubes[cubeId] = nil
 
-		SendHUDUpdate(player) -- This automatically subtracts the values perfectly
+		SendHUDUpdate(player)
 
 		local data = GameManager.GetData(uid)
 		UpdateHatchery:FireClient(player, { current = hatchery[uid], max = GetHatcheryMax(data) })
