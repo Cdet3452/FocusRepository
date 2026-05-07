@@ -1,906 +1,534 @@
--- ClickHandler
--- Location: StarterPlayer > StarterPlayerScripts > ClickHandler
+-- UIController
+-- Location: StarterPlayer > StarterPlayerScripts > UIController
 
-local Players = game:GetService("Players")
+local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local TweenService = game:GetService("TweenService")
-local UserInputService = game:GetService("UserInputService")
-local Debris = game:GetService("Debris")
+local RunService        = game:GetService("RunService")
+local TweenService      = game:GetService("TweenService")
+local Debris            = game:GetService("Debris")
+local UserInputService  = game:GetService("UserInputService") 
+local AdminConfig       = require(ReplicatedStorage.Modules.AdminConfig)
+local Formatter         = require(ReplicatedStorage.Modules.NumberFormatter)
+local UITheme           = require(ReplicatedStorage.Modules.UITheme)
 
-local AdminConfig = require(ReplicatedStorage.Modules.AdminConfig)
-local UITheme = require(ReplicatedStorage.Modules.UITheme)
-local AreaRegistry = require(ReplicatedStorage.Modules.AreaRegistry) 
-local NumberFormatter = require(ReplicatedStorage.Modules.NumberFormatter)
-
-local ProduceAura = ReplicatedStorage.RemoteEvents:WaitForChild("ProduceAura")
-local AuraSpawned = ReplicatedStorage.RemoteEvents:WaitForChild("AuraSpawned")
-local UpdateHatchery = ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHatchery")
-local ForceStopHold = ReplicatedStorage.RemoteEvents:WaitForChild("ForceStopHold")
-local HabitatFull = ReplicatedStorage.RemoteEvents:WaitForChild("HabitatFull")
-local UpdateMultiplier = ReplicatedStorage:WaitForChild("UpdateMultiplier")
-local HabitatFullEvent = ReplicatedStorage:WaitForChild("HabitatFullEvent")
-local CubeMutatedBatch = ReplicatedStorage.RemoteEvents:WaitForChild("CubeMutatedBatch")
-local CubeSmushed = ReplicatedStorage.RemoteEvents:WaitForChild("CubeSmushed")
-local CubeStored = ReplicatedStorage.RemoteEvents:WaitForChild("CubeStored") 
-
-local player = Players.LocalPlayer
+local player    = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
-local holding = false
-local fireRate = AdminConfig.FireRate
-local holdStart = nil
-local hatcheryEmpty = false
-local habitatFull = false
 
-local currentPassiveInterval = AdminConfig.PassiveInterval
+local UpdateHUD = ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHUD")
+local ShipAuras = ReplicatedStorage.RemoteEvents:WaitForChild("ShipAuras")
+local HabitatFull = ReplicatedStorage.RemoteEvents:WaitForChild("HabitatFull")
+local UpdateHatchery = ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHatchery")
+local mainHUD   = playerGui:WaitForChild("MainHUD")
 
-local ClickButton = playerGui:WaitForChild("MainHUD"):WaitForChild("ClickButton")
-local HatcheryBar = playerGui:WaitForChild("MainHUD"):WaitForChild("HatcheryBar")
-local HatcheryFill = HatcheryBar:WaitForChild("Fill")
-local HatcheryLabel = HatcheryBar:WaitForChild("Label")
+local isAutoMode          = AdminConfig.AutoDispatch
+local HabitatHolder       = workspace:WaitForChild("HabitatHolder")
+local GoldenAurasLabel    = mainHUD:WaitForChild("GoldenAurasLabel")
 
-local clickScale = ClickButton:FindFirstChildOfClass("UIScale") or Instance.new("UIScale", ClickButton)
-local clickStroke = ClickButton:FindFirstChildOfClass("UIStroke") or Instance.new("UIStroke", ClickButton)
-clickStroke.Color = Color3.fromRGB(255, 215, 0)
-clickStroke.Thickness = 0
-local basePos = ClickButton.Position
-local tiltSide = 1
+local serverCurrency      = 0
+local prevServerCurrency  = 0
+local displayedCurrency   = 0
+local ratePerSecond       = 0
+local pendingAuras        = 0
+local habitatCapacity     = AdminConfig.BaseHabitatCapacity
+local passiveInterval     = AdminConfig.PassiveInterval
+local currentCooldownTime = 15
+local isShipOnCooldown    = false
+local sharedCooldownEnd   = 0
+local manualCooldownLoopID = 0
+local lastSpendTick       = 0
+local liveGoldenAuras     = 0
+local autoLoopID          = 0
 
-local Camera = workspace.CurrentCamera
-local defaultFOV = 70 
-local lastMilestone = 1
+local currentHatcheryLevel = AdminConfig.HatcheryMax or 150 
 
-local MilestoneData = AdminConfig.MilestoneData
+-- [FIXED] Bypass math.floor so the formatter handles decimals properly
+local function FormatNumber(n) return Formatter.Format(n) end
 
-local playerMultSpeed = 1.0 
-local playerMaxTier = 5     
-local lastTierIndex = 1
-
-local function FormatNumber(n)
-	return NumberFormatter.Format(n)
-end	
-
----------------------------------------------------------------
--- AURA MODEL FOLDERS & INSTANTIATION
----------------------------------------------------------------
-local VFXFolder = ReplicatedStorage:FindFirstChild("VFX")
-local cubeDataMap = {}
-
-local TierScale = {
-	Common    = 1.0,
-	Uncommon  = 1.15,
-	Rare      = 1.3,
-	Epic      = 1.5,
-	Legendary = 1.75,
-}
-
-local function CloneAuraModel(tierName, currentArea)
-	currentArea = currentArea or 1
-	local clone = AreaRegistry.FetchAuraModel(currentArea, tierName)
-	if clone and not clone.PrimaryPart then
-		warn("[Aura] Model '" .. tierName .. "' has no PrimaryPart set! Set PrimaryPart to the main BasePart for reliable positioning.")
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ✨ SYNCING VISUAL CASH & AURA TICK UP ✨
+-- ─────────────────────────────────────────────────────────────────────────────
+player:GetAttributeChangedSignal("VisualCashToAdd"):Connect(function()
+	local addAmount = player:GetAttribute("VisualCashToAdd") or 0
+	if addAmount > 0 then
+		displayedCurrency += addAmount
+		player:SetAttribute("VisualCashToAdd", 0) 
 	end
-	return clone
+end)
+
+player:GetAttributeChangedSignal("VisualAurasToAdd"):Connect(function()
+	local addAmount = player:GetAttribute("VisualAurasToAdd") or 0
+	if addAmount > 0 then
+		liveGoldenAuras += addAmount
+		GoldenAurasLabel.Text = "GAURAS: " .. FormatNumber(liveGoldenAuras) 
+		player:SetAttribute("VisualAurasToAdd", 0) 
+	end
+end)
+
+player:GetAttributeChangedSignal("LocalSpend"):Connect(function()
+	local spend = player:GetAttribute("LocalSpend") or 0
+	if spend > 0 then
+		displayedCurrency = math.max(0, displayedCurrency - spend)
+		lastSpendTick = tick()
+		player:SetAttribute("LocalSpend", 0)
+	end
+end)
+
+player:GetAttributeChangedSignal("LocalAuraSpend"):Connect(function()
+	local spend = player:GetAttribute("LocalAuraSpend") or 0
+	if spend > 0 then
+		liveGoldenAuras = math.max(0, (liveGoldenAuras or 0) - spend)
+		GoldenAurasLabel.Text = "GAURAS: " .. FormatNumber(liveGoldenAuras) 
+		lastSpendTick = tick()
+		player:SetAttribute("LocalAuraSpend", 0)
+	end
+end)
+
+player:GetAttributeChangedSignal("ForceSyncCurrency"):Connect(function()
+	local serverValue = player:GetAttribute("ForceSyncCurrency")
+	if serverValue and serverValue > 0 then
+		displayedCurrency = serverValue
+		player:SetAttribute("ForceSyncCurrency", 0)
+	end
+end)
+
+local function FormatRate(perSecond)
+	if perSecond <= 0 then return "$0/sec" end
+	return "$" .. Formatter.Format(perSecond) .. "/sec"
 end
 
-local function CreatePlaceholderPart(color, glow)
-	local part = Instance.new("Part")
-	part.Size = Vector3.new(1.5, 1.5, 1.5)
-	part.Color = color
-	part.Anchored = false
-	part.CastShadow = false
-	part.Material = Enum.Material.Neon
-	if glow then
-		local light = Instance.new("PointLight")
-		light.Brightness = 3
-		light.Range = 8
-		light.Color = color
-		light.Parent = part
-	end
-	return part
-end
-
-local function GetRootPart(instance)
-	if instance:IsA("Model") then
-		return instance.PrimaryPart or instance:FindFirstChildWhichIsA("BasePart")
-	end
-	return instance
-end
-
--- ✨ APPLIES HEAVY, NON-BOUNCY PHYSICS ✨
-local function ApplyHeavyPhysics(instance)
-	-- Density (100 = max heavy), Friction (0.3 = slides down funnels), Elasticity (0 = no bounce)
-	local heavyProps = PhysicalProperties.new(100, 0.3, 0, 1, 100) 
-
-	if instance:IsA("BasePart") then
-		instance.CustomPhysicalProperties = heavyProps
-	elseif instance:IsA("Model") then
-		for _, part in ipairs(instance:GetDescendants()) do
-			if part:IsA("BasePart") then
-				part.CustomPhysicalProperties = heavyProps
-			end
-		end
+local function GetRateColor(pending, capacity)
+	local ratio = math.clamp((pending or 0) / (capacity or 50), 0, 1)
+	if ratio >= 1        then return Color3.fromRGB(255, 60,  60)
+	elseif ratio >= 0.75 then return Color3.fromRGB(255, 200,  0)
+	elseif ratio >= 0.5  then return Color3.fromRGB(80,  255, 80)
+	else                      return Color3.fromRGB(80,  180, 80)
 	end
 end
 
-local function SpawnAuraInstance(tierName, color, glow, position, currentArea)
-	local auraModel = CloneAuraModel(tierName, currentArea)
-	if auraModel then
-		auraModel:PivotTo(CFrame.new(position))
-		auraModel.Parent = workspace
-		if auraModel.PrimaryPart then
-			auraModel.PrimaryPart.Anchored = false
-			auraModel.PrimaryPart.CanCollide = true
-			auraModel.PrimaryPart.CollisionGroup = "Auras"
-		end
-		ApplyHeavyPhysics(auraModel)
-		return auraModel, true
-	else
-		local part = CreatePlaceholderPart(color, glow)
-		part.Position = position
-		part.CollisionGroup = "Auras"
-		part.Parent = workspace
-		ApplyHeavyPhysics(part)
-		return part, false
-	end
-end
-
-local function ScaleAura(instance, tierName, animated, fromTierName)
-	local targetScale = TierScale[tierName] or 1.0
-	local fromScale = fromTierName and (TierScale[fromTierName] or 1.0) or nil
-
-	if instance:IsA("Model") then
-		if animated then
-			local scaleProxy = Instance.new("NumberValue")
-			scaleProxy.Value = fromScale or 1.0
-
-			local scaleTween = TweenService:Create(scaleProxy, TweenInfo.new(0.6, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
-				Value = targetScale
-			})
-
-			local conn
-			conn = scaleProxy.Changed:Connect(function(val)
-				if instance and instance.Parent then
-					pcall(function() instance:ScaleTo(val) end)
-				else
-					conn:Disconnect()
-				end
-			end)
-
-			scaleTween:Play()
-			scaleTween.Completed:Connect(function()
-				scaleProxy:Destroy()
-				if conn then conn:Disconnect() end
-			end)
-		else
-			pcall(function() instance:ScaleTo(targetScale) end)
-		end
-	elseif instance:IsA("BasePart") then
-		local baseSize = 1.5
-		local targetSize = Vector3.new(1, 1, 1) * (baseSize * targetScale)
-		if animated then
-			if fromScale then instance.Size = Vector3.new(1, 1, 1) * (baseSize * fromScale) end
-			TweenService:Create(instance, TweenInfo.new(0.6, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
-				Size = targetSize
+local function UpdateHabitatBar(pending, capacity)
+	local ratio    = math.clamp((pending or 0) / (capacity or 50), 0, 1)
+	local color    = GetRateColor(pending, capacity)
+	local model    = HabitatHolder:FindFirstChild("HabitatModel")
+	if model then
+		local gui    = model:FindFirstChild("HabitatGui")
+		local barBg  = gui and gui:FindFirstChild("BarBackground")
+		local barFill = barBg and barBg:FindFirstChild("BarFill")
+		if barFill then
+			TweenService:Create(barFill, TweenInfo.new(0.3), {
+				Size = UDim2.new(ratio, 0, 1, 0),
+				BackgroundColor3 = color,
 			}):Play()
-		else
-			instance.Size = targetSize
 		end
 	end
 end
 
----------------------------------------------------------------
--- VFX SYSTEM
----------------------------------------------------------------
-local function PlayVFX(effectName, position, duration)
-	if not VFXFolder then return end
-	local template = VFXFolder:FindFirstChild(effectName)
-	if not template then return end
+local hud        = playerGui:WaitForChild("MainHUD")
+local curr       = hud:WaitForChild("CurrencyLabel")
+local rate       = hud:WaitForChild("RateLabel")
+local sendButton = hud:WaitForChild("SendButton")
+local modeToggle = hud:WaitForChild("ModeToggle")
 
-	local vfx = template:Clone()
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ✨ WARNING POPUP SYSTEM
+-- ─────────────────────────────────────────────────────────────────────────────
+local activeAlerts = {}
 
-	if vfx:IsA("Model") then vfx:PivotTo(CFrame.new(position))
-	elseif vfx:IsA("BasePart") then vfx.Position = position end
+local function ShowAlertPopup(alertType, text, iconColor)
+	if tick() - (activeAlerts[alertType] or 0) < 2.5 then return end
+	activeAlerts[alertType] = tick()
 
-	for _, obj in ipairs(vfx:GetDescendants()) do
-		if obj:IsA("BasePart") then
-			obj.Anchored = true; obj.Transparency = 1; obj.CanCollide = false; obj.CastShadow = false
-		end
+	local ratePos = rate.AbsolutePosition
+	local rateSize = rate.AbsoluteSize
+
+	local alertW = 200
+	local alertH = 40
+	local padding = 15
+
+	local endX = ratePos.X - padding
+	local startX = endX + 40
+	local startY = ratePos.Y + (rateSize.Y / 2)
+
+	local effectGui = Instance.new("ScreenGui")
+	effectGui.Name = "AlertGui_" .. alertType
+	effectGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	effectGui.Parent = playerGui
+
+	local alertFrame = Instance.new("Frame")
+	alertFrame.Size = UDim2.new(0, alertW, 0, alertH)
+	alertFrame.AnchorPoint = Vector2.new(1, 0.5)
+	alertFrame.Position = UDim2.new(0, startX, 0, startY)
+	alertFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+	alertFrame.BorderSizePixel = 0
+	alertFrame.BackgroundTransparency = 1 
+	alertFrame.Parent = effectGui
+
+	local corner = Instance.new("UICorner", alertFrame)
+	corner.CornerRadius = UDim.new(0.5, 0)
+
+	local stroke = Instance.new("UIStroke", alertFrame)
+	stroke.Color = iconColor
+	stroke.Thickness = 2
+	stroke.Transparency = 1
+
+	local icon = Instance.new("ImageLabel", alertFrame)
+	icon.Size = UDim2.new(0, 20, 0, 20)
+	icon.Position = UDim2.new(0, 10, 0.5, -10)
+	icon.BackgroundTransparency = 1
+	icon.Image = "rbxassetid://7733658504" 
+	icon.ImageColor3 = iconColor
+	icon.ImageTransparency = 1
+
+	local msg = Instance.new("TextLabel", alertFrame)
+	msg.Size = UDim2.new(1, -40, 1, 0)
+	msg.Position = UDim2.new(0, 35, 0, 0)
+	msg.BackgroundTransparency = 1
+	msg.Text = text
+	msg.TextColor3 = iconColor
+	msg.Font = Enum.Font.GothamBold
+	msg.TextScaled = true
+	msg.TextTransparency = 1
+	msg.TextXAlignment = Enum.TextXAlignment.Left
+
+	local uipadding = Instance.new("UIPadding", msg)
+	uipadding.PaddingTop = UDim.new(0, 6)
+	uipadding.PaddingBottom = UDim.new(0, 6)
+
+	local sfxFolder = ReplicatedStorage:FindFirstChild("SFX") or ReplicatedStorage:FindFirstChild("Sounds")
+	if sfxFolder and sfxFolder:FindFirstChild("ErrorBuzz") then
+		local sfx = sfxFolder.ErrorBuzz:Clone()
+		sfx.Parent = game:GetService("SoundService")
+		sfx.Volume = 0.5
+		sfx:Play()
+		Debris:AddItem(sfx, 2)
 	end
 
-	if vfx:IsA("BasePart") then
-		vfx.Anchored = true; vfx.Transparency = 1; vfx.CanCollide = false; vfx.CastShadow = false
-	end
-
-	vfx.Parent = workspace
-
-	for _, emitter in ipairs(vfx:GetDescendants()) do
-		if emitter:IsA("ParticleEmitter") then
-			emitter.Enabled = true
-			emitter:Emit(emitter:GetAttribute("BurstCount") or 15)
-		end
-	end
-
-	task.delay((duration or 1.0) * 0.5, function()
-		if vfx and vfx.Parent then
-			for _, emitter in ipairs(vfx:GetDescendants()) do
-				if emitter:IsA("ParticleEmitter") then emitter.Enabled = false end
-			end
-		end
-	end)
-
-	Debris:AddItem(vfx, duration or 1.5)
-end
-
----------------------------------------------------------------
--- GAMEPLAY VISUAL LOGIC
----------------------------------------------------------------
-local function GetCurrentMultiplier()
-	if not holding or not holdStart then return 1.0, 1 end
-
-	local holdTime = tick() - holdStart
-	local effectiveTime = holdTime * playerMultSpeed 
-
-	local currentTier = 1
-	local nextTier = 1
-
-	for i = 1, playerMaxTier do
-		if effectiveTime >= MilestoneData[i].time then
-			currentTier = i
-			nextTier = math.min(i + 1, playerMaxTier)
-		end
-	end
-
-	if currentTier == playerMaxTier then
-		return MilestoneData[currentTier].mult, currentTier
-	end
-
-	local timePassedInTier = effectiveTime - MilestoneData[currentTier].time
-	local timeNeededForNext = MilestoneData[nextTier].time - MilestoneData[currentTier].time
-	local progressRatio = timePassedInTier / timeNeededForNext
-
-	local currentMult = MilestoneData[currentTier].mult
-	local nextMult = MilestoneData[nextTier].mult
-	local smoothMult = currentMult + ((nextMult - currentMult) * progressRatio)
-
-	return smoothMult, currentTier
-end
-
-local function PlayMilestoneSound(soundValue)
-	if not soundValue or soundValue == "" then return end
-	local sfxToPlay = nil
-
-	if string.find(soundValue, "rbxassetid://") then
-		sfxToPlay = Instance.new("Sound")
-		sfxToPlay.SoundId = soundValue
-		sfxToPlay.Volume = 0.6
-	else
-		local sfxFolder = ReplicatedStorage:FindFirstChild("SFX") or ReplicatedStorage:FindFirstChild("Sounds")
-		if sfxFolder then
-			local foundSound = sfxFolder:FindFirstChild(soundValue)
-			if foundSound then
-				sfxToPlay = foundSound:Clone()
-				sfxToPlay.Volume = 0.6
-			end
-		end
-	end
-
-	if sfxToPlay then
-		sfxToPlay.Parent = game:GetService("SoundService")
-		sfxToPlay:Play()
-		Debris:AddItem(sfxToPlay, sfxToPlay.TimeLength > 0 and sfxToPlay.TimeLength or 3)
-	end
-end
-
-local function SpawnMilestonePopup(multFloor)
-	local data = MilestoneData[multFloor]
-	if not data then return end 
-
-	PlayMilestoneSound(data.sound)
-
-	local pop = Instance.new("TextLabel")
-	pop.Text = data.name .. " (" .. string.format("%.1f", data.mult) .. "x)"
-	pop.Font = Enum.Font.FredokaOne 
-	pop.TextScaled = true
-	pop.TextColor3 = data.color
-	pop.BackgroundTransparency = 1
-	pop.AnchorPoint = Vector2.new(0.5, 0.5)
-
-	pop.Position = UDim2.new(
-		ClickButton.Position.X.Scale, ClickButton.Position.X.Offset, 
-		ClickButton.Position.Y.Scale - 0.15, ClickButton.Position.Y.Offset
-	)
-	pop.Parent = ClickButton.Parent
-
-	local stroke = Instance.new("UIStroke", pop)
-	stroke.Thickness = 3
-	stroke.Color = Color3.fromRGB(0, 0, 0)
-	pop.Size = UDim2.new(0.1, 0, 0.02, 0) 
-
-	TweenService:Create(pop, TweenInfo.new(0.4, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
-		Size = UDim2.new(0.35, 0, 0.08, 0),
-		Position = UDim2.new(
-			pop.Position.X.Scale, pop.Position.X.Offset, 
-			ClickButton.Position.Y.Scale - 0.25, ClickButton.Position.Y.Offset
-		)
+	TweenService:Create(alertFrame, TweenInfo.new(0.4, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+		Position = UDim2.new(0, endX, 0, startY),
+		BackgroundTransparency = 0.1
 	}):Play()
+	TweenService:Create(stroke, TweenInfo.new(0.4), {Transparency = 0}):Play()
+	TweenService:Create(icon, TweenInfo.new(0.4), {ImageTransparency = 0}):Play()
+	TweenService:Create(msg, TweenInfo.new(0.4), {TextTransparency = 0}):Play()
 
-	task.delay(0.6, function()
-		TweenService:Create(pop, TweenInfo.new(0.3), {TextTransparency = 1}):Play()
-		TweenService:Create(stroke, TweenInfo.new(0.3), {Transparency = 1}):Play()
-		task.delay(0.3, function() pop:Destroy() end)
-	end)
-end
-
-local function UpdateButtonVisual()
-	local col
-	local mult = 1
-	local currentTierIndex = 1
-
-	if habitatFull then
-		col = Color3.fromRGB(180, 60, 60)
-	elseif not holding then
-		col = Color3.fromRGB(255, 0, 0)
-	else
-		mult, currentTierIndex = GetCurrentMultiplier()
-		col = MilestoneData[currentTierIndex].color
-		UpdateMultiplier:Fire(mult)
-	end
-
-	local targetFOV = defaultFOV + (mult * 1.2)
-	if not holding then targetFOV = defaultFOV end
-	TweenService:Create(Camera, TweenInfo.new(0.3, Enum.EasingStyle.Sine), {FieldOfView = targetFOV}):Play()
-
-	if holding then
-		if currentTierIndex > lastTierIndex then
-			if currentTierIndex > 1 then SpawnMilestonePopup(currentTierIndex) end
-			lastTierIndex = currentTierIndex
-		end
-	else
-		lastTierIndex = 1
-	end
-
-	TweenService:Create(ClickButton, TweenInfo.new(0.2), { BackgroundColor3 = col }):Play()
-
-	if holding and not habitatFull then
-		tiltSide = tiltSide * -1 
-		if mult >= 5.0 then 
-			TweenService:Create(ClickButton, TweenInfo.new(0.05, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, 0, true), {
-				Rotation = 8 * tiltSide
-			}):Play()
-			clickStroke.Thickness = 12
-			clickStroke.Transparency = 0
-			TweenService:Create(clickStroke, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Thickness = 0, Transparency = 1}):Play()
-		else
-			TweenService:Create(ClickButton, TweenInfo.new(0.08, Enum.EasingStyle.Sine, Enum.EasingDirection.Out, 0, true), {
-				Rotation = 3 * tiltSide
-			}):Play()
-		end
-	elseif not holding then
-		TweenService:Create(ClickButton, TweenInfo.new(0.15, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Rotation = 0}):Play()
-		TweenService:Create(clickScale, TweenInfo.new(0.15), {Scale = 1}):Play()
-	end
-end
-
-local function UpdateHatcheryBar(current, max)
-	local ratio = math.clamp(current / max, 0, 1)
-	TweenService:Create(HatcheryFill, TweenInfo.new(0.1), { Size = UDim2.new(ratio, 0, 1, 0) }):Play()
-
-	local color = Color3.fromRGB(255, 60, 60)
-	if ratio > 0.5 then color = Color3.fromRGB(80, 220, 80)
-	elseif ratio > 0.25 then color = Color3.fromRGB(255, 200, 0) end
-
-	TweenService:Create(HatcheryFill, TweenInfo.new(0.1), { BackgroundColor3 = color }):Play()
-	HatcheryLabel.Text = "Hatchery: " .. math.floor(current) .. " / " .. max
-	hatcheryEmpty = (current <= 0)
-end
-
-local function FlashEmpty()
-	TweenService:Create(HatcheryFill, TweenInfo.new(0.1), { BackgroundColor3 = Color3.fromRGB(255, 255, 255) }):Play()
-	task.delay(0.1, function() TweenService:Create(HatcheryFill, TweenInfo.new(0.1), { BackgroundColor3 = Color3.fromRGB(255, 60, 60) }):Play() end)
-end
-
-local function ShowTierPopup(position, tierName, tierColor)
-	local anchor = Instance.new("Part")
-	anchor.Size = Vector3.new(0.1, 0.1, 0.1); anchor.Anchored = true; anchor.Transparency = 1; anchor.CanCollide = false
-	anchor.Position = position + Vector3.new(0, 3, 0); anchor.Parent = workspace
-
-	local bb = Instance.new("BillboardGui")
-	bb.Size = UDim2.new(0, 120, 0, 40); bb.StudsOffset = Vector3.new(0, 2, 0)
-	bb.AlwaysOnTop = false; bb.Adornee = anchor; bb.Parent = anchor
-
-	local label = Instance.new("TextLabel")
-	label.Size = UDim2.new(1, 0, 1, 0); label.BackgroundTransparency = 1
-	label.Text = tierName:upper(); label.TextColor3 = tierColor; label.TextScaled = true
-	label.Font = Enum.Font.GothamBold; label.TextStrokeTransparency = 0.3; label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
-	label.Parent = bb
-
-	TweenService:Create(bb, TweenInfo.new(1.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { StudsOffset = Vector3.new(0, 6, 0) }):Play()
-	TweenService:Create(label, TweenInfo.new(1.5, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { TextTransparency = 1, TextStrokeTransparency = 1 }):Play()
-	Debris:AddItem(anchor, 2)
-end
-
-local function ShowCubeValue(position, value, color)
-	local anchor = Instance.new("Part")
-	anchor.Size = Vector3.new(0.1, 0.1, 0.1); anchor.Anchored = true; anchor.Transparency = 1; anchor.CanCollide = false
-	anchor.Position = position + Vector3.new(math.random(-1, 1), 2, math.random(-1, 1)); anchor.Parent = workspace
-
-	local bb = Instance.new("BillboardGui")
-	bb.Size = UDim2.new(0, 80, 0, 25); bb.StudsOffset = Vector3.new(0, 0, 0)
-	bb.AlwaysOnTop = false; bb.Adornee = anchor; bb.Parent = anchor
-
-	local label = Instance.new("TextLabel")
-	label.Size = UDim2.new(1, 0, 1, 0); label.BackgroundTransparency = 1
-	label.Text = "Value: $" .. FormatNumber(value); label.TextColor3 = Color3.fromRGB(255, 255, 255); label.TextScaled = true
-	label.Font = Enum.Font.Gotham; label.TextStrokeTransparency = 0.4; label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
-	label.Parent = bb
-
-	TweenService:Create(bb, TweenInfo.new(1.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { StudsOffset = Vector3.new(0, 4, 0) }):Play()
-	TweenService:Create(label, TweenInfo.new(1.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { TextTransparency = 1, TextStrokeTransparency = 1 }):Play()
-	Debris:AddItem(anchor, 1.5)
-end
-
-local function AttachPermanentRateLabel(auraInstance, baseValue, auraColor)
-	local rootPart = GetRootPart(auraInstance)
-	if not rootPart then return end
-
-	local bb = Instance.new("BillboardGui")
-	bb.Name = "PermanentRateLabel"
-	bb.Size = UDim2.new(0, 90, 0, 25)
-	bb.StudsOffset = Vector3.new(0, 0.5, 0) 
-	bb.AlwaysOnTop = false
-	bb.Adornee = rootPart
-
-	local label = Instance.new("TextLabel")
-	label.Size = UDim2.new(1, 0, 1, 0)
-	label.BackgroundTransparency = 1
-
-	local ratePerSec = baseValue / currentPassiveInterval
-	label.Text = "+$" .. FormatNumber(ratePerSec) .. "/sec"
-
-	label.TextColor3 = auraColor or Color3.fromRGB(100, 255, 100) 
-	label.Font = Enum.Font.GothamBold
-	label.TextScaled = true
-	label.TextTransparency = 0.2 
-	label.TextStrokeTransparency = 0.6 
-	label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
-	label.Parent = bb
-
-	bb.Parent = rootPart
-	return label
-end
-
----------------------------------------------------------------
--- ✨ DYNAMIC TRIGGER HOOKS (RECURSIVE) ✨
----------------------------------------------------------------
-local AuraHolder = workspace:WaitForChild("AuraHolder")
-local HabitatHolder = workspace:WaitForChild("HabitatHolder")
-
--- ✨ NEW: 3D Habitat Bar Animation & Updating!
-local function UpdateHabitatBar(current, max)
-	local habitatModel = HabitatHolder:FindFirstChildWhichIsA("Model")
-	if not habitatModel then return end
-
-	local habitatGui = habitatModel:FindFirstChild("HabitatGui", true)
-	if not habitatGui then return end
-
-	local bg = habitatGui:FindFirstChild("BarBackground")
-	if not bg then return end
-
-	local fill = bg:FindFirstChild("BarFill")
-	local textLabel = bg:FindFirstChild("CountLabel") or bg:FindFirstChild("AmountLabel")
-
-	if fill and max > 0 then
-		local ratio = math.clamp(current / max, 0, 1)
-
-		-- Smoothly tween the bar size
-		TweenService:Create(fill, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-			Size = UDim2.new(ratio, 0, 1, 0)
+	task.delay(2, function()
+		if not alertFrame.Parent then return end
+		TweenService:Create(alertFrame, TweenInfo.new(0.3, Enum.EasingStyle.Sine, Enum.EasingDirection.In), {
+			Position = UDim2.new(0, startX, 0, startY),
+			BackgroundTransparency = 1
 		}):Play()
-
-		-- Change colors based on how full it is!
-		local targetColor = Color3.fromRGB(80, 220, 80) -- Green
-		if ratio >= 1 then
-			targetColor = Color3.fromRGB(255, 60, 60) -- Red (FULL!)
-		elseif ratio >= 0.8 then
-			targetColor = Color3.fromRGB(255, 200, 0) -- Yellow (Warning)
-		end
-
-		TweenService:Create(fill, TweenInfo.new(0.2), {BackgroundColor3 = targetColor}):Play()
-
-		-- Update the text label
-		if textLabel then
-			if current >= max then
-				textLabel.Text = "FULL!"
-				textLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
-			else
-				textLabel.Text = current .. " / " .. max
-				textLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-			end
-		end
-	end
-end
-
--- Fixes the hierarchy issue by searching up from the hit part
-local function GetAuraCubeFromHit(hit)
-	if hit:GetAttribute("AuraCube") then return hit end
-	local p = hit.Parent
-	if p and p:GetAttribute("AuraCube") then return p end
-	local m = hit:FindFirstAncestorWhichIsA("Model")
-	if m and m:GetAttribute("AuraCube") then return m end
-	return nil
-end
-
-local function HookAuraModel(model)
-	task.delay(0.1, function()
-		local smush = model:FindFirstChild("SmushTrigger", true)
-		if smush then
-			smush.Touched:Connect(function(hit)
-				local auraObj = GetAuraCubeFromHit(hit)
-				if auraObj then
-					for id, data in pairs(cubeDataMap) do
-						if data.instance == auraObj then
-							CubeSmushed:FireServer(id)
-
-							local root = GetRootPart(auraObj)
-							local pos = (root and root.Position) or hit.Position
-							PlayVFX("Spawn", pos, 0.5) 
-
-							if data.instance.Parent then data.instance:Destroy() end
-							cubeDataMap[id] = nil
-							break
-						end
-					end
-				end
-			end)
-		end
-
-		-- Force default Conveyor state on load (Forward ON, Backward OFF)
-		local conveyer = model:FindFirstChild("ConveyerPath", true)
-		if conveyer then
-			local forwardBeam = conveyer:FindFirstChild("Foward") or conveyer:FindFirstChild("Forward")
-			local backwardBeam = conveyer:FindFirstChild("Backward")
-
-			if forwardBeam then forwardBeam.Enabled = not habitatFull end
-			if backwardBeam then backwardBeam.Enabled = habitatFull end
-
-			if habitatFull then
-				conveyer.AssemblyLinearVelocity = Vector3.new(30, 0, 0)
-			else
-				conveyer.AssemblyLinearVelocity = Vector3.new(-3, 0, 0)
-			end
-		end
-
-		-- Ensure StorageBelt is always securely locked moving forward
-		local storageBelt = model:FindFirstChild("StorageBelt", true)
-		if not storageBelt then
-			local habModel = HabitatHolder:FindFirstChildWhichIsA("Model")
-			if habModel then storageBelt = habModel:FindFirstChild("StorageBelt", true) end
-		end
-
-		if storageBelt then
-			storageBelt.AssemblyLinearVelocity = Vector3.new(-5, 0, 0)
-		end
+		TweenService:Create(stroke, TweenInfo.new(0.3), {Transparency = 1}):Play()
+		TweenService:Create(icon, TweenInfo.new(0.3), {ImageTransparency = 1}):Play()
+		TweenService:Create(msg, TweenInfo.new(0.3), {TextTransparency = 1}):Play()
+		Debris:AddItem(effectGui, 0.4)
 	end)
 end
-
-local function HookHabitatModel(model)
-	task.delay(0.1, function()
-		local storage = model:FindFirstChild("StorageTrigger", true)
-		if storage then
-			storage.Touched:Connect(function(hit)
-				local auraObj = GetAuraCubeFromHit(hit)
-				if auraObj then
-					for id, data in pairs(cubeDataMap) do
-						if data.instance == auraObj and not data.isStored then
-							data.isStored = true
-							local label = auraObj:FindFirstChild("PermanentRateLabel", true)
-							if label then label.Enabled = false end
-
-							CubeStored:FireServer(id)
-							break
-						end
-					end
-				end
-			end)
-		end
-	end)
-end
-
-AuraHolder.ChildAdded:Connect(function(child) if child:IsA("Model") then HookAuraModel(child) end end)
-HabitatHolder.ChildAdded:Connect(function(child) if child:IsA("Model") then HookHabitatModel(child) end end)
-
-for _, child in ipairs(AuraHolder:GetChildren()) do if child:IsA("Model") then HookAuraModel(child) end end
-for _, child in ipairs(HabitatHolder:GetChildren()) do if child:IsA("Model") then HookHabitatModel(child) end end
-
----------------------------------------------------------------
--- INPUT CONTROLS
----------------------------------------------------------------
-local trackedInputs = {}
-
-local function EvaluateHolding()
-	local hasInput = false
-	for _, _ in pairs(trackedInputs) do hasInput = true; break end
-
-	if hasInput and not holding then
-		if hatcheryEmpty then FlashEmpty() return end
-		if habitatFull then return end
-		holding = true
-		holdStart = tick()
-		TweenService:Create(clickScale, TweenInfo.new(0.1, Enum.EasingStyle.Sine), {Scale = 0.9}):Play()
-		ProduceAura:FireServer("start")
-	elseif not hasInput and holding then
-		holding = false
-		holdStart = nil
-		ProduceAura:FireServer("stop")
-		UpdateButtonVisual()
-		UpdateMultiplier:Fire(1.0)
-	end
-end
-
-ClickButton.InputBegan:Connect(function(input)
-	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-		trackedInputs[input] = true; EvaluateHolding()
-	end
-end)
-
-UserInputService.InputEnded:Connect(function(input)
-	if trackedInputs[input] then trackedInputs[input] = nil; EvaluateHolding() end
-end)
-
-UserInputService.InputBegan:Connect(function(input, gameProcessed)
-	if input.KeyCode == Enum.KeyCode.Space and not UserInputService:GetFocusedTextBox() then
-		trackedInputs[input] = true; EvaluateHolding()
-	end
-end)
-
-UserInputService.WindowFocusReleased:Connect(function()
-	table.clear(trackedInputs); EvaluateHolding()
-end)
-
-ForceStopHold.OnClientEvent:Connect(function()
-	table.clear(trackedInputs); EvaluateHolding()
-end)
 
 HabitatFull.OnClientEvent:Connect(function()
-	habitatFull = true; 
-	HabitatFullEvent:Fire(true); 
-	table.clear(trackedInputs); 
-	EvaluateHolding()
-end)
-
-HabitatFullEvent.Event:Connect(function(isFull)
-	local auraModel = AuraHolder:FindFirstChildWhichIsA("Model")
-	local conveyer = auraModel and auraModel:FindFirstChild("ConveyerPath", true)
-
-	if isFull then 
-		if conveyer then 
-			conveyer.AssemblyLinearVelocity = Vector3.new(10, 0, 0) 
-
-			-- TOGGLE BEAMS (Enable Backward, Disable Forward)
-			local forwardBeam = conveyer:FindFirstChild("Foward") or conveyer:FindFirstChild("Forward")
-			local backwardBeam = conveyer:FindFirstChild("Backward")
-
-			if forwardBeam then forwardBeam.Enabled = false end
-			if backwardBeam then backwardBeam.Enabled = true end
-		end
-	else 
-		habitatFull = false; 
-		UpdateButtonVisual() 
-		if conveyer then 
-			conveyer.AssemblyLinearVelocity = Vector3.new(-5, 0, 0) 
-
-			-- TOGGLE BEAMS (Enable Forward, Disable Backward)
-			local forwardBeam = conveyer:FindFirstChild("Foward") or conveyer:FindFirstChild("Forward")
-			local backwardBeam = conveyer:FindFirstChild("Backward")
-
-			if forwardBeam then forwardBeam.Enabled = true end
-			if backwardBeam then backwardBeam.Enabled = false end
-		end
-	end
+	ShowAlertPopup("HabitatFull", "HABITAT FULL!", Color3.fromRGB(255, 80, 80))
 end)
 
 UpdateHatchery.OnClientEvent:Connect(function(info)
-	local finalMax = info.max
-	local localHatchLvl = player:GetAttribute("LocalHatcheryLevel")
-
-	if localHatchLvl then
-		local UpgradeConfig = require(ReplicatedStorage.Modules.UpgradeConfig)
-		local cfg = UpgradeConfig.GetUpgradeConfig("hatcheryCapacity")
-		if cfg and cfg.apply then
-			local predictedMax = cfg.apply({ upgrades = { hatcheryCapacity = localHatchLvl } })
-			finalMax = math.max(info.max, predictedMax)
-		end
-	end
-	UpdateHatcheryBar(info.current, finalMax)
-end)
-
-ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHUD").OnClientEvent:Connect(function(stats)
-	if stats.passiveInterval ~= nil then
-		currentPassiveInterval = stats.passiveInterval
-	end
-
-	if stats.pendingAuras ~= nil and stats.habitatCapacity ~= nil then
-		if stats.pendingAuras < stats.habitatCapacity and habitatFull then
-			habitatFull = false; HabitatFullEvent:Fire(false); UpdateButtonVisual()
-		end
-
-		-- ✨ FIRE THE 3D HABITAT BAR ANIMATION
-		UpdateHabitatBar(stats.pendingAuras, stats.habitatCapacity)
-	end
-
-	if stats.upgrades then
-		local tierUnlocks = {
-			{ upgradeId = "unlockOmniMult",      tier = 10 },
-			{ upgradeId = "unlockUniversalMult", tier = 9 },
-			{ upgradeId = "unlockGodlyMult",     tier = 8 },
-			{ upgradeId = "unlockCosmicMult",    tier = 7 },
-			{ upgradeId = "unlockMythicMult",    tier = 6 },
-		}
-
-		local calculatedMaxTier = 5 
-		for _, data in ipairs(tierUnlocks) do
-			local upgData = stats.upgrades[data.upgradeId]
-			local level = (typeof(upgData) == "table" and upgData.level) or (typeof(upgData) == "number" and upgData) or 0
-			if level > 0 then calculatedMaxTier = data.tier; break end
-		end
-
-		playerMaxTier = calculatedMaxTier
-
-		local speedData = stats.upgrades["multiplierSpeed"]
-		local speedLevel = (typeof(speedData) == "table" and speedData.level) or (typeof(speedData) == "number" and speedData) or 0
-		playerMultSpeed = 1.0 + (speedLevel * 0.05) 
+	currentHatcheryLevel = info.current
+	if info.current <= 0 then
+		ShowAlertPopup("HatcheryEmpty", "HATCHERY EMPTY!", Color3.fromRGB(255, 180, 50))
 	end
 end)
 
-task.spawn(function()
-	while true do
-		if holding then
-			if hatcheryEmpty or habitatFull then
-				table.clear(trackedInputs); EvaluateHolding()
-			else
-				ProduceAura:FireServer(); UpdateButtonVisual()
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+
+		local clickedMainButton = false
+		if gameProcessed then
+			local guis = playerGui:GetGuiObjectsAtPosition(input.Position.X, input.Position.Y)
+			for _, gui in ipairs(guis) do
+				if gui.Name == "ClickButton" then
+					clickedMainButton = true
+					break
+				end
 			end
 		end
-		task.wait(fireRate)
+
+		if not clickedMainButton then return end
+
+		if currentHatcheryLevel <= 0.5 then
+			ShowAlertPopup("HatcheryEmpty", "HATCHERY EMPTY!", Color3.fromRGB(255, 180, 50))
+		elseif pendingAuras >= habitatCapacity then
+			ShowAlertPopup("HabitatFull", "HABITAT FULL!", Color3.fromRGB(255, 80, 80))
+		end
 	end
 end)
 
----------------------------------------------------------------
--- AURA MUTATION RESPONSES (CLIENT BOUND)
----------------------------------------------------------------
-AuraSpawned.OnClientEvent:Connect(function(info)
-	local instance, isCustom = SpawnAuraInstance(info.tier, info.color, info.glow, info.spawnPos, info.currentArea)
+local function SyncManualCooldownVisuals()
+	if isAutoMode or not sendButton.Visible then return end
 
-	instance:SetAttribute("AuraCube", true)
-	ScaleAura(instance, info.tier, false)
-	ShowCubeValue(info.spawnPos, info.value, info.color)
-	PlayVFX("Spawn", info.spawnPos, 1.0)
+	local progressContainer = sendButton:FindFirstChild("CooldownProgress")
+	local fillPart          = progressContainer and progressContainer:FindFirstChild("Fill")
+	local textTarget        = sendButton:FindFirstChildOfClass("TextLabel") or sendButton
 
-	local permLabel = AttachPermanentRateLabel(instance, info.value, info.color)
+	local uiStroke = sendButton:FindFirstChildOfClass("UIStroke") or Instance.new("UIStroke", sendButton)
+	uiStroke.Thickness = 1.5
 
-	if info.tier == "Legendary" then
-		ShowTierPopup(info.spawnPos, "Legendary", Color3.fromRGB(255, 200, 0))
-		PlayVFX("Legendary", info.spawnPos, 2.0)
+	if not fillPart then return end
+
+	sendButton.ClipsDescendants = true
+	progressContainer.Size     = UDim2.new(1, 0, 1, 0)
+	progressContainer.Position = UDim2.new(0, 0, 0, 0)
+	progressContainer.AnchorPoint = Vector2.new(0, 0)
+
+	fillPart.BorderSizePixel = 0
+	fillPart.AnchorPoint     = Vector2.new(0, 1)
+	fillPart.Position        = UDim2.new(0, 0, 1, 0)
+	for _, child in ipairs(fillPart:GetChildren()) do
+		if child:IsA("UICorner") or child:IsA("UIAspectRatioConstraint") or child:IsA("UIStroke") then
+			child:Destroy()
+		end
 	end
 
-	if info.cubeId then
-		cubeDataMap[info.cubeId] = { 
-			instance = instance, 
-			tierName = info.tier, 
-			isCustom = isCustom,
-			rateLabel = permLabel 
-		}
-		instance.AncestryChanged:Connect(function(_, parent)
-			if not parent then cubeDataMap[info.cubeId] = nil end
+	manualCooldownLoopID += 1
+	local currentLoop = manualCooldownLoopID
+	local timeLeft    = sharedCooldownEnd - tick()
+
+	sendButton.BackgroundColor3    = Color3.fromRGB(0, 160, 255)
+	uiStroke.Color                 = Color3.fromRGB(0, 220, 255)
+	fillPart.BackgroundColor3      = Color3.fromRGB(0, 0, 0)
+	fillPart.BackgroundTransparency = 0.55
+
+	if timeLeft > 0 then
+		isShipOnCooldown = true
+		if textTarget ~= sendButton then sendButton.Text = "" end
+
+		task.spawn(function()
+			while timeLeft > 0 and manualCooldownLoopID == currentLoop do
+				local pct = timeLeft / currentCooldownTime
+				TweenService:Create(fillPart, TweenInfo.new(0.1, Enum.EasingStyle.Linear), {
+					Size = UDim2.new(1, 0, pct, 0)
+				}):Play()
+				task.wait(0.1)
+				timeLeft = sharedCooldownEnd - tick()
+			end
+
+			if manualCooldownLoopID == currentLoop then
+				isShipOnCooldown  = false
+				textTarget.Text   = ""
+				fillPart.Size     = UDim2.new(1, 0, 0, 0)
+			end
 		end)
+	else
+		isShipOnCooldown = false
+		textTarget.Text  = ""
+		fillPart.Size    = UDim2.new(1, 0, 0, 0)
 	end
-end)
-
-CubeMutatedBatch.OnClientEvent:Connect(function(batchData)
-	for _, info in ipairs(batchData) do
-		local cubeData = cubeDataMap[info.cubeId]
-		if not cubeData then continue end 
-
-		local instance = cubeData.instance
-		if not instance or not instance.Parent then continue end 
-
-		local rootPart = GetRootPart(instance)
-		if not rootPart then continue end 
-		local position = rootPart.Position
-
-		if info.mutationType == "tierUpgrade" then
-			PlayVFX("TierUpgrade", position, 1.5)
-			if info.tierName == "Legendary" then PlayVFX("Legendary", position, 2.0) end
-
-			local oldTierName = cubeData.tierName
-			local newAura = CloneAuraModel(info.tierName, info.currentArea)
-
-			if newAura then
-				newAura:PivotTo(CFrame.new(position))
-				newAura.Parent = workspace
-				newAura:SetAttribute("AuraCube", true)
-
-				if newAura.PrimaryPart then
-					newAura.PrimaryPart.Anchored = false
-					newAura.PrimaryPart.CanCollide = true
-					newAura.PrimaryPart.CollisionGroup = "Auras"
-				end
-
-				ScaleAura(newAura, info.tierName, true, oldTierName)
-				ApplyHeavyPhysics(newAura)
-
-				if cubeData.rateLabel and cubeData.rateLabel.Parent then
-					cubeData.rateLabel.Adornee = GetRootPart(newAura)
-					cubeData.rateLabel.Parent = GetRootPart(newAura)
-
-					cubeData.rateLabel.TextColor3 = info.newColor or Color3.fromRGB(100, 255, 100)
-
-					if cubeData.isStored then
-						cubeData.rateLabel.Enabled = false
-					end
-				end
-
-				instance:Destroy()
-
-				cubeData.instance = newAura
-				cubeData.tierName = info.tierName
-				cubeData.isCustom = true
-
-				newAura.AncestryChanged:Connect(function(_, parent)
-					if not parent then cubeDataMap[info.cubeId] = nil end
-				end)
-			else
-				if rootPart:IsA("BasePart") then
-					TweenService:Create(rootPart, TweenInfo.new(0.5, Enum.EasingStyle.Quad), { Color = info.newColor }):Play()
-					if info.newGlow then
-						local light = rootPart:FindFirstChildOfClass("PointLight")
-						if not light then light = Instance.new("PointLight"); light.Parent = rootPart end
-						TweenService:Create(light, TweenInfo.new(0.5), { Brightness = 3, Range = 8, Color = info.newColor }):Play()
-					end
-					ScaleAura(instance, info.tierName, true, oldTierName)
-				end
-				cubeData.tierName = info.tierName
-			end
-			ShowTierPopup(position, info.tierName, info.newColor)
-		end
-	end
-end)
-
----------------------------------------------------------------
--- HUD BUTTON POLISH
----------------------------------------------------------------
-local function AddBasicJuice(btn)
-	if not btn then return end
-	local scale = btn:FindFirstChildOfClass("UIScale") or Instance.new("UIScale", btn)
-	btn.MouseEnter:Connect(function() TweenService:Create(scale, TweenInfo.new(0.15), {Scale = 1.08}):Play() end)
-	btn.MouseLeave:Connect(function() TweenService:Create(scale, TweenInfo.new(0.15), {Scale = 1}):Play() end)
-	btn.MouseButton1Down:Connect(function() TweenService:Create(scale, TweenInfo.new(0.1), {Scale = 0.9}):Play() end)
-	btn.MouseButton1Up:Connect(function() TweenService:Create(scale, TweenInfo.new(0.2, Enum.EasingStyle.Bounce), {Scale = 1.08}):Play() end)
 end
 
-AddBasicJuice(playerGui:WaitForChild("MainHUD"):FindFirstChild("ModeToggle"))
-AddBasicJuice(playerGui:WaitForChild("MainHUD"):FindFirstChild("SendButton"))
+local function UpdateSendButton()
+	if AdminConfig.DisableShipping then sendButton.Visible = false; return end
+	sendButton.Visible = not isAutoMode and (pendingAuras or 0) > 0
+	if sendButton.Visible then
+		SyncManualCooldownVisuals()
+	end
+end
 
-ReplicatedStorage.RemoteEvents.UpgradeUpdated.OnClientEvent:Connect(function(info)
-	if not info or not info.upgrades then return end
-	local speedData = info.upgrades["multiplierSpeed"]
-	local speedLevel = (typeof(speedData) == "table" and speedData.level) or (typeof(speedData) == "number" and speedData) or 0
-	playerMultSpeed = 1.0 + (speedLevel * 0.05) 
+local autoProgressContainer = Instance.new("Frame")
+autoProgressContainer.Name             = "AutoProgressContainer"
+autoProgressContainer.Size             = UDim2.new(0, 12, 1, 0)
+autoProgressContainer.Position         = UDim2.new(1, 8, 0, 0)
+autoProgressContainer.BackgroundColor3 = Color3.fromRGB(24, 60, 24)
+autoProgressContainer.BorderSizePixel  = 0
+autoProgressContainer.Visible          = false
+autoProgressContainer.Parent           = modeToggle
+Instance.new("UICorner", autoProgressContainer).CornerRadius = UDim.new(0.5, 0)
 
-	local tierUnlocks = {
-		{ upgradeId = "unlockOmniMult",      tier = 10 },
-		{ upgradeId = "unlockUniversalMult", tier = 9 },
-		{ upgradeId = "unlockGodlyMult",     tier = 8 },
-		{ upgradeId = "unlockCosmicMult",    tier = 7 },
-		{ upgradeId = "unlockMythicMult",    tier = 6 },
-	}
+local autoStroke = Instance.new("UIStroke")
+autoStroke.Color     = Color3.fromRGB(0, 255, 128)
+autoStroke.Thickness = 1.5
+autoStroke.Parent    = autoProgressContainer
 
-	local calculatedMaxTier = 5 
-	for _, data in ipairs(tierUnlocks) do
-		local upgData = info.upgrades[data.upgradeId]
-		local level = (typeof(upgData) == "table" and upgData.level) or (typeof(upgData) == "number" and upgData) or 0
-		if level > 0 then calculatedMaxTier = data.tier; break end
+local autoFillClip = Instance.new("Frame")
+autoFillClip.Size                 = UDim2.new(1, 0, 1, 0)
+autoFillClip.BackgroundTransparency = 1
+autoFillClip.ClipsDescendants     = true
+autoFillClip.Parent               = autoProgressContainer
+Instance.new("UICorner", autoFillClip).CornerRadius = UDim.new(0.5, 0)
+
+local autoFill = Instance.new("Frame")
+autoFill.Name             = "Fill"
+autoFill.Size             = UDim2.new(1, 0, 1, 0)
+autoFill.Position         = UDim2.new(0, 0, 1, 0)
+autoFill.AnchorPoint      = Vector2.new(0, 1)
+autoFill.BackgroundColor3 = Color3.fromRGB(0, 255, 128)
+autoFill.BorderSizePixel  = 0
+autoFill.Parent           = autoFillClip
+
+local function UpdateModeToggleVisuals()
+	local textLabel = modeToggle:FindFirstChildOfClass("TextLabel") or modeToggle
+	local uiStroke  = modeToggle:FindFirstChildOfClass("UIStroke")
+
+	autoLoopID += 1
+	local currentLoop = autoLoopID
+
+	if isAutoMode then
+		modeToggle.BackgroundColor3 = Color3.fromRGB(24, 60, 24)
+		textLabel.Text              = "[AUTO ACTIVE]"
+		textLabel.TextColor3        = Color3.fromRGB(0, 255, 128)
+		if uiStroke then uiStroke.Color = Color3.fromRGB(0, 255, 128) end
+
+		autoProgressContainer.Visible = true
+
+		task.spawn(function()
+			while isAutoMode and autoLoopID == currentLoop do
+				local timeLeft = sharedCooldownEnd - tick()
+
+				if timeLeft <= 0 then
+					sharedCooldownEnd = tick() + currentCooldownTime
+					timeLeft = currentCooldownTime
+
+					if (pendingAuras or 0) > 0 then
+						ShipAuras:FireServer("manual")
+					end
+				end
+
+				local pct = timeLeft / currentCooldownTime
+				autoFill.Size = UDim2.new(1, 0, pct, 0)
+
+				local tween = TweenService:Create(autoFill, TweenInfo.new(timeLeft, Enum.EasingStyle.Linear), {
+					Size = UDim2.new(1, 0, 0, 0)
+				})
+				tween:Play()
+
+				local elapsed = 0
+				while elapsed < timeLeft and isAutoMode and autoLoopID == currentLoop do
+					task.wait(0.1)
+					elapsed += 0.1
+				end
+
+				if tween then tween:Cancel() end
+			end
+		end)
+	else
+		modeToggle.BackgroundColor3 = Color3.fromRGB(38, 38, 45)
+		textLabel.Text              = "Mode: Manual"
+		textLabel.TextColor3        = Color3.fromRGB(220, 230, 240)
+		if uiStroke then uiStroke.Color = Color3.fromRGB(100, 180, 220) end
+
+		autoProgressContainer.Visible = false
+	end
+end
+
+sendButton.MouseButton1Down:Connect(function()
+	if AdminConfig.DisableShipping then return end
+	if isAutoMode or isShipOnCooldown or (pendingAuras or 0) <= 0 then return end
+
+	ShipAuras:FireServer("manual")
+	sharedCooldownEnd = tick() + currentCooldownTime
+	SyncManualCooldownVisuals()
+end)
+
+modeToggle.MouseButton1Down:Connect(function()
+	if AdminConfig.DisableShipping then return end
+
+	isAutoMode = not isAutoMode
+	ShipAuras:FireServer("setMode", isAutoMode and "auto" or "manual")
+
+	UpdateModeToggleVisuals()
+	UpdateSendButton()
+end)
+
+UpdateModeToggleVisuals()
+sendButton.Visible = false
+
+if AdminConfig.DisableShipping then
+	isAutoMode         = false
+	sendButton.Visible = false
+	modeToggle.Visible = false
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- UpdateHUD EVENT
+-- ─────────────────────────────────────────────────────────────────────────────
+UpdateHUD.OnClientEvent:Connect(function(stats)
+	local serverPurchaseTick = player:GetAttribute("LastServerPurchaseTick") or 0
+	local safeToSync = (tick() - math.max(lastSpendTick, serverPurchaseTick)) > 2.5
+
+	if stats.goldenAuras ~= nil and safeToSync then
+		local pendingAuras = player:GetAttribute("LocalPendingAuras") or 0
+		local effectiveServerAuras = stats.goldenAuras - pendingAuras
+
+		if effectiveServerAuras ~= liveGoldenAuras then
+			liveGoldenAuras = effectiveServerAuras
+			GoldenAurasLabel.Text = "GAURAS: " .. FormatNumber(liveGoldenAuras) 
+		end
 	end
 
-	playerMaxTier = calculatedMaxTier
+	if stats.currency ~= nil then
+		local newServerCurrency = stats.currency
+
+		if safeToSync then
+			local dynamicInterval = math.max(5, (passiveInterval or 1) * 2) 
+			local snapThreshold = math.max(500, ratePerSecond * dynamicInterval)
+
+			local pendingPayout = player:GetAttribute("LocalPendingPayout") or 0
+			local effectiveServerCurrency = newServerCurrency - pendingPayout
+
+			local diff = effectiveServerCurrency - displayedCurrency
+
+			if diff > snapThreshold then
+				displayedCurrency = effectiveServerCurrency
+				curr.TextColor3 = Color3.fromRGB(80, 255, 80)
+				TweenService:Create(curr, TweenInfo.new(0.4), {
+					TextColor3 = Color3.fromRGB(255, 255, 255)
+				}):Play()
+
+			elseif diff < -snapThreshold then
+				displayedCurrency = effectiveServerCurrency
+				curr.TextColor3 = Color3.fromRGB(255, 80, 80)
+				TweenService:Create(curr, TweenInfo.new(0.4), {
+					TextColor3 = Color3.fromRGB(255, 255, 255)
+				}):Play()
+			end
+		end
+
+		prevServerCurrency = newServerCurrency
+		serverCurrency     = newServerCurrency
+	end
+
+	if stats.pendingAuras ~= nil then
+		pendingAuras    = stats.pendingAuras
+		habitatCapacity = stats.habitatCapacity or habitatCapacity
+		UpdateHabitatBar(pendingAuras, habitatCapacity)
+		UpdateSendButton()
+	end
+
+	if stats.rate ~= nil then
+		passiveInterval = stats.passiveInterval or passiveInterval
+		local serverRate = stats.rate
+		ratePerSecond = (passiveInterval > 0 and serverRate > 0)
+			and serverRate / passiveInterval or 0
+		rate.Text = FormatRate(ratePerSecond)
+		TweenService:Create(rate, TweenInfo.new(0.3), {
+			TextColor3 = GetRateColor(pendingAuras, habitatCapacity)
+		}):Play()
+	end
+
+	if stats.shipCooldown ~= nil then
+		currentCooldownTime = stats.shipCooldown
+	end
 end)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SMOOTH TICKER
+-- ─────────────────────────────────────────────────────────────────────────────
+RunService.RenderStepped:Connect(function(dt)
+	if ratePerSecond > 0 then
+		displayedCurrency += ratePerSecond * dt
+	end
+
+	player:SetAttribute("LiveCurrency",     displayedCurrency)
+	player:SetAttribute("LiveGoldenAuras",  liveGoldenAuras)
+	curr.Text = "Currency: $" .. FormatNumber(displayedCurrency)
+end)
+
+local function RefreshLook()
+	UITheme.ApplyFlair(GoldenAurasLabel, "GoldStroke")
+end
+task.wait(2)
+RefreshLook()
