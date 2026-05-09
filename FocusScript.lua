@@ -570,3 +570,111 @@ local function RefreshLook()
 end
 task.wait(2)
 RefreshLook()
+
+Skip to main content
+Creator Hub
+Forum
+DistanceFade - A transparency falloff effect for your games
+Resources
+Community Resources
+
+Log in to Forum
+
+​
+
+​
+DistanceFade - A transparency falloff effect for your games
+Resources
+Community Resources
+Aug 2024
+Jan 29
+
+xander22
+xander_z22
+
+7
+Aug 2024
+Hi, I made this module for a game I’m working on and I wanted to release it to the community for use in your own projects
+
+thumbnail
+thumbnail
+1280×540 42.3 KB
+
+Showcase Video
+What is DistanceFade?
+DistanceFade is a module that aims to recreate transparency falloff shaders commonly found in games outside of Roblox.
+The module essentially works by “projecting” the effect onto a table of target parts. The parts can be arranged with varying sizes and rotations to create different shapes for the effect (the thumbnail is 3 parts arranged in a curve, for example). 21 different customization settings allow for more complicated effects like animated textures, texture offsets, colors and more.
+
+Note:
+The module as it is now is more of a foundation than a perfect solution… it isn’t perfectly optimized and still has some flaws. I made it for a specific use case in my game (map barriers that fade in when close), but designed the module to be fairly flexible in what it can be used for. I probably won’t be updating it so feel free to modify and redistribute it as you see fit
+
+If you like my work / want some more assets you can support me on Patreon
+If you’re interested in other stuff I make it’ll be on my yt channel here
+
+Examples
+
+
+
+
+Awesome 3D illusion and color gradient effects by Powerbow
+Really cool parallax mapping effect by Bobcat
+Download
+DistanceFade.rbxm (15.6 KB)
+
+ Template models
+Toolbox Model
+
+Basic Usage
+Step 1 - Initialization
+Require the module and initialize it using the .new() constructor. You can have multiple forcefield objects running in the same script
+local DistanceFade = require(game.ReplicatedStorage.DistanceFade) -- or wherever the module is located
+local distanceFadeObj = DistanceFade.new() --initialize the object
+Step 2 - Add target faces
+DistanceFade works by applying the effect to individual BasePart faces. For every face you want to have the effect on, you need to use :AddFace() with 2 parameters, the target part and the Enum.NormalId of the face
+local partToAdd -- can be any BasePart
+distanceFadeObj:AddFace(partToAdd, Enum.NormalId.Front) -- can add to any face, in this case the front and back of the part
+distanceFadeObj:AddFace(partToAdd, Enum.NormalId.Back)
+Step 3 - Running the effect
+Use :Step() to update the simulation at any time. Use Heartbeat for a visually smooth effect. TargetPos parameter is a Vector3
+game:GetService("RunService").Heartbeat:Connect(function()
+	local targetPos -- the position the effect is centered around
+	distanceFadeObj:Step(targetPos) -- if parameter is nil, automatically targets local character's root part
+end)
+Step 4 - Apply settings
+Use :UpdateSettings() to update the effect at any time (applies settings to all faces of that object). If you want to update the effect on individual faces, use :UpdateFaceSettings() (overwrites the object settings)
+game:GetService("RunService").Heartbeat:Connect(function()
+	local newSettings = {} --table of settings to modify. Full list below
+	distanceFadeObj:UpdateSettings(newSettings)
+
+	local targetPos -- the position the effect is centered around
+	distanceFadeObj:Step(targetPos) -- if parameter is nil, automatically targets local character's root part
+end)
+Full list of settings:
+
+local DEFAULT_SETTINGS = {
+	["DistanceOuter"] = 16, -- Distance at which the effect starts to appear
+	["DistanceInner"] = 4, -- Distance at which the effect is fully visible
+	["EffectRadius"] = 16, -- Size of the effect when in range
+	["EffectRadiusMin"] = 0, -- Size of the effect when out of range
+	["EdgeDistanceCalculations"] = false, -- When set to true, distance to target is calculated from the face edges rather than the face itself. Can be more accurate in certain cases
+	["Texture"] = "rbxassetid://18838056070", -- TextureId
+	["TextureTransparency"] = 0, -- Transparency of the texture when in range
+	["TextureTransparencyMin"] = 1, -- Transparency of the texture when out of range
+	["BackgroundTransparency"] = 1, -- Transparency of the texture background when in range
+	["BackgroundTransparencyMin"] = 1, -- Transparency of the texture background when out of range
+	["TextureColor"] = Color3.fromRGB(255, 255, 255), -- Color of the texture
+	["BackgroundColor"] = Color3.fromRGB(255, 255, 255), -- Color of the texture background
+	["TextureSize"] = Vector2.new(8, 8), -- Size of the texture in studs per tile. Can potentially cause clipping issues if greater than EffectRadius * 2
+	["TextureOffset"] = Vector2.new(0, 0), -- Texture offset in studs
+	-- SurfaceGui settings
+	["ZOffset"] = 0,
+	["AlwaysOnTop"] = false,
+	["Brightness"] = 1,
+	["LightInfluence"] = 0,
+	["MaxDistance"] = 1000,
+	["PixelsPerStud"] = 100,
+	["SizingMode"] = Enum.SurfaceGuiSizingMode.PixelsPerStud
+}
+More advanced examples can be found in the template models dropdown above. Also make sure to read through the module code if you want more in-depth explanations of each function. Please leave any questions or feedback and I’ll do my best to help
+
+
