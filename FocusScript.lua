@@ -1,2348 +1,1701 @@
--- AreaManager
--- Location: ServerScriptService > AreaManager
---
--- PHASE 4 — AREA CHOICE + PRESTIGE LIMIT SUPPORT:
---   FIX: MergeUnlockedAreas never removes saved unlocks.
---   FIX: hasPrestigedThisArea reset on ALL area travel (forward + backward).
---   TravelToArea server handler for player-chosen destinations.
---   Batched AreaUnlocked notification.
---   AreaRegistry is sole source for thresholds/names/multipliers.
+	-- PrestigeController
+-- Location: StarterPlayer > StarterPlayerScripts > PrestigeController
 
-local Players             = game:GetService("Players")
-local ReplicatedStorage   = game:GetService("ReplicatedStorage")
-local ServerScriptService = game:GetService("ServerScriptService")
-
-local AdminConfig    = require(ReplicatedStorage.Modules.AdminConfig)
-local UpgradeConfig  = require(ReplicatedStorage.Modules.UpgradeConfig)
-local PrestigeModule = require(ReplicatedStorage.Modules.PrestigeModule)
-local AreaRegistry   = require(ReplicatedStorage.Modules.AreaRegistry)
-local GameManager    = require(ServerScriptService.GameManager)
-local BoostManager   = require(ServerScriptService.BoostManager)
-
-local AreaUpdated  = ReplicatedStorage.RemoteEvents:WaitForChild("AreaUpdated")
-local AreaUnlocked = ReplicatedStorage.RemoteEvents:WaitForChild("AreaUnlocked")
-local EnterPortal  = ReplicatedStorage.RemoteEvents:WaitForChild("EnterPortal")
-local TravelToArea = ReplicatedStorage.RemoteEvents:WaitForChild("TravelToArea")
-local AreaChanged  = ReplicatedStorage.RemoteEvents:WaitForChild("AreaChanged")
-
-local PrestigeComplete = ReplicatedStorage.RemoteEvents:WaitForChild("PrestigeComplete")
-local UpgradeUpdated   = ReplicatedStorage.RemoteEvents:WaitForChild("UpgradeUpdated")
-local UpdateHUD        = ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHUD")
-local UpdateHatchery   = ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHatchery")
-
-local lastPortalEntry = {}
-local lastUnlockCount = {}
-local PORTAL_COOLDOWN = 3
-
----------------------------------------------------------------
--- UNLOCK CALCULATION — MERGES with saved list, never removes
----------------------------------------------------------------
-local function MergeUnlockedAreas(data, farmEval)
-	local currentArea = data.currentArea or 1
-	local maxArea     = AreaRegistry.GetMaxArea()
-	local seen, merged = {}, {}
-	if type(data.unlockedAreas) == "table" then
-		for _, v in ipairs(data.unlockedAreas) do
-			if not seen[v] then seen[v] = true; table.insert(merged, v) end
-		end
-	end
-	for i = 1, currentArea do
-		if AreaRegistry.Areas[i] and not seen[i] then
-			seen[i] = true; table.insert(merged, i)
-		end
-	end
-	for i = currentArea + 1, maxArea do
-		local area = AreaRegistry.Areas[i]
-		if area and farmEval >= (area.threshold or 0) then
-			if not seen[i] then seen[i] = true; table.insert(merged, i) end
-		end
-	end
-	table.sort(merged)
-	data.unlockedAreas = merged
-	return merged
-end
-
----------------------------------------------------------------
--- FORWARD TRAVEL — prestige-style reset + area change
----------------------------------------------------------------
-local function DoForwardTravel(player, targetArea)
-	local uid     = player.UserId
-	local data    = GameManager.GetData(uid)
-	local runtime = GameManager.GetRuntime(uid)
-	if not data then return false end
-
-	local earned       = data.totalEarned or 0
-	local rawSoulAuras = PrestigeModule.CalcSoulAuras(earned)
-	local soulMult     = BoostManager.GetSoulMultiplier(uid)
-	local newSoulAuras = math.floor(rawSoulAuras * soulMult)
-
-	local previousSoulAuras  = data.soulAuras or 0
-	local previousMultiplier = PrestigeModule.GetMultiplier(previousSoulAuras)
-
-	local bonusPercent  = AdminConfig.PrestigeStartBonusPercent or 0.05
-	local prestigeBonus = math.max(math.floor(earned * bonusPercent), 50)
-
-	if newSoulAuras > 0 then
-		data.soulAuras = previousSoulAuras + newSoulAuras
-	end
-	data.prestigeCount = (data.prestigeCount or 0) + 1
-	local newMultiplier = PrestigeModule.GetMultiplier(data.soulAuras)
-
-	-- Add target to unlocked BEFORE resetting
-	if type(data.unlockedAreas) ~= "table" then data.unlockedAreas = { 1 } end
-	local has = false
-	for _, v in ipairs(data.unlockedAreas) do if v == targetArea then has = true end end
-	if not has then table.insert(data.unlockedAreas, targetArea); table.sort(data.unlockedAreas) end
-
-	-- Reset run data
-	data.currentArea            = targetArea
-	data.hasPrestigedThisArea   = false   -- PRESTIGE LIMIT: reset on area travel
-	data.currency               = prestigeBonus
-	data.totalEarned            = 0
-	data.farmEvaluation         = 0
-	data.pendingAuras           = 0
-	data.pendingPayout          = 0
-	data.pendingBonusPayout     = 0
-	data.lastPayout             = 0
-
-	for key, _ in pairs(data.upgrades) do data.upgrades[key] = 0 end
-
-	if runtime then
-		runtime.cubes          = {}
-		runtime.cubeOrder      = {}
-		runtime.cubeCount      = 0
-		runtime.nextCubeId     = 1
-		runtime.lastActiveTime = tick()
-		runtime.sessionStart   = tick()
-	end
-
-	lastUnlockCount[uid] = nil
-
-	local PrestigeReset = ServerScriptService:FindFirstChild("PrestigeReset")
-	if PrestigeReset then PrestigeReset:Fire(player) end
-
-	PrestigeComplete:FireClient(player, {
-		newSoulAuras         = newSoulAuras,
-		totalSoulAuras       = data.soulAuras,
-		previousMultiplier   = previousMultiplier,
-		newMultiplier        = newMultiplier,
-		prestigeCount        = data.prestigeCount,
-		prestigeBonus        = prestigeBonus,
-		isPortalEntry        = true,
-		soulBoostActive      = soulMult > 1,
-		hasPrestigedThisArea = false,
-	})
-
-	local resetState = {}
-	for _, tierData in ipairs(UpgradeConfig.Tiers) do
-		for upgradeId, cfg in pairs(tierData.upgrades) do
-			resetState[upgradeId] = {
-				level    = 0,
-				maxLevel = cfg.maxLevel,
-				cost     = UpgradeConfig.CalculateCost(upgradeId, 0),
-				maxed    = false,
-			}
-		end
-	end
-	UpgradeUpdated:FireClient(player, {
-		type     = "fullState",
-		upgrades = resetState,
-		currency = prestigeBonus,
-	})
-
-	UpdateHatchery:FireClient(player, {
-		current = AdminConfig.HatcheryMax,
-		max     = AdminConfig.HatcheryMax,
-	})
-
-	task.wait(0.3)
-	UpdateHUD:FireClient(player, {
-		currency             = data.currency,
-		pendingAuras         = 0,
-		habitatCapacity      = AdminConfig.BaseHabitatCapacity,
-		rate                 = 0,
-		passiveInterval      = AdminConfig.PassiveInterval,
-		totalEarned          = 0,
-		soulAuras            = data.soulAuras or 0,
-		farmEvaluation       = 0,
-		hasPrestigedThisArea = false,
-	})
-
-	AreaChanged:FireClient(player, {
-		newArea            = targetArea,
-		areaName           = AreaRegistry.GetName(targetArea),
-		areaMultiplier     = AreaRegistry.GetMultiplier(targetArea),
-		newSoulAuras       = newSoulAuras,
-		totalSoulAuras     = data.soulAuras,
-		previousMultiplier = previousMultiplier,
-		newMultiplier      = newMultiplier,
-		unlockedAreas      = data.unlockedAreas,
-	})
-
-	GameManager.SavePlayer(player)
-	return true
-end
-
-local function DoBackwardTravel(player, targetArea)
-	local uid  = player.UserId
-	local data = GameManager.GetData(uid)
-	if not data then return false end
-
-	local isUnlocked = false
-	if type(data.unlockedAreas) == "table" then
-		for _, v in ipairs(data.unlockedAreas) do
-			if v == targetArea then isUnlocked = true; break end
-		end
-	end
-	if not isUnlocked then return false end
-
-	data.currentArea          = targetArea
-	-- REMOVED: data.hasPrestigedThisArea = false (This prevents the exploit)
-	lastUnlockCount[uid]      = nil
-
-	AreaChanged:FireClient(player, {
-		newArea              = targetArea,
-		areaName             = AreaRegistry.GetName(targetArea),
-		areaMultiplier       = AreaRegistry.GetMultiplier(targetArea),
-		travelType           = "backward",
-		unlockedAreas        = data.unlockedAreas,
-		hasPrestigedThisArea = data.hasPrestigedThisArea, -- Send current state to client
-	})
-
-	GameManager.SavePlayer(player)
-	return true
-end
-
----------------------------------------------------------------
--- TRAVEL TO AREA
----------------------------------------------------------------
-TravelToArea.OnServerEvent:Connect(function(player, targetArea)
-	local uid = player.UserId
-	local now = tick()
-	if lastPortalEntry[uid] and now - lastPortalEntry[uid] < PORTAL_COOLDOWN then return end
-	local data = GameManager.GetData(uid)
-	if not data then return end
-	targetArea = tonumber(targetArea)
-	if not targetArea or not AreaRegistry.Get(targetArea) then return end
-	local currentArea = data.currentArea or 1
-	if targetArea == currentArea then return end
-	lastPortalEntry[uid] = now
-	if targetArea > currentArea then
-		local isUnlocked = false
-		if type(data.unlockedAreas) == "table" then
-			for _, v in ipairs(data.unlockedAreas) do
-				if v == targetArea then isUnlocked = true; break end
-			end
-		end
-		if not isUnlocked then return end
-		DoForwardTravel(player, targetArea)
-	else
-		DoBackwardTravel(player, targetArea)
-	end
-end)
-
----------------------------------------------------------------
--- ENTER PORTAL (convenience)
----------------------------------------------------------------
-EnterPortal.OnServerEvent:Connect(function(player)
-	local uid = player.UserId
-	local now = tick()
-	if lastPortalEntry[uid] and now - lastPortalEntry[uid] < PORTAL_COOLDOWN then return end
-	local data = GameManager.GetData(uid)
-	if not data then return end
-	local bestArea = AreaRegistry.GetBestNextArea(data.currentArea or 1, data.farmEvaluation or 0)
-	if not bestArea then return end
-	lastPortalEntry[uid] = now
-	DoForwardTravel(player, bestArea)
-end)
-
----------------------------------------------------------------
--- 1-SECOND PUSH
----------------------------------------------------------------
-task.spawn(function()
-	while true do
-		task.wait(1)
-		for _, player in ipairs(Players:GetPlayers()) do
-			local uid  = player.UserId
-			local data = GameManager.GetData(uid)
-			if not data then continue end
-
-			local currentArea = data.currentArea or 1
-			local farmEval    = data.farmEvaluation or 0
-			local unlocked    = MergeUnlockedAreas(data, farmEval)
-
-			local prevCount     = lastUnlockCount[uid] or #unlocked
-			local newCount      = #unlocked
-			local newlyUnlocked = newCount - prevCount
-
-			local nextGoalArea, nextGoalThreshold = nil, nil
-			for i = currentArea + 1, AreaRegistry.GetMaxArea() do
-				local area = AreaRegistry.Areas[i]
-				if area and farmEval < (area.threshold or 0) then
-					nextGoalArea = i; nextGoalThreshold = area.threshold; break
-				end
-			end
-
-			local portalReady = false
-			for _, v in ipairs(unlocked) do
-				if v > currentArea then portalReady = true; break end
-			end
-
-			AreaUpdated:FireClient(player, {
-				currentArea          = currentArea,
-				areaName             = AreaRegistry.GetName(currentArea),
-				farmEvaluation       = farmEval,
-				nextThreshold        = nextGoalThreshold,
-				nextArea             = nextGoalArea,
-				nextAreaName         = nextGoalArea and AreaRegistry.GetName(nextGoalArea) or nil,
-				portalReady          = portalReady,
-				unlockedAreas        = unlocked,
-				maxArea              = AreaRegistry.GetMaxArea(),
-				hasPrestigedThisArea = data.hasPrestigedThisArea == true,
-			})
-
-			if newlyUnlocked > 0 and prevCount > 0 then
-				local highestNew = unlocked[#unlocked]
-				AreaUnlocked:FireClient(player, {
-					newAreasCount  = newlyUnlocked,
-					highestNew     = highestNew,
-					highestNewName = AreaRegistry.GetName(highestNew),
-					unlockedAreas  = unlocked,
-				})
-			end
-
-			lastUnlockCount[uid] = newCount
-		end
-	end
-end)
-
----------------------------------------------------------------
--- PLAYER JOIN / LEAVE
----------------------------------------------------------------
-Players.PlayerAdded:Connect(function(player)
-	lastUnlockCount[player.UserId] = nil
-	lastPortalEntry[player.UserId] = nil
-end)
-Players.PlayerRemoving:Connect(function(player)
-	lastUnlockCount[player.UserId] = nil
-	lastPortalEntry[player.UserId] = nil
-end)
-
-
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local ServerScriptService = game:GetService("ServerScriptService")
-local TweenService = game:GetService("TweenService")
-local Debris = game:GetService("Debris")
-local CollectionService = game:GetService("CollectionService")
-
-local AdminConfig = require(ReplicatedStorage.Modules:WaitForChild("AdminConfig"))
-local GameManager = require(ServerScriptService:WaitForChild("GameManager"))
-
--- 🛡️ SAFETY CHECK: Using the correct name from your screenshot
-local AURA_ORIGIN = workspace:FindFirstChild("AuraModel") or workspace:FindFirstChild("AuraHolder")
-
-local function FadeOutAndDestroy(obj, duration)
-	if not obj or not obj.Parent then return end
-	if obj:IsA("BasePart") then
-		TweenService:Create(obj, TweenInfo.new(duration), {Size = Vector3.zero, Transparency = 1}):Play()
-	else
-		for _, desc in ipairs(obj:GetDescendants()) do
-			if desc:IsA("BasePart") or desc:IsA("Decal") or desc:IsA("Texture") then
-				TweenService:Create(desc, TweenInfo.new(duration), {Transparency = 1}):Play()
-			end
-		end
-	end
-	Debris:AddItem(obj, duration)
-end
-
-local function CreatePhysicsAura(isElite)
-	if not AURA_ORIGIN then 
-		warn("❌ AURA_ORIGIN (AuraModel/AuraHolder) NOT FOUND IN WORKSPACE!")
-		return 
-	end
-
-	-- 1. CLONE TEMPLATE
-	local VFX_FOLDER = ReplicatedStorage:FindFirstChild("VFX")
-	local aura
-	if VFX_FOLDER and isElite and VFX_FOLDER:FindFirstChild("ElitePhysicsVFX") then
-		aura = VFX_FOLDER.ElitePhysicsVFX:Clone()
-	elseif VFX_FOLDER and not isElite and VFX_FOLDER:FindFirstChild("PhysicsVFX") then
-		aura = VFX_FOLDER.PhysicsVFX:Clone()
-	else
-		aura = Instance.new("Part")
-		aura.Shape = Enum.PartType.Ball; aura.Material = Enum.Material.Neon; aura.Size = Vector3.new(2,2,2)
-		aura.Color = isElite and Color3.fromRGB(255, 50, 255) or Color3.fromRGB(50, 255, 255)
-	end
-
-	-- 2. SETUP CORE
-	local mainPart = aura:IsA("Model") and aura.PrimaryPart or aura
-	if not mainPart then aura:Destroy() return end
-
-	mainPart.CanCollide = true
-	aura.Parent = workspace
-
-	-- 3. POSITION & LAUNCH
-	local spawnPart = AURA_ORIGIN:FindFirstChild("Position")
-	if not spawnPart then warn("❌ No 'Position' part in AuraModel!"); return end
-
-	local spawnPos = spawnPart.Position + Vector3.new(0, 5, 0)
-	if aura:IsA("Model") then aura:PivotTo(CFrame.new(spawnPos)) else aura.Position = spawnPos end
-
-	task.wait()
-	mainPart:SetNetworkOwner(nil)
-
-	-- Launch it
-	local angle = math.random() * math.pi * 2
-	local outF = math.random(AdminConfig.PhysicsOutwardForceMin, AdminConfig.PhysicsOutwardForceMax)
-	local upF = math.random(AdminConfig.PhysicsUpwardForceMin, AdminConfig.PhysicsUpwardForceMax)
-	mainPart:ApplyImpulse(Vector3.new(math.cos(angle)*outF, upF, math.sin(angle)*outF) * mainPart.AssemblyMass)
-
-	local sfxFolder = ReplicatedStorage:FindFirstChild("SFX")
-	if sfxFolder and sfxFolder:FindFirstChild("AuraShoot") then
-		local sfx = sfxFolder.AuraShoot:Clone()
-		sfx.Parent = mainPart 
-
-		-- ✨ THE 3D BOOST FIX:
-		sfx.RollOffMaxDistance = 500 -- How many studs away you can still hear it
-		sfx.RollOffMinDistance = 10  -- Distance before the volume starts dropping
-		sfx.RollOffMode = Enum.RollOffMode.Linear -- Makes the drop-off feel more natural
-
-		sfx.PlaybackSpeed = 1 + (math.random(-10, 10) / 100) 
-		sfx:Play()
-		Debris:AddItem(sfx, 2)
-	end
-
-	-- ✨ NEW: SPAWN VFX
-	local vfxFolder = ReplicatedStorage:FindFirstChild("VFX")
-	if vfxFolder and vfxFolder:FindFirstChild("AuraSpawnVFX") then
-		local spawnEffect = vfxFolder.AuraSpawnVFX:Clone()
-		spawnEffect.Position = mainPart.Position
-		spawnEffect.Parent = workspace
-
-		-- Tell all ParticleEmitters inside the part to burst!
-		for _, emitter in ipairs(spawnEffect:GetDescendants()) do
-			if emitter:IsA("ParticleEmitter") then
-				emitter:Emit(emitter:GetAttribute("EmitCount") or 25) 
-			end
-		end
-		Debris:AddItem(spawnEffect, 3) -- Deletes the effect part after 3 seconds
-	end
-
-	-- 9. CLICK & REWARDS (🛡️ Back to Custom Style)
-	local prompt = Instance.new("ProximityPrompt")
-	prompt.Name = "AuraPrompt"
-	prompt.ActionText = "Collect"
-	prompt.ObjectText = isElite and "Elite Aura" or "Golden Aura"
-	prompt.HoldDuration = 0
-	prompt.MaxActivationDistance = 30
-	prompt.RequiresLineOfSight = false 
-
-	-- 🛡️ Hide the default bubble and tag it for the cool UI
-	prompt.Style = Enum.ProximityPromptStyle.Custom 
-	prompt:SetAttribute("IsElite", isElite == true) 
-	game:GetService("CollectionService"):AddTag(prompt, "AuraHologram")
-
-	prompt.Parent = mainPart
-
-
-	-- 5. LANDING LOGIC & LIFETIME START
-	local maxB = (isElite and AdminConfig.PhysicsMaxBouncesElite or AdminConfig.PhysicsMaxBouncesRegular) or 1
-	local hasLanded = false
-
-	-- ✨ THE FIX: We must define these so the script has numbers to calculate!
-	local bounces = 0
-	local lastB = 0 
-
-	mainPart.Touched:Connect(function(hit)
-		-- Now lastB has a starting value of 0, so tick() - lastB won't crash!
-		if hasLanded or (tick() - lastB < 0.15) then return end
-
-		if hit.Position.Y <= mainPart.Position.Y then
-			-- Now bounces has a starting value, so we can safely add 1 to it!
-			bounces += 1
-			lastB = tick()
-
-			-- 🎵 SOUND SPOT 1: Touches the ground / Bounces
-			local sfxFolder = ReplicatedStorage:FindFirstChild("SFX")
-			if sfxFolder and sfxFolder:FindFirstChild("Landing") then
-				local sfx = sfxFolder.Landing:Clone()
-				sfx.Parent = mainPart
-				sfx:Play()
-				Debris:AddItem(sfx, 2)
-			end
-
-			if bounces > maxB then
-				hasLanded = true
-				mainPart.AssemblyLinearVelocity = Vector3.zero
-				mainPart.AssemblyAngularVelocity = Vector3.zero 
-
-				-- ✨ NEW: LANDING VFX
-				local vfxFolder = ReplicatedStorage:FindFirstChild("VFX")
-				if vfxFolder and vfxFolder:FindFirstChild("AuraLandingVFX") then
-					local landingEffect = vfxFolder.AuraLandingVFX:Clone()
-					landingEffect.Position = mainPart.Position - Vector3.new(0, mainPart.Size.Y/2, 0)
-					landingEffect.Parent = workspace
-
-					for _, emitter in ipairs(landingEffect:GetDescendants()) do
-						if emitter:IsA("ParticleEmitter") then
-							emitter:Emit(emitter:GetAttribute("EmitCount") or 25) 
-						end
-					end
-					Debris:AddItem(landingEffect, 3)
-				end
-
-				-- 🛡️ LIFETIME STARTS NOW
-				local despawnTime = isElite and AdminConfig.PhysicsEliteDespawn or AdminConfig.PhysicsRegularDespawn
-				if type(despawnTime) ~= "number" then 
-					despawnTime = 15 -- Will stay on the ground for 15 seconds!
-				end
-
-				task.delay(despawnTime, function()
-					if aura and aura.Parent then 
-						FadeOutAndDestroy(aura, 1) 
-					end
-				end)
-			end
-		end
-	end)
-
-	prompt.Triggered:Connect(function(player)
-		local data = GameManager.GetData(player.UserId)
-		local runtime = GameManager.GetRuntime(player.UserId)
-
-		if data and runtime then
-			-- ✨ THE GOLDEN AURA MATH FIX: 
-			-- Elite gives 5 Golden Auras, Regular gives 1. (Change these numbers if you want!)
-			local r = isElite and 5 or 1 
-
-			data.goldenAuras += r
-
-			local RemoteEvents = ReplicatedStorage:FindFirstChild("RemoteEvents")
-			if RemoteEvents and RemoteEvents:FindFirstChild("UpdateHUD") then
-				RemoteEvents.UpdateHUD:FireClient(player, { goldenAuras = data.goldenAuras })
-			end
-		end
-
-		-- 🎵 SOUND SPOT 2: When Collected
-		local sfxFolder = ReplicatedStorage:FindFirstChild("SFX")
-		if sfxFolder and sfxFolder:FindFirstChild("ClassicBass") then
-			local sfx = sfxFolder.ClassicBass:Clone()
-			sfx.Parent = player.Character and player.Character:FindFirstChild("HumanoidRootPart") or workspace
-			sfx:Play()
-			Debris:AddItem(sfx, 2)
-		end
-
-		mainPart.Anchored = true
-		FadeOutAndDestroy(aura, 0.2)
-	end)
-end
-
--- Start spawning
-task.spawn(function()
-	while true do
-		task.wait(math.random(AdminConfig.PhysicsSpawnMin, AdminConfig.PhysicsSpawnMax))
-		CreatePhysicsAura(math.random(1,100) <= AdminConfig.PhysicsEliteChance)
-	end
-end)
-
--- =======================================================
--- 💥 TUTORIAL BURST LISTENER
--- =======================================================
-local RemoteEvents = ReplicatedStorage:FindFirstChild("RemoteEvents")
-if RemoteEvents then
-	local burstEvent = RemoteEvents:FindFirstChild("TutorialBurst")
-	if not burstEvent then
-		-- Auto-create the remote if it doesn't exist yet so you don't have to!
-		burstEvent = Instance.new("RemoteEvent")
-		burstEvent.Name = "TutorialBurst"
-		burstEvent.Parent = RemoteEvents
-	end
-
-	burstEvent.OnServerEvent:Connect(function(player, amount)
-		-- 🛡️ Anti-Exploit: Cap at 25 so hackers can't spawn 10,000 and crash the server
-		if type(amount) ~= "number" or amount > 50 then 
-			amount = 15 
-		end
-
-		-- 💥 Trigger the Burst
-		task.spawn(function()
-			for i = 1, amount do
-				-- Pass 'false' so it only drops standard Golden Auras, not game-breaking Elites
-				CreatePhysicsAura(false) 
-				task.wait(0.15) -- The delay makes them pop out like a fountain
-			end
-		end)
-	end)
-end
-
--- AuraSpawner
--- Location: ServerScriptService > AuraSpawner
-
-local Players             = game:GetService("Players")
-local ReplicatedStorage   = game:GetService("ReplicatedStorage")
-local ServerScriptService = game:GetService("ServerScriptService")
-
-local TierConfig     = require(ReplicatedStorage.Modules.TierConfig)
-local UpgradeConfig  = require(ReplicatedStorage.Modules.UpgradeConfig)
-local PrestigeModule = require(ReplicatedStorage.Modules.PrestigeModule)
-local AdminConfig    = require(ReplicatedStorage.Modules.AdminConfig)
-local MutationConfig = require(ReplicatedStorage.Modules.MutationConfig)
-local AreaRegistry   = require(ReplicatedStorage.Modules.AreaRegistry)
-local GameManager    = require(ServerScriptService.GameManager)
-local BoostManager   = require(ServerScriptService.BoostManager)
-local WeatherManager = require(ServerScriptService.WeatherManager) 
-
-local AuraSpawned    = ReplicatedStorage.RemoteEvents:WaitForChild("AuraSpawned")
-local ProduceAura    = ReplicatedStorage.RemoteEvents:WaitForChild("ProduceAura")
-local UpdateHatchery = ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHatchery")
-local UpdateHUD      = ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHUD")
-local HabitatFull    = ReplicatedStorage.RemoteEvents:WaitForChild("HabitatFull")
-local CubeMutated    = ReplicatedStorage.RemoteEvents:WaitForChild("CubeMutated")
-local CubeSmushed    = ReplicatedStorage.RemoteEvents:WaitForChild("CubeSmushed")
-
-local RemoteEvents = ReplicatedStorage:WaitForChild("RemoteEvents")
-if not RemoteEvents:FindFirstChild("CubeStored") then
-	local ev = Instance.new("RemoteEvent")
-	ev.Name = "CubeStored"
-	ev.Parent = RemoteEvents
-end
-local CubeStored = RemoteEvents:WaitForChild("CubeStored")
-
-local HABITAT_HOLDER = workspace:WaitForChild("HabitatHolder")
-local HABITAT_PART   = HABITAT_HOLDER:WaitForChild("Position")
-local AURA_HOLDER    = workspace:WaitForChild("AuraHolder") 
-
-local lastFire          = {}
-local holdStart         = {}
-local hatchery          = {}
-local clickSessionStart = {}
-
-local function GetAreaAuraModels(areaId)
-	local config = nil
-	if type(AreaRegistry.GetArea) == "function" then
-		config = AreaRegistry.GetArea(areaId)
-	elseif type(AreaRegistry.GetAreaConfig) == "function" then
-		config = AreaRegistry.GetAreaConfig(areaId)
-	elseif AreaRegistry.Areas then
-		config = AreaRegistry.Areas[areaId]
-	end
-	return config and config.auraModels or nil
-end
-
-local function GetHatcheryMax(data)
-	local cfg = UpgradeConfig.GetUpgradeConfig("hatcheryCapacity")
-	return (cfg and cfg.apply) and cfg.apply(data) or AdminConfig.HatcheryMax
-end
-
-local function GetHabitatCapacity(data)
-	local cfg = UpgradeConfig.GetUpgradeConfig("habitatCapacity")
-	return (cfg and cfg.apply) and cfg.apply(data) or AdminConfig.BaseHabitatCapacity
-end
-
-local function GetMutationSpeedMult(data)
-	local cfg = UpgradeConfig.GetUpgradeConfig("mutationSpeed")
-	return (cfg and cfg.apply) and cfg.apply(data) or 1
-end
-
-Players.PlayerAdded:Connect(function(p)
-	hatchery[p.UserId] = AdminConfig.HatcheryMax
-	clickSessionStart[p.UserId] = nil
-end)
-
-Players.PlayerRemoving:Connect(function(p)
-	hatchery[p.UserId]=nil; holdStart[p.UserId]=nil
-	lastFire[p.UserId]=nil; clickSessionStart[p.UserId]=nil
-end)
-
-task.spawn(function()
-	local PR = ServerScriptService:WaitForChild("PrestigeReset", 30)
-	if PR then
-		PR.Event:Connect(function(player)
-			local uid = player.UserId
-			local data = GameManager.GetData(uid)
-			hatchery[uid] = data and GetHatcheryMax(data) or AdminConfig.HatcheryMax
-			holdStart[uid]=nil; lastFire[uid]=nil; clickSessionStart[uid]=nil
-		end)
-	end
-end)
-
-task.spawn(function()
-	while true do
-		task.wait(0.1)
-		for _, player in ipairs(Players:GetPlayers()) do
-			local uid = player.UserId
-			local data = GameManager.GetData(uid)
-			local hatchMax = data and GetHatcheryMax(data) or AdminConfig.HatcheryMax
-			local prev = hatchery[uid] or hatchMax
-
-			if holdStart[uid] then
-				hatchery[uid] = math.max(0, prev - AdminConfig.HatcheryDrainRate * 0.1)
-			else
-				hatchery[uid] = math.min(hatchMax, prev + AdminConfig.HatcheryRefillRate * 0.1)
-			end
-
-			if hatchery[uid] ~= prev then
-				UpdateHatchery:FireClient(player, { current=hatchery[uid], max=hatchMax })
-			end
-
-			if hatchery[uid] <= 0 and holdStart[uid] then
-				holdStart[uid] = nil
-				ReplicatedStorage.RemoteEvents.ForceStopHold:FireClient(player)
-			end
-		end
-	end
-end)
-
-local function GetAFKSpeed(runtime)
-	local idleTime = tick() - runtime.lastActiveTime
-	local speed = MutationConfig.AFKDecay[1].speed
-	for _, e in ipairs(MutationConfig.AFKDecay) do
-		if idleTime >= e.time then speed = e.speed end
-	end
-	return speed
-end
-
--- ✨ Uses optimized counters directly
-local function SendHUDUpdate(player)
-	local uid = player.UserId
-	local data = GameManager.GetData(uid)
-	local runtime = GameManager.GetRuntime(uid)
-	if not data or not runtime then return end
-
-	local storedCount = runtime.storedCubeCount or 0
-	local activeMV = runtime.activeMutatedValue or 0
-
-	local boostMult = BoostManager.GetValueMultiplier(uid) * BoostManager.GetSpawnRateMultiplier(uid)
-	local displayRate = math.floor(activeMV * boostMult)
-
-	local passTickCfg = UpgradeConfig.GetUpgradeConfig("passiveTickSpeed")
-	local passInt = (passTickCfg and passTickCfg.apply) and passTickCfg.apply(data) or AdminConfig.PassiveInterval
-
-	UpdateHUD:FireClient(player, {
-		currency        = data.currency, 
-		pendingAuras    = storedCount, 
-		habitatCapacity = GetHabitatCapacity(data), 
-		rate            = displayRate,
-		passiveInterval = passInt, 
-		totalEarned     = data.totalEarned or 0,
-		soulAuras       = data.soulAuras or 0, 
-		farmEvaluation  = data.farmEvaluation or 0,
-		goldenAuras     = data.goldenAuras or 0, 
-		boostInventory  = data.boostInventory or {},
-		prestigeCount   = data.prestigeCount or 0,
-		upgrades        = data.upgrades or {},
-		totalCubesProduced = data.totalCubesProduced or 0,
-		currentArea     = data.currentArea or 1,
-		discoveredTiers = data.discoveredTiers or {}
-	})
-end
-
-task.spawn(function()
-	while true do
-		local tickInterval = AdminConfig.MutationTickInterval or MutationConfig.CheckInterval
-		task.wait(tickInterval)
-
-		for _, player in ipairs(Players:GetPlayers()) do
-			local uid = player.UserId
-			local data = GameManager.GetData(uid)
-			local runtime = GameManager.GetRuntime(uid)
-			if not data or not runtime then continue end
-
-			local dt = tickInterval * GetAFKSpeed(runtime) * GetMutationSpeedMult(data) * (AdminConfig.MutationSpeedMultiplier or 1)
-			local mutationBatch = {}
-
-			local currentArea = data.currentArea or 1
-			local areaModels = GetAreaAuraModels(currentArea)
-
-			for cubeId, cube in pairs(runtime.cubes) do
-				local oldMutatedValue = MutationConfig.GetMutatedValue(cube)
-				local mutated = false
-
-				local prev = cube.effectiveElapsed
-				cube.effectiveElapsed += dt
-				local pl = MutationConfig.GetValueBonusLevel(prev)
-				local nl = MutationConfig.GetValueBonusLevel(cube.effectiveElapsed)
-
-				if nl > pl then
-					mutated = true
-					local be = MutationConfig.ValueBonuses[nl]
-					table.insert(mutationBatch, { 
-						cubeId = cubeId, 
-						mutationType = "valueBonus",
-						bonusLevel = nl, 
-						bonusPercent = be and math.floor(be.bonus * 100) or 0 
-					})
-				end
-
-				local maxTier = AdminConfig.MutationMaxTierIndex or 3
-				local upgrades = 0
-
-				while cube.tierIndex < maxTier and cube.tierIndex < #TierConfig.Tiers and upgrades < 5 do
-
-					if areaModels then
-						local nextTierName = TierConfig.Tiers[cube.tierIndex + 1].name
-						if not areaModels[nextTierName] then
-							break 
-						end
-					end
-
-					local timeSince = cube.effectiveElapsed - (cube.lastUpgradeElapsed or 0)
-					local bestChance, bestTime = 0, 0
-
-					for _, threshold in ipairs(MutationConfig.TierUpgrades) do
-						if timeSince >= threshold.time then 
-							bestChance = threshold.chance
-							bestTime = threshold.time 
-						end
-					end
-
-					if bestChance <= 0 then break end
-
-					if math.random() <= bestChance then
-						local oldTier = TierConfig.Tiers[cube.tierIndex]
-						cube.tierIndex += 1
-						local newTier = TierConfig.Tiers[cube.tierIndex]
-
-						cube.baseValue = math.floor(cube.baseValue * (newTier.multiplier/oldTier.multiplier))
-						cube.color = newTier.color
-						cube.glow = newTier.glow
-						cube.tierName = newTier.name
-						cube.lastUpgradeElapsed = (cube.lastUpgradeElapsed or 0) + bestTime
-						upgrades += 1
-						mutated = true
-
-						table.insert(mutationBatch, { 
-							cubeId = cubeId, 
-							mutationType = "tierUpgrade",
-							newColor = newTier.color, 
-							newGlow = newTier.glow, 
-							tierName = newTier.name,
-							currentArea = currentArea
-						})
-
-						if newTier.name == "Legendary" then
-							data.totalLegendaryCubes = (data.totalLegendaryCubes or 0) + 1
-						end
-					else 
-						break 
-					end
-				end
-
-				if mutated then
-					local newMutatedValue = MutationConfig.GetMutatedValue(cube)
-					runtime.totalMutatedValue = (runtime.totalMutatedValue or 0) + (newMutatedValue - oldMutatedValue)
-					if not cube.isStored then
-						runtime.activeMutatedValue = (runtime.activeMutatedValue or 0) + (newMutatedValue - oldMutatedValue)
-					end
-				end
-			end
-
-			if #mutationBatch > 0 then
-				ReplicatedStorage.RemoteEvents.CubeMutatedBatch:FireClient(player, mutationBatch)
-			end
-			SendHUDUpdate(player)
-		end
-	end
-end)
-
-local function GetHoldMultiplier(holdTime, data)
-	local upgrades = data and data.upgrades or {}
-	local speedData = upgrades["multiplierSpeed"]
-	local speedLevel = (typeof(speedData) == "table" and speedData.level) or (typeof(speedData) == "number" and speedData) or 0
-	local playerMultSpeed = 1.0 + (speedLevel * 0.05)
-
-	local playerMaxTier = 5
-	local mythicData = upgrades["unlockMythicMult"]
-	local mythicLevel = (typeof(mythicData) == "table" and mythicData.level) or (typeof(mythicData) == "number" and mythicData) or 0
-	if mythicLevel > 0 then playerMaxTier = 6 end
-
-	local effectiveTime = holdTime * playerMultSpeed
-	local currentTier = 1
-
-	for i = 1, playerMaxTier do
-		if AdminConfig.MilestoneData[i] and effectiveTime >= AdminConfig.MilestoneData[i].time then
-			currentTier = i
-		end
-	end
-
-	local nextTier = math.min(currentTier + 1, playerMaxTier)
-	if currentTier == playerMaxTier then
-		return AdminConfig.MilestoneData[currentTier].mult, AdminConfig.MilestoneData[currentTier].luck
-	end
-
-	local timePassed = effectiveTime - AdminConfig.MilestoneData[currentTier].time
-	local timeNeeded = AdminConfig.MilestoneData[nextTier].time - AdminConfig.MilestoneData[currentTier].time
-	local ratio = timePassed / timeNeeded
-
-	local cMult = AdminConfig.MilestoneData[currentTier].mult
-	local nMult = AdminConfig.MilestoneData[nextTier].mult
-	local smoothMult = cMult + ((nMult - cMult) * ratio)
-
-	return smoothMult, AdminConfig.MilestoneData[currentTier].luck
-end
-
-local function RollWithLuck(luckBonus)
-	local tiers = TierConfig.Tiers
-	local adjusted, total = {}, 0
-	for _, tier in ipairs(tiers) do
-		local chance = tier.chance
-		if tier.name ~= "Common" then chance += luckBonus/(#tiers-1) end
-		table.insert(adjusted, { tier=tier, chance=chance })
-		total += chance
-	end
-
-	local r, cum = math.random() * total, 0
-	for _, e in ipairs(adjusted) do
-		cum += e.chance
-		if r <= cum then return e.tier end
-	end
-	return tiers[1]
-end
-
-local function SpawnAura(player, data, runtime, holdMult, luckBonus)
-	local uid  = player.UserId
-	local tier = RollWithLuck(luckBonus)
-	local tierIndex = 1
-	for i, t in ipairs(TierConfig.Tiers) do if t.name == tier.name then tierIndex=i; break end end
-
-	local currentArea = data.currentArea or 1
-	local areaModels = GetAreaAuraModels(currentArea)
-
-	if areaModels then
-		while tierIndex > 1 do
-			local checkName = TierConfig.Tiers[tierIndex].name
-			if areaModels[checkName] then break end
-			tierIndex -= 1
-		end
-		tier = TierConfig.Tiers[tierIndex] 
-	end
-
-	local totalValueMultiplier = 1.0 
-	local valueUpgrades = {
-		"blockValue", "blockValueT2", "auraValueT3", 
-		"auraValueT4", "auraValueT6", "auraValueT8", "auraValueT10"
-	}
-
-	for _, upgradeId in ipairs(valueUpgrades) do
-		local cfg = UpgradeConfig.GetUpgradeConfig(upgradeId)
-		if cfg and cfg.apply then totalValueMultiplier += cfg.apply(data) end
-	end
-
-	local prestigeMult    = PrestigeModule.GetMultiplier(data.soulAuras)
-	local areaMult        = AreaRegistry.GetMultiplier(data.currentArea or 1)
-	local boostValueMult  = BoostManager.GetValueMultiplier(uid)
-	local _, weatherValueMult = WeatherManager.GetMultipliers(uid)
-
-	local calcMultFloat = totalValueMultiplier * prestigeMult * areaMult * boostValueMult * weatherValueMult
-	local baseValue = math.floor(AdminConfig.BaseAuraValue * tier.multiplier * calcMultFloat)
-	local totalValue = baseValue + math.floor(baseValue * (holdMult - 1))
-
-	local spawnPos = HABITAT_PART.Position + Vector3.new(math.random(-3,3), 10, math.random(-3,3))	
-
-	local areaFolder = ReplicatedStorage:FindFirstChild("AreaAssets") and ReplicatedStorage.AreaAssets:FindFirstChild("Area" .. currentArea)
-	if areaFolder then
-		local auraModel = areaFolder:FindFirstChild("AuraModel")
-		if auraModel then
-			local spawnPoint = auraModel:FindFirstChild("AuraSpawnPoint", true)
-			if spawnPoint and spawnPoint:IsA("BasePart") then
-				local size = spawnPoint.Size
-				local randX = (math.random() - 0.5) * size.X
-				local randZ = (math.random() - 0.5) * size.Z
-				spawnPos = (spawnPoint.CFrame * CFrame.new(randX, 0, randZ)).Position
-			end
-		end
-	end
-
-	local cubeRecord = {
-		spawnTime=tick(), effectiveElapsed=0, lastUpgradeElapsed=0,
-		baseValue=totalValue, tierIndex=tierIndex,
-		tierName=tier.name, color=tier.color, glow=tier.glow,
-		isStored=false,
-		currentArea=currentArea 
-	}
-
-	if AdminConfig.MutationInstantMax then
-		local mb = MutationConfig.ValueBonuses[#MutationConfig.ValueBonuses]
-		if mb then cubeRecord.effectiveElapsed = mb.time + 1 end
-	end
-
-	local cubeId = GameManager.AddCube(uid, cubeRecord)
-	if not cubeId then return end
-
-	data.totalCubesProduced = (data.totalCubesProduced or 0) + 1
-	if tier.name == "Legendary" then data.totalLegendaryCubes = (data.totalLegendaryCubes or 0) + 1 end
-	runtime.lastActiveTime = tick()
-
-	AuraSpawned:FireClient(player, {
-		cubeId=cubeId, tier=tier.name, color=tier.color,
-		glow=tier.glow, value=totalValue, spawnPos=spawnPos,
-		currentArea = currentArea 
-	})
-end
-
-ProduceAura.OnServerEvent:Connect(function(player, action)
-	local uid = player.UserId
-	local now = tick()
-	local data    = GameManager.GetData(uid)
-	local runtime = GameManager.GetRuntime(uid)
-
-	if action == "start" then 
-		if data and runtime then
-			local storedCount = runtime.storedCubeCount or 0
-			if storedCount >= GetHabitatCapacity(data) then
-				HabitatFull:FireClient(player)
-				return
-			end
-		end
-
-		if (hatchery[uid] or 0) > 0.5 then 
-			holdStart[uid] = now 
-		else
-			UpdateHatchery:FireClient(player, { current = 0, max = data and GetHatcheryMax(data) or AdminConfig.HatcheryMax })
-		end
-		return 
-	end
-
-	if action == "stop" then 
-		holdStart[uid] = nil; return 
-	end
-
-	if not data or not runtime then return end
-
-	local capacity = GetHabitatCapacity(data)
-	local storedCount = runtime.storedCubeCount or 0
-
-	if storedCount >= capacity then HabitatFull:FireClient(player); return end
-	if runtime.cubeCount >= capacity + 150 then return end 
-
-	if (hatchery[uid] or 0) <= 0.5 then 
-		UpdateHatchery:FireClient(player, { current = 0, max = data and GetHatcheryMax(data) or AdminConfig.HatcheryMax })
-		return 
-	end
-	if not holdStart[uid] then return end
-
-	local rushMult = BoostManager.GetSpawnRateMultiplier(uid)
-	local weatherSpawnMult, _ = WeatherManager.GetMultipliers(uid)
-	local effectiveFireRate = AdminConfig.FireRate / (rushMult * weatherSpawnMult)
-
-	if lastFire[uid] then
-		local timeSinceLast = now - lastFire[uid]
-		if timeSinceLast > 3 then clickSessionStart[uid] = now end
-		if not clickSessionStart[uid] then clickSessionStart[uid] = now end
-
-		local sessionLength = now - clickSessionStart[uid]
-		if sessionLength > 300 then effectiveFireRate *= 2 end
-		if sessionLength > 600 then effectiveFireRate *= 4 end
-		if timeSinceLast < effectiveFireRate then return end
-	else
-		clickSessionStart[uid] = now
-	end
-
-	lastFire[uid] = now
-
-	local holdTime = now - holdStart[uid]
-	local holdMult, luckBonus = GetHoldMultiplier(holdTime, data)
-	SpawnAura(player, data, runtime, holdMult, luckBonus)
-	SendHUDUpdate(player)
-	UpdateHatchery:FireClient(player, { current=hatchery[uid], max=GetHatcheryMax(data) })
-end)
-
-CubeStored.OnServerEvent:Connect(function(player, cubeId)
-	local uid = player.UserId
-	local runtime = GameManager.GetRuntime(uid)
-	local data = GameManager.GetData(uid)
-
-	if runtime and runtime.cubes[cubeId] then
-		GameManager.MarkCubeStored(uid, cubeId)
-		SendHUDUpdate(player)
-
-		local storedCount = runtime.storedCubeCount or 0
-		if storedCount >= GetHabitatCapacity(data) then
-			HabitatFull:FireClient(player)
-		end
-	end
-end)
-
-CubeSmushed.OnServerEvent:Connect(function(player, cubeId)
-	local uid = player.UserId
-
-	-- ✨ THIS FIXED IT: Destroys the aura properly via the manager so it strips its value from your income!
-	GameManager.RemoveCube(uid, cubeId)
-	SendHUDUpdate(player)
-
-	local data = GameManager.GetData(uid)
-	UpdateHatchery:FireClient(player, { current = hatchery[uid], max = GetHatcheryMax(data) })
-end)
-
--- BoostManager
--- Location: ServerScriptService > BoostManager (ModuleScript)
---
--- STACKING CHANGE: Additive like Egg Inc Bird Feed.
---   Formula: total = 1 + (multiplier - 1) * activeStackCount
-
-local Players             = game:GetService("Players")
-local ReplicatedStorage   = game:GetService("ReplicatedStorage")
-local ServerScriptService = game:GetService("ServerScriptService")
-
-local AdminConfig = require(ReplicatedStorage.Modules.AdminConfig)
-local GameManager = require(ServerScriptService.GameManager)
-local BoostConfig = require(ReplicatedStorage.Modules.BoostConfig)
-local AchievementConfig = require(ReplicatedStorage.Modules.AchievementConfig)
-
-local function GetOrCreate(name)
-	local existing = ReplicatedStorage.RemoteEvents:FindFirstChild(name)
-	if existing then return existing end
-	local re = Instance.new("RemoteEvent")
-	re.Name   = name
-	re.Parent = ReplicatedStorage.RemoteEvents
-	return re
-end
-
-local BuyBoost      = GetOrCreate("BuyBoost")
-local ActivateBoost = GetOrCreate("ActivateBoost")
-local BoostUpdated  = GetOrCreate("BoostUpdated")
-
-local activeStacks = {}  -- [uid] = { {boostId, endsAt}, ... }
-
----------------------------------------------------------------
--- Helpers
----------------------------------------------------------------
-local function GetActiveStacks(uid, boostId)
-	local stacks = activeStacks[uid] or {}
-	local count, now = 0, tick()
-	for _, entry in ipairs(stacks) do
-		if entry.boostId == boostId and entry.endsAt > now then
-			count += 1
-		end
-	end
-	return count
-end
-
-local function PruneExpired(uid)
-	local stacks = activeStacks[uid]
-	if not stacks then return end
-	local now, pruned = tick(), {}
-	for _, entry in ipairs(stacks) do
-		if entry.endsAt > now then table.insert(pruned, entry) end
-	end
-	activeStacks[uid] = pruned
-end
-
----------------------------------------------------------------
--- ADDITIVE multiplier helper
----------------------------------------------------------------
-local function AdditiveMultiplier(uid, boostId)
-	PruneExpired(uid)
-	local cfg = BoostConfig.Get(boostId)
-	if not cfg then return 1 end
-	local bonus  = (cfg.multiplier or 2) - 1 
-	local count  = GetActiveStacks(uid, boostId)	
-	return 1 + bonus * count
-end
-
----------------------------------------------------------------
--- Public API
----------------------------------------------------------------
-local BoostManager = {}
-
-function BoostManager.GetSpawnRateMultiplier(uid)
-	return AdditiveMultiplier(uid, "AuraRush")
-end
-
-function BoostManager.GetValueMultiplier(uid)
-	return AdditiveMultiplier(uid, "SpawnBoost")
-end
-
-function BoostManager.IsActive(uid, boostId)
-	return GetActiveStacks(uid, boostId) > 0
-end
-
-function BoostManager.GetSoulMultiplier(uid)
-	PruneExpired(uid)
-	local stacks = activeStacks[uid] or {}
-	local now    = tick()
-	local cfg = BoostConfig.Get("SoulBoost")
-	for _, entry in ipairs(stacks) do
-		if entry.boostId == "SoulBoost" and entry.endsAt > now then
-			return cfg and cfg.multiplier or 2
-		end
-	end
-	return 1
-end
-
-local function BuildState(uid)
-	PruneExpired(uid)
-	local stacks = activeStacks[uid] or {}
-	local data   = GameManager.GetData(uid)
-	local now    = tick()
-
-	local state = {}
-
-	for boostId, cfg in pairs(BoostConfig.Boosts or {}) do
-		local activeList = {}
-		for _, entry in ipairs(stacks) do
-			if entry.boostId == boostId and entry.endsAt > now then
-				table.insert(activeList, math.max(0, entry.endsAt - now))
-			end
-		end
-		state[boostId] = {
-			inventoryCount = data and (data.boostInventory and data.boostInventory[boostId] or 0) or 0,
-			activeCount    = #activeList,
-			activeTimes    = activeList,
-			duration       = cfg.duration,
-			cost           = cfg.cost,
-			multiplier     = cfg.multiplier,
-			displayName    = cfg.displayName,
-			description    = cfg.description,
-			icon           = cfg.icon,
-			maxStack       = cfg.maxStack,
-			stackable      = cfg.stackable,
-		}
-	end
-
-	state._goldenAuras = data and (data.goldenAuras or 0) or 0
-	return state
-end
-
-local function SendState(player)
-	BoostUpdated:FireClient(player, BuildState(player.UserId))
-end
-
----------------------------------------------------------------
--- BUY
----------------------------------------------------------------
-BuyBoost.OnServerEvent:Connect(function(player, boostId)
-	local uid  = player.UserId
-	local data = GameManager.GetData(uid)
-	if not data then return end
-
-	local cfg = BoostConfig.Get(boostId)
-	if not cfg then warn("[BoostManager] Unknown boost:", boostId); return end
-
-	local cost = cfg.cost or 0
-	if (data.goldenAuras or 0) < cost then return end
-	local isUnlocked = AchievementConfig.IsBoostUnlocked(boostId, data)
-	if not isUnlocked then return end 
-
-	data.goldenAuras = (data.goldenAuras or 0) - cost
-	data.boostInventory = data.boostInventory or {}
-	data.boostInventory[boostId] = (data.boostInventory[boostId] or 0) + 1
-
-	SendState(player)
-	ReplicatedStorage.RemoteEvents.UpdateHUD:FireClient(player, {
-		goldenAuras    = data.goldenAuras,
-		boostInventory = data.boostInventory,
-	})
-end)
-
----------------------------------------------------------------
--- ACTIVATE
----------------------------------------------------------------
-ActivateBoost.OnServerEvent:Connect(function(player, boostId)
-	local uid  = player.UserId
-	local data = GameManager.GetData(uid)
-	if not data then return end
-
-	local cfg = BoostConfig.Get(boostId)
-	if not cfg then return end
-
-	data.boostInventory = data.boostInventory or {}
-	if (data.boostInventory[boostId] or 0) <= 0 then return end
-
-	PruneExpired(uid)
-	local currentStacks = GetActiveStacks(uid, boostId)
-	if currentStacks >= (cfg.maxStack or 1) then return end
-
-	data.boostInventory[boostId] = data.boostInventory[boostId] - 1
-
-	-- ✨ FIX: Handle Instant / One-Shot Boosts (Like CashCheck)
-	if cfg.duration == 0 then
-		if cfg.effectType == "cashCheck" then
-			local payout = math.floor((data.farmEvaluation or 0) * (cfg.multiplier or 5))
-			if payout > 0 then
-				data.currency    = (data.currency or 0) + payout
-				data.totalEarned = (data.totalEarned or 0) + payout
-
-				-- Send a special flag so the UI knows it is allowed to snap UPWARD!
-				ReplicatedStorage.RemoteEvents.UpdateHUD:FireClient(player, {
-					currency      = data.currency,
-					totalEarned   = data.totalEarned,
-					instantPayout = payout 
-				})
-			end
-		end
-
-		SendState(player)
-		return
-	end
-
-	activeStacks[uid] = activeStacks[uid] or {}
-	table.insert(activeStacks[uid], {
-		boostId = boostId,
-		endsAt  = tick() + cfg.duration,
-	})
-
-	SendState(player)
-
-	task.delay(cfg.duration, function()
-		PruneExpired(uid)
-		if player and player.Parent then SendState(player) end
-	end)
-end)
-
----------------------------------------------------------------
--- Player lifecycle
----------------------------------------------------------------
-Players.PlayerAdded:Connect(function(player)
-	activeStacks[player.UserId] = {}
-	task.wait(2)
-	SendState(player)
-end)
-
-Players.PlayerRemoving:Connect(function(player)
-	activeStacks[player.UserId] = nil
-end)
-
-task.spawn(function()
-	while true do
-		task.wait(5)
-		for _, player in ipairs(Players:GetPlayers()) do
-			if activeStacks[player.UserId] and #activeStacks[player.UserId] > 0 then
-				SendState(player)
-			end
-		end
-	end
-end)
-
-return BoostManager
-
--- EpicUpgradeManager
--- Location: ServerScriptService > EpicUpgradeManager
---
--- Purchases permanent upgrades with Golden Auras.
--- Public API: GetBonus(uid, id), GetAllBonuses(uid), ResendState(player)
--- REQUIRES: RemoteEvents PurchaseEpicUpgrade, EpicUpgradeUpdated
-
-local Players             = game:GetService("Players")
-local ReplicatedStorage   = game:GetService("ReplicatedStorage")
-local ServerScriptService = game:GetService("ServerScriptService")
-
-local EpicUpgradeConfig = require(ReplicatedStorage.Modules.EpicUpgradeConfig)
-local GameManager       = require(ServerScriptService.GameManager)
-
-local PurchaseEpicUpgrade = ReplicatedStorage.RemoteEvents:WaitForChild("PurchaseEpicUpgrade")
-local EpicUpgradeUpdated  = ReplicatedStorage.RemoteEvents:WaitForChild("EpicUpgradeUpdated")
-local UpdateHUD           = ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHUD")
-
-PurchaseEpicUpgrade.OnServerEvent:Connect(function(player, upgradeId)
-	local uid, data = player.UserId, GameManager.GetData(player.UserId)
-	if not data then return end
-	local cfg = EpicUpgradeConfig.GetUpgradeConfig(upgradeId)
-	if not cfg then return end
-	if not data.epicUpgrades then data.epicUpgrades = {} end
-	local lv = data.epicUpgrades[upgradeId] or 0
-	if lv >= cfg.maxLevel then return end
-	local cost = EpicUpgradeConfig.CalculateCost(upgradeId, lv)
-	if (data.goldenAuras or 0) < cost then return end
-	data.goldenAuras = data.goldenAuras - cost
-	data.epicUpgrades[upgradeId] = lv + 1
-	local newLv = lv + 1; local maxed = newLv >= cfg.maxLevel
-	EpicUpgradeUpdated:FireClient(player, {
-		type="purchased", upgradeId=upgradeId, level=newLv,
-		maxLevel=cfg.maxLevel, cost=maxed and 0 or EpicUpgradeConfig.CalculateCost(upgradeId, lv), maxed=maxed,
-	})
-	UpdateHUD:FireClient(player, { goldenAuras = data.goldenAuras })
-	GameManager.SavePlayer(player)
-end)
-
-local function SendFullState(player)
-	local data = GameManager.GetData(player.UserId)
-	if not data then return end
-	local ep = data.epicUpgrades or {}; local payload = {}
-	-- SURGICAL FIX: Open Tiers first, then find Upgrades
-	for _, tierData in ipairs(EpicUpgradeConfig.Tiers) do
-		for id, cfg in pairs(tierData.upgrades) do
-			local lv = ep[id] or 0
-			local maxed = lv >= cfg.maxLevel
-			-- Calculate cost using the new dynamic function
-			local cost = maxed and 0 or EpicUpgradeConfig.CalculateCost(id, lv)
-
-			payload[id] = {
-				level = lv, 
-				maxLevel = cfg.maxLevel, 
-				cost = cost,
-				maxed = maxed
-			}
-		end
-	end
-	EpicUpgradeUpdated:FireClient(player, { type="fullState", upgrades=payload, goldenAuras=data.goldenAuras or 0 })
-end
-
-Players.PlayerAdded:Connect(function(player) task.wait(2); SendFullState(player) end)
-
-local EpicUpgradeManager = {}
-function EpicUpgradeManager.GetBonus(uid, upgradeId)
-	local cfg = EpicUpgradeConfig.GetUpgradeConfig(upgradeId); if not cfg then return 0 end
-	local data = GameManager.GetData(uid); return cfg.apply(data or { epicUpgrades = {} })
-end
-function EpicUpgradeManager.GetAllBonuses(uid)
-	local data = GameManager.GetData(uid) or { epicUpgrades = {} }; local b = {}
-	-- SURGICAL FIX: Nested loop to find all active bonuses
-	for _, tierData in ipairs(EpicUpgradeConfig.Tiers) do
-		for id, cfg in pairs(tierData.upgrades) do
-			b[id] = cfg.apply(data)
-		end
-	end
-	return b
-end
-function EpicUpgradeManager.ResendState(player) SendFullState(player) end
-return EpicUpgradeManager
-
--- GameManager
--- Location: ServerScriptService > GameManager
-
-local DataStoreService  = game:GetService("DataStoreService")
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService        = game:GetService("RunService")
+local TweenService      = game:GetService("TweenService")
+local CollectionService = game:GetService("CollectionService")
 
-local PlayerDB       = DataStoreService:GetDataStore("PlayerData_v1")
-local AdminConfig    = require(ReplicatedStorage.Modules.AdminConfig)
-local UpgradeConfig  = require(ReplicatedStorage.Modules.UpgradeConfig)
-local MutationConfig = require(ReplicatedStorage.Modules.MutationConfig)
+local AdminConfig       = require(ReplicatedStorage.Modules.AdminConfig)
+local PrestigeModule    = require(ReplicatedStorage.Modules.PrestigeModule)
+local UITheme           = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("UITheme"))
+local T                 = UITheme.Get("Custom")
+local C                 = require(ReplicatedStorage.Modules.UIConfig)
+local Formatter         = require(ReplicatedStorage.Modules.NumberFormatter)
 
-local SAVE_COOLDOWN = 7
+local EXPONENT     = PrestigeModule.EXPONENT
+local COEFFICIENT  = PrestigeModule.COEFFICIENT
+local BONUS_PER_SA = PrestigeModule.BONUS_PER_SA
 
-local function DefaultData()
-	return {
-		currency      = 0,
-		totalEarned   = 0,
-		soulAuras     = 0,
-		prestigeCount = 0,
-		pendingAuras        = 0,
-		upgrades = { dropRate=0, blockValue=0, habitatCapacity=0, autoShipper=0, mutationSpeed=0, mutationTierChance=0, passiveTickSpeed=0, hatcheryCapacity=0 },
-		totalCubesProduced    = 0,
-		totalPlatformsShipped = 0,
-		totalLegendaryCubes   = 0,
-		settings = { sfxEnabled=true, musicEnabled=true },
-		farmEvaluation = 0,
-		currentArea    = 1,
-		unlockedAreas  = { 1 },
-		goldenAuras = AdminConfig.GoldenAuraStart or 10,
-		boostInventory = { AuraRush=0, SpawnBoost=0, SoulBoost=0 },
-		hasPrestigedThisArea = false,
-		epicUpgrades         = {},
-		tutorialProgress     = {},
-		tutorialComplete     = false,
-		claimedMail          = {},
-		unlockedMail         = {},
-	}
-end
-
-local function DefaultRuntime()
-	return {
-		cubes              = {},
-		cubeOrder          = {},
-		cubeCount          = 0,
-		storedCubeCount    = 0,      -- ✨ Pre-tracked for fast HUD updates
-		activeMutatedValue = 0,      -- ✨ Pre-tracked for fast Passive Income
-		nextCubeId         = 1,
-		totalMutatedValue  = 0,
-		lastActiveTime     = tick(),
-		sessionStart       = tick(),
-	}
-end
-
-local PlayerData    = {}
-local PlayerRuntime = {}
-local lastSaveTick  = {}
-local pendingSave   = {}
-
-local function DeepMerge(saved, defaults)
-	for key, defaultValue in pairs(defaults) do
-		if saved[key] == nil then
-			saved[key] = defaultValue
-		elseif type(defaultValue) == "table" and type(saved[key]) == "table" and not getmetatable(saved[key]) then
-			if defaultValue[1] == nil then DeepMerge(saved[key], defaultValue) end
-		end
-	end
-end
-
-local function EnsureUnlockedAreas(data)
-	if type(data.unlockedAreas) ~= "table" then data.unlockedAreas = { 1 } end
-	local has1, hasCurrent = false, false
-	for _, v in ipairs(data.unlockedAreas) do
-		if v == 1 then has1 = true end
-		if v == data.currentArea then hasCurrent = true end
-	end
-	if not has1 then table.insert(data.unlockedAreas, 1) end
-	if not hasCurrent and data.currentArea ~= 1 then table.insert(data.unlockedAreas, data.currentArea) end
-end
-
-local function SaveData(player)
-	local uid  = player.UserId
-	local data = PlayerData[uid]
-	if not data then return end
-	local now, last = tick(), lastSaveTick[uid] or 0
-	if now - last >= SAVE_COOLDOWN then
-		lastSaveTick[uid] = now
-		pcall(function() PlayerDB:SetAsync("Player_" .. uid, data) end)
-	else
-		if not pendingSave[uid] then
-			pendingSave[uid] = true
-			task.delay(SAVE_COOLDOWN - (now - last) + 0.5, function()
-				pendingSave[uid] = nil
-				if player and player.Parent and PlayerData[uid] then
-					pcall(function() PlayerDB:SetAsync("Player_" .. uid, PlayerData[uid]) end)
-					lastSaveTick[uid] = tick()
-				end
-			end)
-		end
-	end
-end
-
-local function LoadData(player)
-	local key      = "Player_" .. player.UserId
-	local ok, data = pcall(function() return PlayerDB:GetAsync(key) end)
-
-	if ok and data then
-		DeepMerge(data, DefaultData())
-		PlayerData[player.UserId] = data
-	else
-		PlayerData[player.UserId] = DefaultData()
-	end
-
-	local d = PlayerData[player.UserId]
-	EnsureUnlockedAreas(d)
-	PlayerRuntime[player.UserId] = DefaultRuntime()
-
-	-- ✨ RESTORED: Admin Config Wipe Flags!
-	if AdminConfig.WipeMoneyOnLoad then
-		d.currency=0; d.totalEarned=0; d.pendingAuras=0; d.pendingPayout=0; d.pendingBonusPayout=0; d.lastPayout=0
-		for k in pairs(d.upgrades) do d.upgrades[k] = 0 end
-		d.totalCubesProduced=0; d.totalPlatformsShipped=0; d.totalLegendaryCubes=0
-		d.piggyBank=0; d.piggyBankBroken=0; d.farmEvaluation=0; d.goldenAuras=AdminConfig.GoldenAuraStart or 10
-		d.boostInventory={ AuraRush=0, SpawnBoost=0, SoulBoost=0 }
-		d.hasPrestigedThisArea=false; d.claimedMail={}; d.tutorialProgress={}; d.tutorialComplete=false
-	end
-
-	if AdminConfig.WipePrestigeOnLoad then d.soulAuras=0; d.prestigeCount=0; d.hasPrestigedThisArea=false end
-	if AdminConfig.WipeAreaOnLoad then d.currentArea=1; d.farmEvaluation=0; d.unlockedAreas={ 1 }; d.hasPrestigedThisArea=false end
-	if AdminConfig.WipeEpicOnLoad then d.goldenAuras = AdminConfig.GoldenAuraStart or 0; d.epicUpgrades = {} end
-	if AdminConfig.WipeAchievementsOnLoad then d.totalCubesProduced=0; d.totalLegendaryCubes=0; d.totalPlatformsShipped=0 end
-
-	-- Ensure structures exist
-	if not d.epicUpgrades     then d.epicUpgrades     = {} end
-	if not d.tutorialProgress then d.tutorialProgress = {} end
-	if d.tutorialComplete == nil then d.tutorialComplete = false end
-	if not d.claimedMail      then d.claimedMail      = {} end
-	if not d.unlockedMail     then d.unlockedMail     = {} end
-	if d.hasPrestigedThisArea == nil then d.hasPrestigedThisArea = false end
-
-	-- ✨ RESTORED: Initial HUD & Upgrade Synchronization
-	task.wait(1)
-	if not player or not player.Parent then return end
-
-	local habCfg = UpgradeConfig.GetUpgradeConfig("habitatCapacity")
-	local habCap  = (habCfg and habCfg.apply) and habCfg.apply(d) or AdminConfig.BaseHabitatCapacity
-	local tickCfg = UpgradeConfig.GetUpgradeConfig("passiveTickSpeed")
-	local passInt = (tickCfg and tickCfg.apply) and tickCfg.apply(d) or AdminConfig.PassiveInterval
-
-	local upgradesState = {}
-	for upgradeId, level in pairs(d.upgrades or {}) do upgradesState[upgradeId] = { level = level } end
-
-	ReplicatedStorage.RemoteEvents.UpdateHUD:FireClient(player, {
-		currency=d.currency, pendingAuras=0, habitatCapacity=habCap, rate=0, passiveInterval=passInt,
-		totalEarned=d.totalEarned or 0, soulAuras=d.soulAuras or 0, farmEvaluation=d.farmEvaluation or 0,
-		goldenAuras=d.goldenAuras or 0, boostInventory=d.boostInventory or {}, settings=d.settings or {},
-		prestigeCount=d.prestigeCount or 0, hasPrestigedThisArea=d.hasPrestigedThisArea or false,
-		tutorialProgress=d.tutorialProgress or {}, tutorialComplete=d.tutorialComplete or false,
-		epicUpgrades=d.epicUpgrades or {}, totalCubesProduced=d.totalCubesProduced or 0,
-		currentArea=d.currentArea or 1, upgrades=upgradesState,
-	})
-
-	task.delay(0.5, function()
-		if not player or not player.Parent then return end
-		local resetState = {}
-		for tierNum, tierData in ipairs(UpgradeConfig.Tiers) do
-			for upgradeId, cfg in pairs(tierData.upgrades) do
-				local lv = d.upgrades[upgradeId] or 0
-				local maxed = lv >= cfg.maxLevel
-				resetState[upgradeId] = { level=lv, maxLevel=cfg.maxLevel, cost=maxed and 0 or UpgradeConfig.CalculateCost(upgradeId, lv), maxed=maxed }
-			end
-		end
-		local UpgradeUpdated = ReplicatedStorage.RemoteEvents:FindFirstChild("UpgradeUpdated")
-		if UpgradeUpdated then UpgradeUpdated:FireClient(player, { type="fullState", upgrades=resetState, currency=d.currency }) end
-	end)
-end
-
-Players.PlayerAdded:Connect(LoadData)
-
-Players.PlayerRemoving:Connect(function(player)
-	SaveData(player)
-	PlayerData[player.UserId] = nil
-	PlayerRuntime[player.UserId] = nil
-end)
-
-local lastPeriodicSave = tick()
-game:GetService("RunService").Heartbeat:Connect(function()
-	if tick() - lastPeriodicSave >= 60 then
-		lastPeriodicSave = tick()
-		for _, p in ipairs(Players:GetPlayers()) do SaveData(p) end
-	end
-end)
-
-task.spawn(function()
-	local TutorialStepComplete = ReplicatedStorage.RemoteEvents:WaitForChild("TutorialStepComplete", 10)
-	if not TutorialStepComplete then return end
-	TutorialStepComplete.OnServerEvent:Connect(function(player, stepId)
-		local uid  = player.UserId
-		local data = PlayerData[uid]
-		if not data then return end
-		if not data.tutorialProgress then data.tutorialProgress = {} end
-		if stepId == "__tutorialComplete__" then data.tutorialComplete = true
-		elseif type(stepId) == "string" and #stepId < 100 then data.tutorialProgress[stepId] = true end
-	end)
-end)
-
-local GameManager = {}
-
-function GameManager.GetData(uid)    return PlayerData[uid]    end
-function GameManager.GetRuntime(uid) return PlayerRuntime[uid] end
-function GameManager.SavePlayer(p)   SaveData(p)               end
-
-function GameManager.AddCube(uid, cubeRecord)
-	local runtime = PlayerRuntime[uid]
-	if not runtime then return nil end
-
-	local id = runtime.nextCubeId
-	runtime.nextCubeId += 1	
-	runtime.cubes[id] = cubeRecord
-
-	local val = MutationConfig.GetMutatedValue(cubeRecord)
-	runtime.totalMutatedValue += val
-
-	if not cubeRecord.isStored then
-		runtime.activeMutatedValue += val
-	else
-		runtime.storedCubeCount += 1
-	end
-
-	table.insert(runtime.cubeOrder, id)
-	runtime.cubeCount += 1
-	return id
-end
-
-function GameManager.MarkCubeStored(uid, cubeId)
-	local runtime = PlayerRuntime[uid]
-	if not runtime then return end
-	local cube = runtime.cubes[cubeId]
-	if cube and not cube.isStored then
-		cube.isStored = true
-		runtime.storedCubeCount += 1
-		runtime.activeMutatedValue -= MutationConfig.GetMutatedValue(cube)
-	end
-end
-
-function GameManager.RemoveCube(uid, cubeId)
-	local runtime = PlayerRuntime[uid]
-	if not runtime or not runtime.cubes[cubeId] then return end
-	local cube = runtime.cubes[cubeId]
-
-	local val = MutationConfig.GetMutatedValue(cube)
-	runtime.totalMutatedValue -= val
-
-	if cube.isStored then
-		runtime.storedCubeCount -= 1
-	else
-		runtime.activeMutatedValue -= val
-	end
-
-	runtime.cubes[cubeId] = nil
-	runtime.cubeCount -= 1
-end
-
-function GameManager.CollectOldestCubes(uid, count)
-	local runtime = PlayerRuntime[uid]
-	if not runtime then return {}, {} end
-	local collected, collectedCubes, newOrder = {}, {}, {}
-	local needed = count
-	for _, cubeId in ipairs(runtime.cubeOrder) do
-		if runtime.cubes[cubeId] then
-			if needed > 0 then
-				table.insert(collected, cubeId)
-				table.insert(collectedCubes, runtime.cubes[cubeId])
-				GameManager.RemoveCube(uid, cubeId) 
-				needed -= 1
-			else
-				table.insert(newOrder, cubeId)
-			end
-		end
-	end
-	runtime.cubeOrder = newOrder
-	return collected, collectedCubes
-end
-
-game:BindToClose(function()
-	print("[GameManager] Server shutting down. Forcing final save for all players...")
-	for _, player in ipairs(Players:GetPlayers()) do SaveData(player) end
-	task.wait(2) 
-end)
-
-return GameManager
-
--- MailManager
--- Location: ServerScriptService > MailManager
-
-local Players             = game:GetService("Players")
-local ReplicatedStorage   = game:GetService("ReplicatedStorage")
-local ServerScriptService = game:GetService("ServerScriptService")
-
-local MailConfig  = require(ReplicatedStorage.Modules.MailConfig)
-local GameManager = require(ServerScriptService.GameManager)
-
-local ClaimMail   = ReplicatedStorage.RemoteEvents:WaitForChild("ClaimMail")
-local MailUpdated = ReplicatedStorage.RemoteEvents:WaitForChild("MailUpdated")
-local UpdateHUD   = ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHUD")
-local ShipAuras   = ReplicatedStorage.RemoteEvents:WaitForChild("ShipAuras")
-
-local function IsMailAvailable(entry, data)
-	if not data then return false end
-	if not data.claimedMail then data.claimedMail = {} end
-	if data.claimedMail[entry.id] then return false end
-	if entry.area and (data.currentArea or 1) ~= entry.area then
-		if entry.trigger == "areaEnter" then
-			local visited = false
-			if type(data.unlockedAreas) == "table" then
-				for _, v in ipairs(data.unlockedAreas) do
-					if v == entry.area then visited = true; break end
-				end
-			end
-			if not visited then return false end
-		else
-			return false
-		end
-	end
-	local trigger = entry.trigger
-	local tv      = entry.triggerValue
-	if trigger == "always" then return true
-	elseif trigger == "areaEnter" then
-		if entry.area then
-			if type(data.unlockedAreas) == "table" then
-				for _, v in ipairs(data.unlockedAreas) do
-					if v == entry.area then return true end
-				end
-			end
-			return (data.currentArea or 1) >= entry.area
-		end
-		return true
-	elseif trigger == "firstPrestige" then return (data.prestigeCount or 0) >= 1
-	elseif trigger == "prestigeCount" then return (data.prestigeCount or 0) >= (tv or 1)
-	elseif trigger == "currencyReached" then return (data.currency or 0) >= (tv or 0)
-	elseif trigger == "farmEvalReached" then return (data.farmEvaluation or 0) >= (tv or 0)
-	elseif trigger == "soulAurasReached" then return (data.soulAuras or 0) >= (tv or 0)
-	elseif trigger == "goldenAurasReached" then return (data.goldenAuras or 0) >= (tv or 0)
-	elseif trigger == "giftCollected" then return data.claimedMail["__giftFlag__"] == true
-	elseif trigger == "manual" then
-		return data.unlockedMail and data.unlockedMail[entry.id] == true
-	end
-	return false
-end
-
-local function GetAvailableMail(data)
-	if not data then return {}, {} end
-	if not data.claimedMail then data.claimedMail = {} end
-	local available, claimed = {}, {}
-	for _, entry in ipairs(MailConfig.Entries) do
-		if data.claimedMail[entry.id] then
-			table.insert(claimed, entry.id)
-		elseif IsMailAvailable(entry, data) then
-			table.insert(available, {
-				id = entry.id, title = entry.title, body = entry.body,
-				icon = entry.icon or "", sender = entry.sender or MailConfig.DefaultSender,
-				rewards = entry.rewards or {},
-				color = entry.color,
-			})
-		end
-	end
-	return available, claimed
-end
-
-local function SendMailState(player)
-	local data = GameManager.GetData(player.UserId)
-	if not data then return end
-	local available, claimed = GetAvailableMail(data)
-	MailUpdated:FireClient(player, {
-		available   = available,
-		claimed     = claimed,
-		unreadCount = #available,
-	})
-end
-
-ClaimMail.OnServerEvent:Connect(function(player, mailId)
-	local uid  = player.UserId
-	local data = GameManager.GetData(uid)
-	if not data then return end
-	if not data.claimedMail then data.claimedMail = {} end
-	if data.claimedMail[mailId] then return end
-	local entry = MailConfig.GetEntry(mailId)
-	if not entry then return end
-	if not IsMailAvailable(entry, data) then return end
-	data.claimedMail[mailId] = true
-	local rewards = entry.rewards or {}
-
-	if rewards.goldenAuras and rewards.goldenAuras > 0 then
-		data.goldenAuras = (data.goldenAuras or 0) + rewards.goldenAuras
-		ShipAuras:FireClient(player, {action = "playJuice", amount = rewards.goldenAuras, currencyType = "Auras"})
-	end
-	if rewards.currency and rewards.currency > 0 then
-		data.currency = (data.currency or 0) + rewards.currency
-		ShipAuras:FireClient(player, {action = "playJuice", amount = rewards.currency, currencyType = "Currency"})
-	end
-
-	if rewards.boosts and type(rewards.boosts) == "table" then
-		if not data.boostInventory then data.boostInventory = {} end
-		for boostId, count in pairs(rewards.boosts) do
-			data.boostInventory[boostId] = (data.boostInventory[boostId] or 0) + count
-		end
-	end
-
-	UpdateHUD:FireClient(player, {
-		goldenAuras    = data.goldenAuras,
-		currency       = data.currency,
-		boostInventory = data.boostInventory,
-	})
-	SendMailState(player)
-	GameManager.SavePlayer(player)
-end)
-
--- Periodic check every 5 seconds
-task.spawn(function()
-	while true do
-		task.wait(5)
-		for _, player in ipairs(Players:GetPlayers()) do SendMailState(player) end
-	end
-end)
-
-Players.PlayerAdded:Connect(function(player)
-	task.wait(4)
-	SendMailState(player)
-	task.wait(3)
-	if player and player.Parent then SendMailState(player) end
-end)
-
-task.delay(6, function()
-	for _, player in ipairs(Players:GetPlayers()) do SendMailState(player) end
-end)
-
-local MailManager = {}
-function MailManager.UnlockMail(player, mailId)
-	local data = GameManager.GetData(player.UserId)
-	if not data then return end
-	if not data.unlockedMail then data.unlockedMail = {} end
-	data.unlockedMail[mailId] = true
-	SendMailState(player)
-end
-function MailManager.FlagGiftCollected(player)
-	local data = GameManager.GetData(player.UserId)
-	if not data then return end
-	if not data.claimedMail then data.claimedMail = {} end
-	data.claimedMail["__giftFlag__"] = true
-end
-return MailManager
-
--- PrestigeHandler
--- Location: ServerScriptService > PrestigeHandler
---
--- ONE PRESTIGE PER AREA — blocks if hasPrestigedThisArea is true.
--- AreaManager resets the flag on any area travel.
-
-local Players             = game:GetService("Players")
-local ReplicatedStorage   = game:GetService("ReplicatedStorage")
-local ServerScriptService = game:GetService("ServerScriptService")
-
-local AdminConfig    = require(ReplicatedStorage.Modules.AdminConfig)
-local UpgradeConfig  = require(ReplicatedStorage.Modules.UpgradeConfig)
-local PrestigeModule = require(ReplicatedStorage.Modules.PrestigeModule)
-local GameManager    = require(ServerScriptService.GameManager)
-local BoostManager   = require(ServerScriptService.BoostManager)
+local player    = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local mainHUD   = playerGui:WaitForChild("MainHUD")
 
 local RequestPrestige  = ReplicatedStorage.RemoteEvents:WaitForChild("RequestPrestige")
 local PrestigeComplete = ReplicatedStorage.RemoteEvents:WaitForChild("PrestigeComplete")
-local UpdateHUD        = ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHUD")
-local UpgradeUpdated   = ReplicatedStorage.RemoteEvents:WaitForChild("UpgradeUpdated")
-local UpdateHatchery   = ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHatchery")
+local PreviewPrestige  = ReplicatedStorage.RemoteEvents:WaitForChild("PreviewPrestige")
+local AreaChanged      = ReplicatedStorage.RemoteEvents:WaitForChild("AreaChanged")
 
-local PrestigeReset = Instance.new("BindableEvent")
-PrestigeReset.Name   = "PrestigeReset"
-PrestigeReset.Parent = ServerScriptService
+local PrestigeReady = Instance.new("BindableEvent")
+PrestigeReady.Name   = "PrestigeReady"
+PrestigeReady.Parent = ReplicatedStorage
 
-local lastPrestige      = {}
-local PRESTIGE_COOLDOWN = 2
+local dialogOpen        = false
+local dialogCanPrestige = false
+local previewPending    = false
 
-RequestPrestige.OnServerEvent:Connect(function(player)
-	local uid = player.UserId
-	local now = tick()
+local serverTotalEarned    = 0
+local displayedTotalEarned = 0
+local ratePerSecond        = 0
+local serverSoulAuras      = 0
+local displayedRunSA       = 0
+local barHighWaterMark     = 0
+local hasPrestigedThisArea = false
 
-	if lastPrestige[uid] and now - lastPrestige[uid] < PRESTIGE_COOLDOWN then return end
-	lastPrestige[uid] = now
+local PRESTIGE_COLOR_ACTIVE   = Color3.fromRGB(120, 50,  160)
+local PRESTIGE_COLOR_DISABLED = Color3.fromRGB(60,  55,  70)
+local PRESTIGE_COLOR_PENDING  = Color3.fromRGB(80,  40,  110)
+local PRESTIGE_COLOR_USED     = Color3.fromRGB(80,  60,  50)
 
-	local data    = GameManager.GetData(uid)
-	local runtime = GameManager.GetRuntime(uid)
-	if not data then warn("[PrestigeHandler] No data for player:", uid); return end
+local function CalcSoulAurasLocal(totalEarned)
+	if totalEarned <= 0 then return 0 end
+	return math.floor((totalEarned ^ EXPONENT) * COEFFICIENT)
+end	
+local function GetThreshold(n)
+	if n <= 0 then return 0 end
+	return (n / COEFFICIENT) ^ (1 / EXPONENT)
+end
+local function PlayUI(id) if shared.PlayUISound then shared.PlayUISound(id) end end
 
-	-- ONE PRESTIGE PER AREA
-	if data.hasPrestigedThisArea then
-		PrestigeComplete:FireClient(player, {
-			blocked              = true,
-			reason               = "Already prestiged in this area. Travel to a new area to prestige again!",
-			hasPrestigedThisArea = true,
-		})
+local function GetButtonColor()
+	if hasPrestigedThisArea then return PRESTIGE_COLOR_USED end
+	if CalcSoulAurasLocal(serverTotalEarned) > 0 then return PRESTIGE_COLOR_ACTIVE end
+	return PRESTIGE_COLOR_DISABLED
+end
+local function GetButtonText()
+	if hasPrestigedThisArea then return "Used" end
+	return "Prestige"
+end
+
+---------------------------------------------------------------
+-- Soul Aura display
+---------------------------------------------------------------
+local SA_DISPLAY_W = 220
+local SA_DISPLAY_H = 90
+
+local SADisplay = Instance.new("Frame")
+SADisplay.Name = "SoulAuraDisplay"
+SADisplay.Size = UDim2.new(0, SA_DISPLAY_W, 0, SA_DISPLAY_H)
+SADisplay.Position = UDim2.new(0, 10, 1, -155)
+SADisplay.BackgroundTransparency = 1; SADisplay.ZIndex = 5; SADisplay.Parent = mainHUD
+
+local SACountLabel = Instance.new("TextLabel")
+SACountLabel.Size = UDim2.new(1,0,0,28)
+SACountLabel.Position = UDim2.new(0,0,0,0)
+SACountLabel.BackgroundTransparency = 1; SACountLabel.Text = "0 Soul Auras"
+SACountLabel.TextColor3 = Color3.fromRGB(200,160,255); SACountLabel.TextScaled = true
+SACountLabel.Font = T.font; SACountLabel.TextXAlignment = Enum.TextXAlignment.Center
+SACountLabel.ZIndex = 6; SACountLabel.Parent = SADisplay
+
+local BarBG = Instance.new("Frame")
+BarBG.Size = UDim2.new(1,0,0,12)
+BarBG.Position = UDim2.new(0,0,0,32)
+BarBG.BackgroundColor3 = Color3.fromRGB(60,30,80); BarBG.BorderSizePixel = 0
+BarBG.ZIndex = 6; BarBG.Parent = SADisplay
+Instance.new("UICorner", BarBG).CornerRadius = UDim.new(0,5)
+
+local BarFill = Instance.new("Frame")
+BarFill.Size = UDim2.new(0,0,1,0)
+BarFill.BackgroundColor3 = Color3.fromRGB(255,255,255); BarFill.BorderSizePixel = 0
+BarFill.ZIndex = 7; BarFill.Parent = BarBG
+Instance.new("UICorner", BarFill).CornerRadius = UDim.new(0,5)
+
+local RunSALabel = Instance.new("TextLabel")
+RunSALabel.Size = UDim2.new(1,0,0,18)
+RunSALabel.Position = UDim2.new(0,0,0,48)
+RunSALabel.BackgroundTransparency = 1; RunSALabel.Text = "earning..."
+RunSALabel.TextColor3 = Color3.fromRGB(160,140,180); RunSALabel.TextScaled = true
+RunSALabel.Font = T.fontBody; RunSALabel.TextXAlignment = Enum.TextXAlignment.Left
+RunSALabel.ZIndex = 6; RunSALabel.Parent = SADisplay
+
+local MultDisplayLabel = Instance.new("TextLabel")
+MultDisplayLabel.Size = UDim2.new(1,0,0,18)
+MultDisplayLabel.Position = UDim2.new(0,0,0,68)
+MultDisplayLabel.BackgroundTransparency = 1; MultDisplayLabel.Text = "+0% earnings bonus"
+MultDisplayLabel.TextColor3 = Color3.fromRGB(140,120,170); MultDisplayLabel.TextScaled = true
+MultDisplayLabel.Font = T.fontBody; MultDisplayLabel.TextXAlignment = Enum.TextXAlignment.Left
+MultDisplayLabel.ZIndex = 6; MultDisplayLabel.Parent = SADisplay
+
+---------------------------------------------------------------
+-- Prestige button
+---------------------------------------------------------------
+local PrestigeButton = Instance.new("TextButton")
+PrestigeButton.Name = "PrestigeButton"
+PrestigeButton.Size = UDim2.new(0, C.HUD.PrestigeButtonW, 0, C.HUD.PrestigeButtonH)
+PrestigeButton.Position = UDim2.new(0, 10, 1, C.HUD.BottomButtonY)
+PrestigeButton.BackgroundColor3 = PRESTIGE_COLOR_DISABLED; PrestigeButton.BorderSizePixel = 0
+PrestigeButton.Text = "Prestige"; PrestigeButton.TextColor3 = Color3.fromRGB(255,255,255)
+PrestigeButton.TextScaled = true; PrestigeButton.Font = T.font
+PrestigeButton.ZIndex = 5; PrestigeButton.Parent = mainHUD
+CollectionService:AddTag(PrestigeButton, "Tutorial_PrestigeButton") -- Tutorial Tracker Tag
+Instance.new("UICorner", PrestigeButton).CornerRadius = UDim.new(0,6)
+
+---------------------------------------------------------------
+-- Prestige dialog
+---------------------------------------------------------------
+local D=C.Dialog; local DW=D.W; local DH=D.H; local DHH=D.HeaderH; local GAP=D.LabelGap
+
+local Dialog = Instance.new("Frame")
+Dialog.Name="PrestigeDialog"
+Dialog.Size=UDim2.new(0.88, 0, 0.72, 0)
+Dialog.AnchorPoint=Vector2.new(0.5, 0.5)
+Dialog.Position=UDim2.new(0.5, 0, 0.5, 0)
+Dialog.BackgroundColor3=Color3.fromRGB(25,20,35); Dialog.BorderSizePixel=0
+Dialog.Visible=false; Dialog.ZIndex=20; Dialog.Parent=mainHUD
+CollectionService:AddTag(Dialog, "Tutorial_PrestigePanel") -- Tutorial Tracker Tag
+Instance.new("UICorner",Dialog).CornerRadius=UDim.new(0,D.CornerRadius)
+local dialogConstraint=Instance.new("UISizeConstraint"); dialogConstraint.MaxSize=Vector2.new(DW,DH); dialogConstraint.Parent=Dialog
+local dialogStroke=Instance.new("UIStroke"); dialogStroke.Color=Color3.fromRGB(140,70,200); dialogStroke.Thickness=2; dialogStroke.Parent=Dialog
+
+local DialogHeader=Instance.new("Frame"); DialogHeader.Size=UDim2.new(1,0,0,DHH)
+DialogHeader.BackgroundColor3=Color3.fromRGB(60,25,90); DialogHeader.BorderSizePixel=0
+DialogHeader.ZIndex=21; DialogHeader.Parent=Dialog
+Instance.new("UICorner",DialogHeader).CornerRadius=UDim.new(0,D.CornerRadius)
+local DialogTitle=Instance.new("TextLabel"); DialogTitle.Size=UDim2.new(1,-48,1,0); DialogTitle.Position=UDim2.new(0,14,0,0)
+DialogTitle.BackgroundTransparency=1; DialogTitle.Text="Prestige?"
+DialogTitle.TextColor3=Color3.fromRGB(200,140,255); DialogTitle.TextScaled=true
+DialogTitle.Font=T.font; DialogTitle.TextXAlignment=Enum.TextXAlignment.Left; DialogTitle.ZIndex=22; DialogTitle.Parent=DialogHeader
+
+local CBS=D.CloseBtnSize
+local DialogCloseBtn=Instance.new("TextButton"); DialogCloseBtn.Size=UDim2.new(0,CBS,0,CBS)
+DialogCloseBtn.Position=UDim2.new(1,-(CBS+8),0.5,-CBS/2)
+DialogCloseBtn.BackgroundColor3=Color3.fromRGB(180,50,50); DialogCloseBtn.BorderSizePixel=0
+DialogCloseBtn.Text="X"; DialogCloseBtn.TextColor3=Color3.fromRGB(255,255,255)
+DialogCloseBtn.TextScaled=true; DialogCloseBtn.Font=T.font; DialogCloseBtn.ZIndex=22; DialogCloseBtn.Parent=DialogHeader
+CollectionService:AddTag(DialogCloseBtn, "Tutorial_PrestigeCloseBtn") -- Tutorial Tracker Tag
+Instance.new("UICorner",DialogCloseBtn).CornerRadius=UDim.new(0,5)
+
+local CBH=D.ConfirmBtnH
+local ConfirmBtn=Instance.new("TextButton"); ConfirmBtn.Size=UDim2.new(1,-30,0,CBH)
+ConfirmBtn.Position=UDim2.new(0,15,1,-(CBH+8))
+ConfirmBtn.BackgroundColor3=PRESTIGE_COLOR_ACTIVE; ConfirmBtn.BorderSizePixel=0
+ConfirmBtn.Text="Prestige Now"; ConfirmBtn.TextColor3=Color3.fromRGB(255,255,255)
+ConfirmBtn.TextScaled=true; ConfirmBtn.Font=T.font; ConfirmBtn.ZIndex=22; ConfirmBtn.Parent=Dialog
+CollectionService:AddTag(ConfirmBtn, "Tutorial_PrestigeConfirm") -- Tutorial Tracker Tag
+Instance.new("UICorner",ConfirmBtn).CornerRadius=UDim.new(0,8)
+
+local ScrollContainer = Instance.new("ScrollingFrame")
+ScrollContainer.Name = "ScrollContainer"
+ScrollContainer.Size = UDim2.new(1, 0, 1, -(DHH + CBH + 20)) 
+ScrollContainer.Position = UDim2.new(0, 0, 0, DHH + 5)
+ScrollContainer.BackgroundTransparency = 1
+ScrollContainer.BorderSizePixel = 0
+ScrollContainer.CanvasSize = UDim2.new(0, 0, 0, 0)
+ScrollContainer.AutomaticCanvasSize = Enum.AutomaticSize.Y
+ScrollContainer.ScrollBarThickness = 6
+ScrollContainer.Parent = Dialog
+
+local listLayout = Instance.new("UIListLayout")
+listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+listLayout.Padding = UDim.new(0, GAP)
+listLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+listLayout.Parent = ScrollContainer
+
+local function MakeLabel(text, color, h, bold, wrapText)
+	local l=Instance.new("TextLabel")
+	l.Size=UDim2.new(1,-30,0,h)
+	l.BackgroundTransparency=1; l.Text=text; l.TextColor3=color
+	l.TextScaled=true; l.Font=bold and T.font or T.fontBody
+	l.TextXAlignment=Enum.TextXAlignment.Left; l.ZIndex=21
+	if wrapText then l.TextWrapped=true end
+	l.Parent=ScrollContainer
+	return l
+end
+
+local EarnedLabel  = MakeLabel("You will earn: +0 Soul Auras",  Color3.fromRGB(255,200,100), D.EarnedH, true)
+local BoostLabel   = MakeLabel("",                              Color3.fromRGB(80,220,160),  D.BoostH,  true)
+local MultLabel    = MakeLabel("Earnings Bonus: +0% -> +0%",    Color3.fromRGB(180,180,200), D.MultH,   false)
+local TotalLabel   = MakeLabel("Total Soul Auras: 0",           Color3.fromRGB(140,140,160), D.TotalH,  false)
+local HintLabel    = MakeLabel("Each Soul Aura gives +"..string.format("%.0f",BONUS_PER_SA*100).."% earnings!", Color3.fromRGB(200,160,255), D.HintH, true)
+local BonusLabel   = MakeLabel("Kickstart Bonus: $50",          Color3.fromRGB(100,220,100), D.BonusH,  true)
+local WarningLabel = MakeLabel("This will RESET your currency, upgrades, and all cubes. Soul Auras are permanent.", Color3.fromRGB(255,100,100), D.WarningH, false, true)
+
+---------------------------------------------------------------
+-- Dialog logic
+---------------------------------------------------------------
+local function CloseDialog()
+	dialogOpen=false; dialogCanPrestige=false; Dialog.Visible=false; PlayUI("6895079853")
+	UITheme.SetMenuVisible(false)
+end
+
+local function OpenDialogWithPreview(info)
+	if dialogOpen then return end
+	UITheme.SetMenuVisible(true)
+	if info.hasPrestigedThisArea then
+		dialogOpen=true; dialogCanPrestige=false
+		EarnedLabel.Text="Already prestiged in this area!"; EarnedLabel.TextColor3=Color3.fromRGB(255,100,100)
+		BoostLabel.Text=""
+		MultLabel.Text="Travel to a new area to prestige again."; MultLabel.TextColor3=Color3.fromRGB(180,180,200)
+		TotalLabel.Text="Total Soul Auras: "..Formatter.Format(info.currentSoulAuras or serverSoulAuras)
+		BonusLabel.Text=""
+		WarningLabel.Text="One prestige per area keeps progression fair. Keep farming or travel!"
+		WarningLabel.TextColor3=Color3.fromRGB(200,180,140)
+		ConfirmBtn.Text="USED"; ConfirmBtn.BackgroundColor3=PRESTIGE_COLOR_USED
+		Dialog.Visible=true; return
+	end
+	if (info.newSoulAuras or 0) <= 0 then
+		TweenService:Create(PrestigeButton,TweenInfo.new(0.1),{BackgroundColor3=Color3.fromRGB(90,40,120)}):Play()
+		task.delay(0.15, function()
+			TweenService:Create(PrestigeButton,TweenInfo.new(0.15),{BackgroundColor3=GetButtonColor()}):Play()
+		end); return
+	end
+	dialogCanPrestige=true; dialogOpen=true
+	EarnedLabel.Text="You will earn: +"..Formatter.Format(info.newSoulAuras).." Soul Auras"
+	EarnedLabel.TextColor3=Color3.fromRGB(255,200,100)
+	BoostLabel.Text=info.soulBoostActive and "Soul Boost active - 2x Soul Auras!" or ""
+	local currentBonus = (info.currentMultiplier - 1) * 100
+	local newBonus = (info.newMultiplier - 1) * 100
+	MultLabel.Text = "Earnings Bonus: +"..Formatter.Format(currentBonus).."% -> +"..Formatter.Format(newBonus).."%"
+	TotalLabel.Text="Total Soul Auras: "..Formatter.Format(info.currentSoulAuras+info.newSoulAuras)
+		.." (was "..Formatter.Format(info.currentSoulAuras)..")"
+	BonusLabel.Text="Kickstart Bonus: $"..Formatter.Format(info.prestigeBonus).." to start your next run!"
+	WarningLabel.Text="This will RESET your currency, upgrades, and all cubes. Soul Auras are permanent."
+	WarningLabel.TextColor3=Color3.fromRGB(255,100,100)
+	ConfirmBtn.BackgroundColor3=PRESTIGE_COLOR_ACTIVE; ConfirmBtn.Text="PRESTIGE"
+	Dialog.Visible=true
+end
+
+PrestigeButton.MouseButton1Down:Connect(function()
+	if dialogOpen then
+		-- LOGIC GATING
+		if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_ClosePrestige") then return end
+		CloseDialog()
+		if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
 		return
 	end
-
-	local earned       = data.totalEarned or 0
-	local rawSoulAuras = PrestigeModule.CalcSoulAuras(earned)
-	if rawSoulAuras <= 0 then return end
-
-	local soulMult     = BoostManager.GetSoulMultiplier(uid)
-	local newSoulAuras = math.floor(rawSoulAuras * soulMult)
-
-	local previousSoulAuras  = data.soulAuras or 0
-	local previousMultiplier = PrestigeModule.GetMultiplier(previousSoulAuras)
-
-	local bonusPercent  = AdminConfig.PrestigeStartBonusPercent or 0.05
-	local prestigeBonus = math.max(math.floor(earned * bonusPercent), 50)
-
-	data.soulAuras              = previousSoulAuras + newSoulAuras
-	data.prestigeCount          = (data.prestigeCount or 0) + 1
-	data.hasPrestigedThisArea   = true
-	local newMultiplier = PrestigeModule.GetMultiplier(data.soulAuras)
-
-	data.currency           = prestigeBonus
-	data.totalEarned        = 0
-	data.pendingAuras       = 0
-	data.pendingPayout      = 0
-	data.pendingBonusPayout = 0
-	data.lastPayout         = 0
-
-	for key, _ in pairs(data.upgrades) do data.upgrades[key] = 0 end
-
-	if runtime then
-		runtime.cubes          = {}
-		runtime.cubeOrder      = {}
-		runtime.cubeCount      = 0
-		runtime.nextCubeId     = 1
-		runtime.lastActiveTime = tick()
-		runtime.sessionStart   = tick()
+	if hasPrestigedThisArea then
+		dialogOpen=true; dialogCanPrestige=false
+		UITheme.SetMenuVisible(true)
+		EarnedLabel.Text="Already prestiged in this area!"; EarnedLabel.TextColor3=Color3.fromRGB(255,100,100)
+		BoostLabel.Text=""; MultLabel.Text="Travel to a new area to prestige again."
+		MultLabel.TextColor3=Color3.fromRGB(180,180,200)
+		TotalLabel.Text="Total Soul Auras: "..Formatter.Format(serverSoulAuras)
+		BonusLabel.Text=""
+		WarningLabel.Text="One prestige per area. Keep farming or travel!"
+		WarningLabel.TextColor3=Color3.fromRGB(200,180,140)
+		ConfirmBtn.Text="USED"; ConfirmBtn.BackgroundColor3=PRESTIGE_COLOR_USED
+		Dialog.Visible=true; return
+	end
+	if previewPending then return end
+	if serverTotalEarned<=0 then
+		TweenService:Create(PrestigeButton,TweenInfo.new(0.1),{BackgroundColor3=Color3.fromRGB(90,40,120)}):Play()
+		task.delay(0.15, function()
+			TweenService:Create(PrestigeButton,TweenInfo.new(0.15),{BackgroundColor3=GetButtonColor()}):Play()
+		end); return
 	end
 
-	PrestigeReset:Fire(player)
+	-- LOGIC GATING
+	if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_OpenPrestige") then return end
 
-	PrestigeComplete:FireClient(player, {
-		newSoulAuras         = newSoulAuras,
-		totalSoulAuras       = data.soulAuras,
-		previousMultiplier   = previousMultiplier,
-		newMultiplier        = newMultiplier,
-		prestigeCount        = data.prestigeCount,
-		prestigeBonus        = prestigeBonus,
-		soulBoostActive      = soulMult > 1,
-		hasPrestigedThisArea = true,
-	})
+	previewPending=true
+	TweenService:Create(PrestigeButton,TweenInfo.new(0.15),{BackgroundColor3=PRESTIGE_COLOR_PENDING}):Play()
+	PreviewPrestige:FireServer()
 
-	local resetState = {}
-	for _, tierData in ipairs(UpgradeConfig.Tiers) do
-		for upgradeId, cfg in pairs(tierData.upgrades) do
-			resetState[upgradeId] = {
-				level    = 0,
-				maxLevel = cfg.maxLevel,
-				cost     = UpgradeConfig.CalculateCost(upgradeId, 0),
-				maxed    = false,
-			}
+	if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
+
+	task.delay(5, function()
+		if previewPending then previewPending=false
+			TweenService:Create(PrestigeButton,TweenInfo.new(0.2),{BackgroundColor3=GetButtonColor()}):Play()
 		end
-	end
-	UpgradeUpdated:FireClient(player, {
-		type     = "fullState",
-		upgrades = resetState,
-		currency = prestigeBonus,
-	})
+	end)
+end)
 
-	UpdateHatchery:FireClient(player, {
-		current = AdminConfig.HatcheryMax,
-		max     = AdminConfig.HatcheryMax,
-	})
+PreviewPrestige.OnClientEvent:Connect(function(info)
+	previewPending=false
+	if info.hasPrestigedThisArea~=nil then hasPrestigedThisArea=info.hasPrestigedThisArea end
+	OpenDialogWithPreview(info)
+end)
 
-	task.wait(0.3)
-	UpdateHUD:FireClient(player, {
-		currency             = data.currency,
-		pendingAuras         = 0,
-		habitatCapacity      = AdminConfig.BaseHabitatCapacity,
-		rate                 = 0,
-		passiveInterval      = AdminConfig.PassiveInterval,
-		totalEarned          = 0,
-		soulAuras            = data.soulAuras      or 0,
-		farmEvaluation       = data.farmEvaluation or 0,
-		goldenAuras          = data.goldenAuras    or 0,
-		boostInventory       = data.boostInventory or {},
-		prestigeCount        = data.prestigeCount  or 0,
-		hasPrestigedThisArea = true,
-	})
+ConfirmBtn.MouseButton1Down:Connect(function()
+	-- LOGIC GATING
+	if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_PrestigeConfirm") then return end
 
-	GameManager.SavePlayer(player)
+	if not dialogCanPrestige then CloseDialog(); return end
+	dialogCanPrestige=false; CloseDialog(); RequestPrestige:FireServer()
+
+	if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
+end)
+
+DialogCloseBtn.MouseButton1Down:Connect(function()
+	-- LOGIC GATING
+	if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_ClosePrestige") then return end
+
+	previewPending=false; CloseDialog()
+	TweenService:Create(PrestigeButton,TweenInfo.new(0.2),{BackgroundColor3=GetButtonColor()}):Play()
+
+	if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
 end)
 
 ---------------------------------------------------------------
--- Preview
+-- RenderStepped
 ---------------------------------------------------------------
-local PreviewPrestige = ReplicatedStorage.RemoteEvents:WaitForChild("PreviewPrestige")
+local buttonWasEnabled = false
+RunService.RenderStepped:Connect(function(dt)
+	if ratePerSecond>0 then displayedTotalEarned+=ratePerSecond*dt end
 
-PreviewPrestige.OnServerEvent:Connect(function(player)
-	local data = GameManager.GetData(player.UserId)
-	if not data then return end
+	-- ✨ FIX: Make Total Earned perfectly accessible to the TutorialController instantly
+	player:SetAttribute("LiveTotalEarned", displayedTotalEarned)
 
-	local earned       = data.totalEarned or 0
-	local rawSoulAuras = PrestigeModule.CalcSoulAuras(earned)
-	local currentSA    = data.soulAuras or 0
-	local currentMult  = PrestigeModule.GetMultiplier(currentSA)
-	local soulMult     = BoostManager.GetSoulMultiplier(player.UserId)
-	local newSoulAuras = math.floor(rawSoulAuras * soulMult)
-	local newMult      = PrestigeModule.GetMultiplier(currentSA + newSoulAuras)
-	local bonusPercent  = AdminConfig.PrestigeStartBonusPercent or 0.05
-	local prestigeBonus = math.max(math.floor(earned * bonusPercent), 50)
-
-	PreviewPrestige:FireClient(player, {
-		totalEarned          = earned,
-		newSoulAuras         = newSoulAuras,
-		currentSoulAuras     = currentSA,
-		currentMultiplier    = currentMult,
-		newMultiplier        = newMult,
-		prestigeCount        = data.prestigeCount or 0,
-		prestigeBonus        = prestigeBonus,
-		soulBoostActive      = soulMult > 1,
-		hasPrestigedThisArea = data.hasPrestigedThisArea == true,
-	})
-end)
-
--- ShippingManager
--- Location: ServerScriptService > ShippingManager
-
-local Players             = game:GetService("Players")
-local ReplicatedStorage   = game:GetService("ReplicatedStorage")
-local ServerScriptService = game:GetService("ServerScriptService")
-local HttpService         = game:GetService("HttpService")
-
-local AdminConfig       = require(ReplicatedStorage.Modules.AdminConfig)
-local UpgradeConfig     = require(ReplicatedStorage.Modules.UpgradeConfig)
-local MutationConfig    = require(ReplicatedStorage.Modules.MutationConfig)
-local GameManager       = require(ServerScriptService.GameManager)
-local EpicUpgradeConfig = require(ReplicatedStorage.Modules.EpicUpgradeConfig)
-local BoostManager      = require(ServerScriptService.BoostManager)
-
-local ShipAuras = ReplicatedStorage.RemoteEvents:WaitForChild("ShipAuras")
-local UpdateHUD = ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHUD")
-
-local RemoteEvents = ReplicatedStorage:WaitForChild("RemoteEvents")
-if not RemoteEvents:FindFirstChild("AuraDiscovered") then
-	local ev = Instance.new("RemoteEvent")
-	ev.Name = "AuraDiscovered"
-	ev.Parent = RemoteEvents
-end
-local AuraDiscovered = RemoteEvents:WaitForChild("AuraDiscovered")
-
-local playerTimers   = {}
-local activeTrucks   = {}
-local playerAutoMode = {}
-local pendingPayouts = {}
-
-Players.PlayerAdded:Connect(function(player)
-	playerTimers[player.UserId]   = AdminConfig.ShipInterval
-	activeTrucks[player.UserId]   = 0
-	playerAutoMode[player.UserId] = AdminConfig.AutoDispatch
-	pendingPayouts[player.UserId] = {}
-end)
-
-Players.PlayerRemoving:Connect(function(player)
-	playerTimers[player.UserId]   = nil
-	activeTrucks[player.UserId]   = nil
-	playerAutoMode[player.UserId] = nil
-	pendingPayouts[player.UserId] = nil
-end)
-
-local function SendHUDUpdate(player)
-	local uid     = player.UserId
-	local data    = GameManager.GetData(uid)
-	local runtime = GameManager.GetRuntime(uid)
-	if not data or not runtime then return end
-
-	local storedCount = runtime.storedCubeCount or 0
-	local activeMV    = runtime.activeMutatedValue or 0
-
-	local boostMult = BoostManager.GetValueMultiplier(uid) * BoostManager.GetSpawnRateMultiplier(uid)
-	local rate = math.floor(activeMV * boostMult)
-
-	local habCfg      = UpgradeConfig.GetUpgradeConfig("habitatCapacity")
-	local habitatCap  = (habCfg and habCfg.apply) and habCfg.apply(data) or AdminConfig.BaseHabitatCapacity
-
-	local tickCfg    = UpgradeConfig.GetUpgradeConfig("passiveTickSpeed")
-	local passiveInt = (tickCfg and tickCfg.apply) and tickCfg.apply(data) or AdminConfig.PassiveInterval
-
-	local shipReduction = 0
-	local shipCfg = EpicUpgradeConfig.GetUpgradeConfig("epicShipCooldown")
-	if shipCfg and shipCfg.apply then
-		shipReduction = shipCfg.apply(data)
+	local runSA=CalcSoulAurasLocal(displayedTotalEarned)
+	SACountLabel.Text=Formatter.Format(serverSoulAuras).." Soul Auras"
+	if runSA>0 then
+		RunSALabel.Text="+"..Formatter.Format(runSA).." on prestige"
+		RunSALabel.TextColor3=hasPrestigedThisArea and Color3.fromRGB(140,120,100) or Color3.fromRGB(255,200,100)
+	else
+		RunSALabel.Text="earning..."
+		RunSALabel.TextColor3=Color3.fromRGB(160,140,180)
 	end
-	local finalCooldown = math.max(1, AdminConfig.ShipInterval - shipReduction)
-
-	UpdateHUD:FireClient(player, {
-		currency        = data.currency,
-		pendingAuras    = storedCount,
-		habitatCapacity = habitatCap,
-		rate            = rate,
-		passiveInterval = passiveInt,
-		totalEarned     = data.totalEarned    or 0,
-		soulAuras       = data.soulAuras      or 0,
-		farmEvaluation  = data.farmEvaluation or 0,
-		shipCooldown    = finalCooldown,
-		discoveredTiers = data.discoveredTiers or {} 
-	})
-end
-
-local function TryDispatch(player)
-	if AdminConfig.DisableShipping then return end
-	local uid     = player.UserId
-	local data    = GameManager.GetData(uid)
-	local runtime = GameManager.GetRuntime(uid)
-	if not data or not runtime then return end
-	if (activeTrucks[uid] or 0) >= 50 then return end
-
-	local totalCubes = runtime.cubeCount
-	if totalCubes <= 0 then return end
-
-	local toCollect  = math.min(totalCubes, AdminConfig.PlatformCapacity)
-	local cubeIds, cubes = GameManager.CollectOldestCubes(uid, toCollect)
-	local collected  = #cubeIds
-	if collected == 0 then return end
-
-	local totalPayout = 0
-
-	data.discoveredTiers = data.discoveredTiers or {}
-	local newlyDiscovered = {}
-
-	for _, cube in ipairs(cubes) do
-		totalPayout = totalPayout + MutationConfig.GetMutatedValue(cube)
-
-		local cArea = cube.currentArea or data.currentArea or 1
-		local discoverKey = cArea .. "_" .. cube.tierName
-
-		if not data.discoveredTiers[discoverKey] then
-			data.discoveredTiers[discoverKey] = true
-			table.insert(newlyDiscovered, {name = cube.tierName, color = cube.color, area = cArea})
+	local tc=GetThreshold(runSA); local tn=GetThreshold(runSA+1)
+	local range=tn-tc; local progress=range>0 and math.clamp((displayedTotalEarned-tc)/range,0,1) or 0
+	if runSA~=displayedRunSA then barHighWaterMark=0; displayedRunSA=runSA end
+	if progress>barHighWaterMark then barHighWaterMark=progress end
+	BarFill.Size=UDim2.new(barHighWaterMark,0,1,0)
+	local canPrestige=CalcSoulAurasLocal(serverTotalEarned)>0 and not hasPrestigedThisArea
+	if canPrestige~=buttonWasEnabled then
+		buttonWasEnabled=canPrestige
+		if canPrestige then PrestigeReady:Fire() end
+		if not dialogOpen and not previewPending then
+			PrestigeButton.Text=GetButtonText()
+			TweenService:Create(PrestigeButton,TweenInfo.new(0.3),{BackgroundColor3=GetButtonColor()}):Play()
 		end
 	end
+end)
 
-	activeTrucks[uid] = (activeTrucks[uid] or 0) + 1
-	data.totalPlatformsShipped = (data.totalPlatformsShipped or 0) + 1
-
-	local dispatchId = HttpService:GenerateGUID(false)
-	pendingPayouts[uid][dispatchId] = totalPayout
-
-	SendHUDUpdate(player)
-
-	ShipAuras:FireClient(player, {
-		collected  = collected,
-		payout     = totalPayout,
-		dispatchId = dispatchId,
-	})
-
-	if #newlyDiscovered > 0 then
-		AuraDiscovered:FireClient(player, newlyDiscovered)
+---------------------------------------------------------------
+-- UpdateHUD
+---------------------------------------------------------------
+local UpdateHUD=ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHUD")
+UpdateHUD.OnClientEvent:Connect(function(stats)
+	if stats.multiplier ~= nil then
+		local mult = stats.multiplier
+		local bonusText = mult > 1 and ("+" .. Formatter.Format((mult - 1) * 100) .. "% earnings bonus") or "+0% earnings bonus"
 	end
-end
-
-ShipAuras.OnServerEvent:Connect(function(player, action, value)
-	local uid = player.UserId
-
-	if action == "manual" then
-		TryDispatch(player)
-
-		local data          = GameManager.GetData(uid)
-		local shipReduction = 0
-		if data then
-			local shipCfg = EpicUpgradeConfig.GetUpgradeConfig("epicShipCooldown")
-			if shipCfg and shipCfg.apply then shipReduction = shipCfg.apply(data) end
+	if stats.totalEarned then
+		serverTotalEarned=stats.totalEarned
+		if serverTotalEarned>displayedTotalEarned then displayedTotalEarned=serverTotalEarned end
+	end
+	if stats.soulAuras then
+		serverSoulAuras=stats.soulAuras
+		local mult=1+(serverSoulAuras*BONUS_PER_SA)
+		local bonusPercent = (mult - 1) * 100
+		MultDisplayLabel.Text = mult > 1 and ("+" .. Formatter.Format(bonusPercent) .. "% earnings bonus") or "+0% earnings bonus"
+		MultDisplayLabel.TextColor3=mult>1 and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(255, 255, 255)
+	end
+	if stats.rate and stats.passiveInterval then
+		local interval=stats.passiveInterval
+		ratePerSecond=(interval>0 and stats.rate>0) and (stats.rate/interval) or 0
+	end
+	if stats.hasPrestigedThisArea~=nil then
+		hasPrestigedThisArea=stats.hasPrestigedThisArea
+		if not dialogOpen and not previewPending then
+			PrestigeButton.Text=GetButtonText()
+			TweenService:Create(PrestigeButton,TweenInfo.new(0.2),{BackgroundColor3=GetButtonColor()}):Play()
 		end
-		playerTimers[uid] = math.max(1, AdminConfig.ShipInterval - shipReduction)
-		return
-	end
-
-	if action == "setMode" then
-		playerAutoMode[uid] = (value == "auto")
-		return
-	end
-
-	if action == "payout" then
-		if player:GetAttribute("TutorialFrozen") then return end
-
-		local data = GameManager.GetData(uid)
-		if not data then return end
-
-		local dispatchId   = value
-		local actualPayout = pendingPayouts[uid] and pendingPayouts[uid][dispatchId]
-
-		if not actualPayout then
-			warn("[Security] " .. player.Name .. " attempted invalid platform payout.")
-			return
-		end
-
-		pendingPayouts[uid][dispatchId] = nil
-		activeTrucks[uid] = math.max(0, (activeTrucks[uid] or 1) - 1)
-
-		data.currency       = (data.currency       or 0) + actualPayout
-		data.totalEarned    = (data.totalEarned     or 0) + actualPayout
-		data.farmEvaluation = (data.farmEvaluation  or 0) + actualPayout
-
-		SendHUDUpdate(player)
-
-		ShipAuras:FireClient(player, {
-			action = "payoutConfirmed",
-			amount = actualPayout
-		})
 	end
 end)
 
--- UpgradeManager
--- Location: ServerScriptService > UpgradeManager
+---------------------------------------------------------------
+-- PrestigeComplete
+---------------------------------------------------------------
+PrestigeComplete.OnClientEvent:Connect(function(info)
+	if info.blocked then
+		TweenService:Create(PrestigeButton,TweenInfo.new(0.1),{BackgroundColor3=Color3.fromRGB(180,60,60)}):Play()
+		task.delay(0.2, function() TweenService:Create(PrestigeButton,TweenInfo.new(0.2),{BackgroundColor3=PRESTIGE_COLOR_USED}):Play() end)
+		PrestigeButton.Text="Used"; hasPrestigedThisArea=true; return
+	end
+	if info.hasPrestigedThisArea~=nil then hasPrestigedThisArea=info.hasPrestigedThisArea end
+
+	for _,obj in ipairs(workspace:GetChildren()) do
+		if obj:GetAttribute("AuraCube") then obj:Destroy() end
+	end
+
+	local burstAmount = 0
+	if info.newSoulAuras and info.newSoulAuras > 0 then
+		burstAmount = math.floor(math.pow(info.newSoulAuras, 0.4) * 1.1)
+	elseif info.isPortalEntry then
+		burstAmount = 15 
+	end
+
+	if burstAmount > 0 then
+		burstAmount = math.clamp(burstAmount, 1, 50)
+		local burstEvent = ReplicatedStorage.RemoteEvents:FindFirstChild("TutorialBurst")
+		if burstEvent then burstEvent:FireServer(burstAmount) end
+	end
+
+	displayedTotalEarned=0; serverTotalEarned=0; displayedRunSA=0
+	ratePerSecond=0; barHighWaterMark=0; previewPending=false
+	serverSoulAuras=info.totalSoulAuras
+	local flash=Instance.new("Frame"); flash.Size=UDim2.new(1,0,1,0)
+	flash.BackgroundColor3=Color3.fromRGB(180,100,255); flash.BackgroundTransparency=0.2
+	flash.ZIndex=50; flash.Parent=mainHUD
+	TweenService:Create(flash,TweenInfo.new(0.8,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),{BackgroundTransparency=1}):Play()
+	task.delay(0.9, function() if flash and flash.Parent then flash:Destroy() end end)
+	PrestigeButton.Text=GetButtonText()
+	TweenService:Create(PrestigeButton,TweenInfo.new(0.2),{BackgroundColor3=GetButtonColor()}):Play()
+	if not info.isPortalEntry then task.delay(0.3, function() ShowPrestigeResultCard(info) end) end
+end)
+
+---------------------------------------------------------------
+-- AreaChanged
+---------------------------------------------------------------
+AreaChanged.OnClientEvent:Connect(function(info)
+	hasPrestigedThisArea=info.hasPrestigedThisArea or false
+	displayedTotalEarned=0; serverTotalEarned=0; displayedRunSA=0
+	ratePerSecond=0; barHighWaterMark=0
+	PrestigeButton.Text=GetButtonText()
+	TweenService:Create(PrestigeButton,TweenInfo.new(0.2),{BackgroundColor3=GetButtonColor()}):Play()
+end)
+
+---------------------------------------------------------------
+-- Result card
+---------------------------------------------------------------
+function ShowPrestigeResultCard(info)
+	local CW=C.Cards.PrestigeCardW; local CH=C.Cards.PrestigeCardH
+	local card=Instance.new("Frame"); card.Name="PrestigeResultCard"
+	card.Size=UDim2.new(0,CW,0,CH); card.Position=UDim2.new(0.5,-CW/2,0,-CH-10)
+	card.BackgroundColor3=Color3.fromRGB(22,16,32); card.BorderSizePixel=0
+	card.ZIndex=55; card.Parent=mainHUD
+	Instance.new("UICorner",card).CornerRadius=UDim.new(0,C.Cards.CornerRadius)
+	local cs=Instance.new("UIStroke"); cs.Color=Color3.fromRGB(180,100,255); cs.Thickness=2; cs.Parent=card
+
+	local function AddLabel(text,color,y,h)
+		local l=Instance.new("TextLabel"); l.Size=UDim2.new(1,-20,0,h or 28); l.Position=UDim2.new(0,10,0,y)
+		l.BackgroundTransparency=1; l.Text=text; l.TextColor3=color
+		l.TextScaled=true; l.Font=T.font; l.ZIndex=56; l.Parent=card
+	end
+
+	AddLabel("PRESTIGE "..info.prestigeCount.." COMPLETE",Color3.fromRGB(210,160,255),10,36)
+	AddLabel("+"..Formatter.Format(info.newSoulAuras).." Soul Auras  ->  "..Formatter.Format(info.totalSoulAuras).." total",
+		Color3.fromRGB(255,210,80),52,30)
+	local prevBonus = (info.previousMultiplier - 1) * 100
+	local newBonus = (info.newMultiplier - 1) * 100
+	AddLabel("Earnings Bonus: +"..Formatter.Format(prevBonus).."% -> +"..Formatter.Format(newBonus).."%",
+		Color3.fromRGB(160,220,255),88,24)
+	AddLabel("Prestige Bonus: $"..Formatter.Format(info.prestigeBonus).." added to your wallet!",
+		Color3.fromRGB(100,230,120),118,24)
+
+	local cont=Instance.new("TextButton"); cont.Size=UDim2.new(0,130,0,36)
+	cont.Position=UDim2.new(0.5,-65,1,-50)
+	cont.BackgroundColor3=Color3.fromRGB(120,50,160); cont.BorderSizePixel=0
+	cont.Text="Continue"; cont.TextColor3=Color3.fromRGB(255,255,255)
+	cont.TextScaled=true; cont.Font=T.font; cont.ZIndex=57; cont.Parent=card
+	Instance.new("UICorner",cont).CornerRadius=UDim.new(0,8)
+
+	TweenService:Create(card,TweenInfo.new(0.45,Enum.EasingStyle.Back,Enum.EasingDirection.Out),
+		{Position=UDim2.new(0.5,-CW/2,0.22,0)}):Play()
+
+	local dismissed=false
+	local function Dismiss()
+		if dismissed then return end; dismissed=true
+		TweenService:Create(card,TweenInfo.new(0.4,Enum.EasingStyle.Quad,Enum.EasingDirection.In),
+			{Position=UDim2.new(0.5,-CW/2,0,-CH-10)}):Play()
+		task.delay(0.5, function() if card and card.Parent then card:Destroy() end end)
+	end
+	cont.MouseButton1Down:Connect(Dismiss); task.delay(10,Dismiss)
+end
+
+---------------------------------------------------------------
+-- UI JUICE
+---------------------------------------------------------------
+local function AddButtonJuice(btn)
+	local scale = btn:FindFirstChildOfClass("UIScale")
+	if not scale then
+		scale = Instance.new("UIScale")
+		scale.Parent = btn
+	end
+	btn.MouseEnter:Connect(function() TweenService:Create(scale, TweenInfo.new(0.15, Enum.EasingStyle.Sine), {Scale = 1.08}):Play() end)
+	btn.MouseLeave:Connect(function() TweenService:Create(scale, TweenInfo.new(0.15, Enum.EasingStyle.Sine), {Scale = 1}):Play() end)
+	btn.MouseButton1Down:Connect(function() TweenService:Create(scale, TweenInfo.new(0.1, Enum.EasingStyle.Sine), {Scale = 0.9}):Play() end)
+	btn.MouseButton1Up:Connect(function() TweenService:Create(scale, TweenInfo.new(0.2, Enum.EasingStyle.Bounce), {Scale = 1.08}):Play() end)
+end
+
+AddButtonJuice(PrestigeButton)
+AddButtonJuice(ConfirmBtn)
+AddButtonJuice(DialogCloseBtn)
+
+local function RefreshLook()
+	UITheme.Apply(PrestigeButton, "Panel")
+	UITheme.Apply(ConfirmBtn, "Panel")
+	UITheme.ApplyShine(Dialog)
+
+	local outerStroke = Dialog:FindFirstChildWhichIsA("UIStroke")
+	if outerStroke then
+		outerStroke.Color = Color3.fromRGB(165, 20, 255)
+	end
+end
+
+task.wait(2)
+RefreshLook()
+
+-- ✨ TUTORIAL OVERRIDE: Close prestige when camera pans
+local forceClose = ReplicatedStorage:FindFirstChild("ForceCloseUI") or Instance.new("BindableEvent")
+forceClose.Name = "ForceCloseUI"
+forceClose.Parent = ReplicatedStorage
+forceClose.Event:Connect(function()
+	if dialogOpen then CloseDialog() end
+end)
+
+-- ShopController
+-- Location: StarterPlayer > StarterPlayerScripts > ShopController
 
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local ServerScriptService = game:GetService("ServerScriptService")
+local TweenService      = game:GetService("TweenService")
+local RunService        = game:GetService("RunService")
+local CollectionService = game:GetService("CollectionService")
 
-local AdminConfig   = require(ReplicatedStorage.Modules.AdminConfig)
-local UpgradeConfig = require(ReplicatedStorage.Modules.UpgradeConfig)
-local MutationConfig = require(ReplicatedStorage.Modules.MutationConfig)
-local GameManager   = require(ServerScriptService.GameManager)
-local BoostManager  = require(ServerScriptService.BoostManager)
+local UpgradeConfig     = require(ReplicatedStorage.Modules.UpgradeConfig)
+local Formatter         = require(ReplicatedStorage.Modules.NumberFormatter)
+local EpicUpgradeConfig = require(ReplicatedStorage.Modules.EpicUpgradeConfig)
+local UITheme           = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("UITheme"))
+local T                 = UITheme.Get("Custom")
+local SoundConfig       = require(ReplicatedStorage.Modules.SoundConfig)
 
-local PurchaseUpgrade = ReplicatedStorage.RemoteEvents:WaitForChild("PurchaseUpgrade")
-local UpgradeUpdated  = ReplicatedStorage.RemoteEvents:WaitForChild("UpgradeUpdated")
-local UpdateHUD       = ReplicatedStorage.RemoteEvents:WaitForChild("UpdateHUD")
+local RemoteEvents        = ReplicatedStorage:WaitForChild("RemoteEvents")
+local PurchaseUpgrade     = RemoteEvents:WaitForChild("PurchaseUpgrade", 15)
+local UpgradeUpdated      = RemoteEvents:WaitForChild("UpgradeUpdated", 15)
+local PurchaseEpicUpgrade = RemoteEvents:WaitForChild("PurchaseEpicUpgrade", 15)
+local EpicUpgradeUpdated  = RemoteEvents:WaitForChild("EpicUpgradeUpdated", 15)
 
-local lastPurchase = {}
-local PURCHASE_COOLDOWN = 0.05
+local player    = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local mainHUD   = playerGui:WaitForChild("MainHUD")
 
-local function GetHabitatCapacity(data)
-	local cfg = UpgradeConfig.GetUpgradeConfig("habitatCapacity")
-	if cfg and cfg.apply then return cfg.apply(data) end
-	return AdminConfig.BaseHabitatCapacity or 50
+local upgradeState      = {}
+local epicUpgradeState  = {}
+local currentCurrency   = 0
+local liveGoldenAuras   = 0
+local shopOpen          = false
+local activeMainTab     = "Upgrades"
+local regularCardRefs   = {}
+local epicCardRefs      = {}
+local isLoadingData     = true
+local globalHoldActive  = false  -- Global flag to prevent multiple simultaneous holds
+local globalHoldGeneration = 0    -- Global generation counter
+
+-- FORWARD DECLARATIONS
+local UpdateLockedTierProgress = nil
+local RebuildRegularShop = nil 
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- INITIALIZATION
+-- ─────────────────────────────────────────────────────────────────────────────
+for _, tierData in ipairs(UpgradeConfig.Tiers) do
+	for upgradeId, cfg in pairs(tierData.upgrades) do
+		upgradeState[upgradeId] = {
+			level    = 0,
+			maxLevel = cfg.maxLevel,
+			cost     = UpgradeConfig.CalculateCost(upgradeId, 0),
+			maxed    = false,
+		}
+	end
 end
 
-local function GetPassiveInterval(data)
-	local cfg = UpgradeConfig.GetUpgradeConfig("passiveTickSpeed")
-	if cfg and cfg.apply then return cfg.apply(data) end
-	return AdminConfig.PassiveInterval or 10
+for _, tierData in ipairs(EpicUpgradeConfig.Tiers) do
+	for upgradeId, cfg in pairs(tierData.upgrades) do
+		epicUpgradeState[upgradeId] = {
+			level    = 0,
+			maxLevel = cfg.maxLevel,
+			cost     = EpicUpgradeConfig.CalculateCost(upgradeId, 0),
+			maxed    = false,
+		}
+	end
 end
 
-local function SendFullUpgradeState(player)
-	local data = GameManager.GetData(player.UserId)
-	if not data then return end
+-- ─────────────────────────────────────────────────────────────────────────────
+-- VFX / SOUND HELPERS
+-- ─────────────────────────────────────────────────────────────────────────────
+local function PlayUIBurst(targetElement, amount, colorTheme)
+	if not shopOpen then return end
+	local burstGui = Instance.new("ScreenGui")
+	burstGui.Name   = "JuiceBurst"
+	burstGui.Parent = playerGui
 
-	local state = {}
+	local absPos  = targetElement.AbsolutePosition
+	local absSize = targetElement.AbsoluteSize
+	local center  = absPos + (absSize / 2)
 
-	for tierNum, tierData in ipairs(UpgradeConfig.Tiers) do
-		for upgradeId, cfg in pairs(tierData.upgrades) do
-			local currentLevel = data.upgrades[upgradeId] or 0
-			state[upgradeId] = {
-				level    = currentLevel,
-				maxLevel = cfg.maxLevel,
-				cost     = currentLevel < cfg.maxLevel and UpgradeConfig.CalculateCost(upgradeId, currentLevel) or 0,
-				maxed    = currentLevel >= cfg.maxLevel,
-			}
+	for i = 1, amount do
+		local particle = Instance.new("Frame")
+		particle.BackgroundColor3 = colorTheme or Color3.fromRGB(255, 215, 0)
+		particle.BorderSizePixel  = 0
+		particle.Size             = UDim2.new(0, math.random(6, 12), 0, math.random(6, 12))
+		particle.Position         = UDim2.new(0, center.X, 0, center.Y)
+		particle.Rotation         = math.random(0, 360)
+
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0.5, 0)
+		corner.Parent       = particle
+		particle.Parent     = burstGui
+
+		local angle    = math.rad(math.random(0, 360))
+		local distance = math.random(50, 150)
+		local endPos   = UDim2.new(0, center.X + math.cos(angle) * distance, 0, center.Y + math.sin(angle) * distance + 50)
+
+		local tInfo = TweenInfo.new(math.random(4, 7) / 10, Enum.EasingStyle.Cubic, Enum.EasingDirection.Out)
+		TweenService:Create(particle, tInfo, {
+			Position             = endPos,
+			Size                 = UDim2.new(0, 0, 0, 0),
+			Rotation             = particle.Rotation + math.random(-180, 180),
+			BackgroundTransparency = 1,
+		}):Play()
+	end
+
+	task.delay(1, function() burstGui:Destroy() end)
+end
+
+local comboPitch  = 1.0
+local lastBuyTime = tick()
+
+local function PlayPurchaseSound()
+	if tick() - lastBuyTime < 0.3 then
+		comboPitch = math.min(comboPitch + 0.05, 2.5)
+	else
+		comboPitch = 1.0
+	end
+	lastBuyTime = tick()
+
+	local sfxFolder = ReplicatedStorage:FindFirstChild("SFX") or ReplicatedStorage:FindFirstChild("Sounds")
+	if sfxFolder and sfxFolder:FindFirstChild("BuyPing") then
+		local sfx = sfxFolder.BuyPing:Clone()
+		sfx.PlaybackSpeed = comboPitch
+		sfx.Parent        = game:GetService("SoundService")
+		sfx:Play()
+		game.Debris:AddItem(sfx, 2)
+	end
+end
+
+local function PlayFeedbackSound(soundName, volume)
+	local sfxFolder = ReplicatedStorage:FindFirstChild("SFX") or ReplicatedStorage:FindFirstChild("Sounds")
+	if sfxFolder then
+		local s = sfxFolder:FindFirstChild(soundName)
+		if s then
+			local sfx = s:Clone()
+			sfx.Volume = volume or 0.5
+			sfx.Parent = game:GetService("SoundService")
+			sfx:Play()
+			game.Debris:AddItem(sfx, 3)
+			return
+		end
+	end
+end
+
+local lastErrorTime = tick()
+
+local function PlayErrorFeedback(targetButton)
+	if tick() - lastErrorTime < 0.25 then return end
+	lastErrorTime = tick()
+
+	local sfxFolder = ReplicatedStorage:FindFirstChild("Sounds") or ReplicatedStorage:FindFirstChild("SFX")
+	if sfxFolder and sfxFolder:FindFirstChild("ErrorBuzz") then
+		local sfx = sfxFolder.ErrorBuzz:Clone()
+		sfx.Volume = 0.5
+		sfx.Parent = workspace
+		sfx:Play()
+		game.Debris:AddItem(sfx, 2)
+	end
+
+	if targetButton and targetButton.Parent then
+		local origPos    = targetButton.Position
+		local wobbleInfo = TweenInfo.new(0.04, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, 3, true)
+		TweenService:Create(targetButton, wobbleInfo, {
+			Position = origPos + UDim2.new(0, 4, 0, 0)
+		}):Play()
+	end
+end
+
+local function FormatNumber(n) return Formatter.Format(n) end
+local function PlayUI(id) if shared.PlayUISound then shared.PlayUISound(id) end end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SHOP BUTTON
+-- ─────────────────────────────────────────────────────────────────────────────
+local ShopButton = Instance.new("ImageButton")
+ShopButton.Name              = "ShopButton"
+ShopButton.Size              = UDim2.new(0, 60, 0, 60)
+ShopButton.AnchorPoint       = Vector2.new(1, 1)
+ShopButton.Position          = UDim2.new(0.98, 0, 0.95, 0)
+ShopButton.BackgroundColor3  = T.buttonSecondary
+ShopButton.BorderSizePixel   = 0
+ShopButton.AutoButtonColor   = false
+ShopButton.ZIndex            = 5
+ShopButton.Parent            = mainHUD
+CollectionService:AddTag(ShopButton, "Tutorial_ShopButton") -- Tutorial Tracker Tag
+Instance.new("UICorner", ShopButton).CornerRadius = UDim.new(0.5, 0)
+
+local shopStroke = Instance.new("UIStroke", ShopButton)
+shopStroke.Color     = T.accentGold
+shopStroke.Thickness = 2
+
+local shopIcon = Instance.new("ImageLabel", ShopButton)
+shopIcon.Size               = UDim2.new(0.6, 0, 0.6, 0)
+shopIcon.Position           = UDim2.new(0.2, 0, 0.2, 0)
+shopIcon.BackgroundTransparency = 1
+shopIcon.ScaleType          = Enum.ScaleType.Fit
+shopIcon.Image              = "rbxassetid://14916846070"
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SHOP PANEL
+-- ─────────────────────────────────────────────────────────────────────────────
+local PANEL_MAX_W = 420; local PANEL_MAX_H = 510; local HEADER_H = 42
+
+local ShopPanel = Instance.new("Frame")
+ShopPanel.Name              = "ShopPanel"
+ShopPanel.Size              = UDim2.new(0.88, 0, 0.82, 0)
+ShopPanel.AnchorPoint       = Vector2.new(0.5, 0.5)
+ShopPanel.Position          = UDim2.new(0.5, 0, 0.5, 0)
+ShopPanel.BackgroundColor3  = T.panelBG
+ShopPanel.BorderSizePixel   = 0
+ShopPanel.Visible           = false
+ShopPanel.ZIndex            = 10
+ShopPanel.ClipsDescendants  = true
+ShopPanel.Parent            = mainHUD
+CollectionService:AddTag(ShopPanel, "Tutorial_ShopPanel") -- Tutorial Tracker Tag
+Instance.new("UICorner", ShopPanel).CornerRadius = UDim.new(0, 10)
+
+local sizeConstraint = Instance.new("UISizeConstraint")
+sizeConstraint.MaxSize = Vector2.new(PANEL_MAX_W, PANEL_MAX_H)
+sizeConstraint.Parent  = ShopPanel
+
+local panelStroke = Instance.new("UIStroke")
+panelStroke.Color     = T.panelStroke
+panelStroke.Thickness = 2
+panelStroke.Parent    = ShopPanel
+
+local TitleBar = Instance.new("Frame")
+TitleBar.Name                 = "TitleBar"
+TitleBar.Size                 = UDim2.new(1, 0, 0, HEADER_H)
+TitleBar.BackgroundColor3     = T.headerBG
+TitleBar.BorderSizePixel      = 0
+TitleBar.ZIndex               = 11
+TitleBar.ClipsDescendants     = true
+TitleBar.BackgroundTransparency = 1
+TitleBar.Parent               = ShopPanel
+Instance.new("UICorner", TitleBar).CornerRadius = UDim.new(0, 10)
+
+local TitleLabel = Instance.new("TextLabel")
+TitleLabel.Size               = UDim2.new(1, -50, 1, 0)
+TitleLabel.Position           = UDim2.new(0, 15, 0, 0)
+TitleLabel.BackgroundTransparency = 1
+TitleLabel.Text               = "RESEARCH"
+TitleLabel.TextColor3         = T.headerText
+TitleLabel.TextScaled         = true
+TitleLabel.Font               = T.font
+TitleLabel.TextXAlignment     = Enum.TextXAlignment.Left
+TitleLabel.ZIndex             = 12
+TitleLabel.Parent             = TitleBar
+
+local CloseButton = Instance.new("TextButton")
+CloseButton.Size             = UDim2.new(0, 30, 0, 30)
+CloseButton.Position         = UDim2.new(1, -35, 0, 6)
+CloseButton.BackgroundColor3 = T.buttonRed
+CloseButton.BorderSizePixel  = 0
+CloseButton.Text             = "X"
+CloseButton.TextColor3       = T.bodyText
+CloseButton.TextScaled       = true
+CloseButton.Font             = T.font
+CloseButton.ZIndex           = 9999
+CloseButton.Parent           = TitleBar
+CollectionService:AddTag(CloseButton, "Tutorial_ShopCloseBtn") -- Tutorial Tracker Tag
+Instance.new("UICorner", CloseButton).CornerRadius = UDim.new(0, 6)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- INFO POPUP
+-- ─────────────────────────────────────────────────────────────────────────────
+local InfoPopup = Instance.new("Frame")
+InfoPopup.Name                 = "InfoPopup"
+InfoPopup.Size                 = UDim2.new(0.85, 0, 0.6, 0)
+InfoPopup.Position             = UDim2.new(0.5, 0, 0.5, 0)
+InfoPopup.AnchorPoint          = Vector2.new(0.5, 0.5)
+InfoPopup.BackgroundColor3     = T.cardBG
+InfoPopup.BackgroundTransparency = 0
+InfoPopup.ZIndex               = 50
+InfoPopup.Visible              = false
+InfoPopup.Parent               = ShopPanel
+Instance.new("UICorner", InfoPopup).CornerRadius = UDim.new(0, 12)
+
+local AspectConstraint = Instance.new("UIAspectRatioConstraint", InfoPopup)
+AspectConstraint.AspectRatio = 1.0
+local InfoScale = Instance.new("UIScale", InfoPopup)
+InfoScale.Scale = 1
+
+local InfoTitle = Instance.new("TextLabel", InfoPopup)
+InfoTitle.Size                 = UDim2.new(1, -20, 0, 35)
+InfoTitle.Position             = UDim2.new(0, 10, 0, 10)
+InfoTitle.BackgroundTransparency = 1
+InfoTitle.Text                 = ""
+InfoTitle.TextColor3           = T.headerText
+InfoTitle.TextScaled           = true
+InfoTitle.Font                 = Enum.Font.GothamBold
+InfoTitle.ZIndex               = 51
+
+local InfoDesc = Instance.new("TextLabel", InfoPopup)
+InfoDesc.Size                  = UDim2.new(1, -20, 1, -110)
+InfoDesc.Position              = UDim2.new(0, 10, 0, 55)
+InfoDesc.BackgroundTransparency = 1
+InfoDesc.Text                  = ""
+InfoDesc.TextColor3            = T.bodyText
+InfoDesc.TextWrapped           = true
+InfoDesc.TextScaled            = true
+InfoDesc.Font                  = T.font
+InfoDesc.TextYAlignment        = Enum.TextYAlignment.Top
+InfoDesc.ZIndex                = 51
+
+local InfoClose = Instance.new("TextButton", InfoPopup)
+InfoClose.Size             = UDim2.new(0.6, 0, 0, 40)
+InfoClose.Position         = UDim2.new(0.2, 0, 1, -50)
+InfoClose.BackgroundColor3 = T.buttonPrimary
+InfoClose.BorderSizePixel  = 0
+InfoClose.Text             = "Close"
+InfoClose.TextColor3       = T.headerText
+InfoClose.TextScaled       = true
+InfoClose.Font             = T.font
+InfoClose.ZIndex           = 51
+Instance.new("UICorner", InfoClose).CornerRadius = UDim.new(0, 8)
+
+local function ShowInfo(title, desc)
+	if shared.PlayUISound then shared.PlayUISound(SoundConfig.UIClick or "") end
+	InfoTitle.Text = title
+	InfoDesc.Text  = desc
+	InfoPopup.BackgroundTransparency = 0
+	InfoScale.Scale  = 0.5
+	InfoPopup.Visible = true
+	TweenService:Create(InfoScale, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1 }):Play()
+end
+
+InfoClose.MouseButton1Down:Connect(function()
+	if shared.PlayUISound then shared.PlayUISound(SoundConfig.UIClick or "") end
+	local tween = TweenService:Create(InfoScale, TweenInfo.new(0.2, Enum.EasingStyle.Back, Enum.EasingDirection.In), { Scale = 0.5 })
+	tween:Play()
+	tween.Completed:Once(function() InfoPopup.Visible = false end)
+end)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- MAIN TAB BAR
+-- ─────────────────────────────────────────────────────────────────────────────
+local activeShopTabText = "Regular Upgrades"
+
+local MainTabBar = Instance.new("Frame")
+MainTabBar.Size                 = UDim2.new(1, -20, 0, 85)
+MainTabBar.Position             = UDim2.new(0, 10, 0, HEADER_H + 4)
+MainTabBar.BackgroundTransparency = 1
+MainTabBar.ZIndex               = 11
+MainTabBar.Parent               = ShopPanel
+
+local ShopHoverLabel = Instance.new("TextLabel", MainTabBar)
+ShopHoverLabel.Size                 = UDim2.new(1, 0, 0, 20)
+ShopHoverLabel.Position             = UDim2.new(0, 0, 0, 0)
+ShopHoverLabel.BackgroundTransparency = 1
+ShopHoverLabel.TextColor3           = T.bodyText
+ShopHoverLabel.TextScaled           = true
+ShopHoverLabel.Font                 = T.font
+ShopHoverLabel.Text                 = activeShopTabText
+
+local TabBtnFrame = Instance.new("Frame", MainTabBar)
+TabBtnFrame.Size                 = UDim2.new(1, 0, 1, -25)
+TabBtnFrame.Position             = UDim2.new(0, 0, 0, 25)
+TabBtnFrame.BackgroundTransparency = 1
+
+local TabListLayout = Instance.new("UIListLayout", TabBtnFrame)
+TabListLayout.FillDirection       = Enum.FillDirection.Horizontal
+TabListLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+TabListLayout.VerticalAlignment   = Enum.VerticalAlignment.Center
+TabListLayout.Padding             = UDim.new(0, 25)
+
+local TAB_COLOR_BASE   = T.buttonSecondary
+local TAB_COLOR_HOVER  = T.buttonPrimary
+local TAB_COLOR_ACTIVE = T.accentGold
+
+local mainTabButtons = {}
+
+local function MakeMainTab(name, hoverText, iconId)
+	local btn = Instance.new("ImageButton", TabBtnFrame)
+	btn.Name             = "MainTab_" .. name
+	btn.Size             = UDim2.new(0, 48, 0, 48)
+	btn.BackgroundColor3 = TAB_COLOR_BASE
+	btn.AutoButtonColor  = false
+	btn.ZIndex           = 12
+	Instance.new("UICorner", btn).CornerRadius = UDim.new(0.5, 0)
+
+	local stroke = Instance.new("UIStroke", btn)
+	stroke.Color     = T.panelStroke
+	stroke.Thickness = 2
+
+	local icon = Instance.new("ImageLabel", btn)
+	icon.Size               = UDim2.new(0.6, 0, 0.6, 0)
+	icon.Position           = UDim2.new(0.2, 0, 0.2, 0)
+	icon.BackgroundTransparency = 1
+	icon.ScaleType          = Enum.ScaleType.Fit
+	icon.Image              = iconId
+
+	btn.MouseEnter:Connect(function()
+		ShopHoverLabel.Text = hoverText
+		if activeMainTab ~= name then btn.BackgroundColor3 = TAB_COLOR_HOVER end
+	end)
+	btn.MouseLeave:Connect(function()
+		ShopHoverLabel.Text = activeShopTabText
+		if activeMainTab ~= name then btn.BackgroundColor3 = TAB_COLOR_BASE end
+	end)
+
+	mainTabButtons[name] = { btn = btn, stroke = stroke }
+	return btn
+end
+
+local tabEpic     = MakeMainTab("Epic",     "Epic Research",     "rbxassetid://14916846070")
+local tabUpgrades = MakeMainTab("Upgrades", "Regular Upgrades",  "rbxassetid://14916846070")
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- CURRENCY LABEL
+-- ─────────────────────────────────────────────────────────────────────────────
+local CURRENCY_H = 0
+local CurrencyLabel = Instance.new("TextLabel")
+CurrencyLabel.Name              = "ShopCurrencyLabel"
+CurrencyLabel.Size              = UDim2.new(1, -24, 0, CURRENCY_H)
+CurrencyLabel.BackgroundTransparency = 1
+CurrencyLabel.Text              = "$0"
+CurrencyLabel.TextColor3        = T.currencyColor
+CurrencyLabel.TextScaled        = true
+CurrencyLabel.Font              = T.font
+CurrencyLabel.TextXAlignment    = Enum.TextXAlignment.Right
+CurrencyLabel.ZIndex            = 11
+CurrencyLabel.Parent            = ShopPanel
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SCROLL FRAMES
+-- ─────────────────────────────────────────────────────────────────────────────
+local function MakeScroll(name, yTop)
+	local sf = Instance.new("ScrollingFrame")
+	sf.Name                 = name
+	sf.Size                 = UDim2.new(1, -20, 1, -(yTop + 10))
+	sf.Position             = UDim2.new(0, 10, 0, yTop)
+	sf.BackgroundTransparency = 1
+	sf.BorderSizePixel      = 0
+	sf.ScrollBarThickness   = 4
+	sf.ScrollBarImageColor3 = T.subText
+	sf.CanvasSize           = UDim2.new(0, 0, 0, 0)
+	sf.ZIndex               = 11
+	sf.Visible              = false
+	sf.ClipsDescendants     = true
+	sf.Parent               = ShopPanel
+
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 8)
+	layout.Parent  = sf
+	layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+		sf.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + 10)
+	end)
+	return sf
+end
+
+local REGULAR_SCROLL_TOP = HEADER_H + 95
+local RegularScroll      = MakeScroll("RegularScroll", REGULAR_SCROLL_TOP)
+local EPIC_SCROLL_TOP    = HEADER_H + 95
+local EpicScroll         = MakeScroll("EpicScroll", EPIC_SCROLL_TOP)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- CARD BUILDER
+-- ─────────────────────────────────────────────────────────────────────────────
+local function BuildCard(parent, upgradeId, cfg, isEpic, cardRefsTable)
+	local card = Instance.new("Frame")
+	card.Name             = "Card_" .. upgradeId
+	card.Size             = UDim2.new(1, 0, 0, 100)
+	card.BackgroundColor3 = T.cardBG
+	card.BorderSizePixel  = 0
+	card.Parent           = parent
+	Instance.new("UICorner", card).CornerRadius = UDim.new(0, 12)
+
+	local icon = Instance.new("ImageLabel", card)
+	icon.Size               = UDim2.new(0, 50, 0, 50)
+	icon.Position           = UDim2.new(0, 15, 0.5, -25)
+	icon.BackgroundTransparency = 1
+	icon.Image              = cfg.iconId or "rbxassetid://0"
+
+	local infoBtn = Instance.new("TextButton", card)
+	infoBtn.Size             = UDim2.new(0, 22, 0, 22)
+	infoBtn.Position         = UDim2.new(0, 75, 0, 12)
+	infoBtn.BackgroundColor3 = T.buttonSecondary
+	infoBtn.Text             = "i"
+	infoBtn.TextColor3       = T.bodyText
+	infoBtn.Font             = Enum.Font.GothamBlack
+	infoBtn.TextSize         = 14
+	Instance.new("UICorner", infoBtn).CornerRadius = UDim.new(1, 0)
+	infoBtn.MouseButton1Click:Connect(function() ShowInfo(cfg.displayName, cfg.description) end)
+
+	local nameLabel = Instance.new("TextLabel", card)
+	nameLabel.Size              = UDim2.new(0.74, -120, 0, 24)
+	nameLabel.Position          = UDim2.new(0, 102, 0, 11)
+	nameLabel.BackgroundTransparency = 1
+	nameLabel.Text              = string.upper(cfg.displayName)
+	nameLabel.TextColor3        = T.bodyText
+	nameLabel.TextScaled        = true
+	nameLabel.Font              = Enum.Font.FredokaOne
+	nameLabel.TextXAlignment    = Enum.TextXAlignment.Left
+
+	local descLabel = Instance.new("TextLabel", card)
+	descLabel.Size              = UDim2.new(0.74, -95, 0, 36)
+	descLabel.Position          = UDim2.new(0, 75, 0, 38)
+	descLabel.BackgroundTransparency = 1
+	descLabel.Text              = cfg.description
+	descLabel.TextColor3        = T.subText
+	descLabel.TextWrapped       = true
+	descLabel.TextSize          = 16
+	descLabel.Font              = Enum.Font.GothamMedium
+	descLabel.TextXAlignment    = Enum.TextXAlignment.Left
+	descLabel.TextYAlignment    = Enum.TextYAlignment.Top
+
+	local levelLabel = Instance.new("TextLabel", card)
+	levelLabel.Size             = UDim2.new(0.74, -95, 0, 18)
+	levelLabel.Position         = UDim2.new(0, 75, 0, 76)
+	levelLabel.BackgroundTransparency = 1
+	levelLabel.Text             = "Lv. 0 / " .. cfg.maxLevel
+	levelLabel.TextColor3       = T.accentGreen
+	levelLabel.TextSize         = 16
+	levelLabel.Font             = Enum.Font.FredokaOne
+	levelLabel.TextXAlignment   = Enum.TextXAlignment.Left
+
+	local buyButton = Instance.new("TextButton", card)
+	buyButton.Name             = "PurchaseButton"
+	buyButton.Size             = UDim2.new(0.24, 0, 0, 46)
+	buyButton.AnchorPoint      = Vector2.new(1, 0.5)
+	buyButton.Position         = UDim2.new(1, -12, 0.5, 0)
+	buyButton.BackgroundColor3 = isEpic and T.accentPurple or T.buttonGreen
+	buyButton.BorderSizePixel  = 0
+	buyButton.TextColor3       = T.bodyText
+	buyButton.TextScaled       = true
+	buyButton.Font             = Enum.Font.FredokaOne
+	CollectionService:AddTag(buyButton, "Tutorial_Buy_" .. upgradeId) -- Tutorial Tracker Tag
+	Instance.new("UICorner", buyButton).CornerRadius = UDim.new(0, 8)
+
+	cardRefsTable[upgradeId] = {
+		frame      = card,
+		levelLabel = levelLabel,
+		buyButton  = buyButton,
+		isEpic     = isEpic,
+		tab        = cfg.category,
+	}
+
+	local holdingBuy    = false
+	local buyGeneration = 0
+
+	local function StopAllOtherHolds(myGen)
+		if globalHoldGeneration ~= myGen then
+			globalHoldGeneration = myGen
 		end
 	end
 
-	UpgradeUpdated:FireClient(player, {
-		type     = "fullState",
-		upgrades = state,
-		currency = data.currency,
-	})
-end
+	local function TryBuy()
+		if isLoadingData then return false end
 
-Players.PlayerAdded:Connect(function(player)
-	task.wait(2)
-	SendFullUpgradeState(player)
-end)
+		-- ✨ TUTORIAL ADAPTATION: Prevent accidental multi-buys if the FSM advances while holding!
+		if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_BuyUpgrade") then return false end
 
-local function SendHUDAfterPurchase(player, data)
-	local uid     = player.UserId
-	local runtime = GameManager.GetRuntime(uid)
-	if not runtime then return end
+		if isEpic then
+			local state = epicUpgradeState[upgradeId]
+			if not state or state.maxed then return false end
 
-	local storedCount = runtime.storedCubeCount or 0
-	local activeMV    = runtime.activeMutatedValue or 0
+			local currentAuras = player:GetAttribute("LiveGoldenAuras") or 0
+			local currentAuraSpend = player:GetAttribute("LocalAuraSpend") or 0
+			local actualAuras = currentAuras - currentAuraSpend
 
-	local boostMult = BoostManager.GetValueMultiplier(uid) * BoostManager.GetSpawnRateMultiplier(uid)
-	local rate = math.floor(activeMV * boostMult)
+			if actualAuras < state.cost then PlayErrorFeedback(buyButton); return false end
 
-	local upgradesState = {}
-	for upgradeId, level in pairs(data.upgrades or {}) do
-		upgradesState[upgradeId] = { level = level }
+			local wasMaxedLocally = state.maxed
+			player:SetAttribute("LocalAuraSpend", currentAuraSpend + state.cost)
+
+			state.level += 1
+			state.maxed  = (state.level >= state.maxLevel)
+			state.cost   = state.maxed and 0 or EpicUpgradeConfig.CalculateCost(upgradeId, state.level)
+
+			if state.maxed and not wasMaxedLocally then
+				PlayFeedbackSound("MaxOut", 0.6); PlayUIBurst(buyButton, 20)
+			else
+				PlayPurchaseSound()
+			end
+			UpdateEpicCard(upgradeId)
+			PurchaseEpicUpgrade:FireServer(upgradeId)
+
+			if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
+			return true
+		else
+			local state = upgradeState[upgradeId]
+			if not state or state.maxed then return false end
+
+			local currentCash = player:GetAttribute("LiveCurrency") or 0
+			local currentSpend = player:GetAttribute("LocalSpend") or 0
+			local actualCash = currentCash - currentSpend
+
+			if actualCash < state.cost then PlayErrorFeedback(buyButton); return false end
+
+			local wasMaxedLocally = state.maxed
+			player:SetAttribute("LocalSpend", currentSpend + state.cost)
+
+			state.level += 1
+			state.maxed  = (state.level >= state.maxLevel)
+			state.cost   = state.maxed and 0 or UpgradeConfig.CalculateCost(upgradeId, state.level)
+
+			if state.maxed and not wasMaxedLocally then
+				PlayFeedbackSound("MaxOut", 0.6); PlayUIBurst(buyButton, 20)
+			else
+				PlayPurchaseSound()
+			end
+			UpdateRegularCard(upgradeId)
+			UpdateLockedTierProgress()
+			PurchaseUpgrade:FireServer(upgradeId)
+
+			if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
+			return true
+		end
 	end
 
-	UpdateHUD:FireClient(player, {
-		currency        = data.currency,
-		pendingAuras    = storedCount,
-		habitatCapacity = GetHabitatCapacity(data),
-		rate            = rate,
-		passiveInterval = GetPassiveInterval(data),
-		totalEarned     = data.totalEarned    or 0,
-		soulAuras       = data.soulAuras      or 0,
-		farmEvaluation  = data.farmEvaluation or 0,
-		upgrades        = upgradesState, 
-	})
+	local pulseTween = nil
+
+	buyButton.MouseButton1Down:Connect(function()
+		-- LOGIC GATING: Ask TutorialController for permission
+		if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_BuyUpgrade") then return end
+
+		globalHoldGeneration += 1
+		local myGlobalGen = globalHoldGeneration
+
+		buyGeneration += 1
+		local myGen   = buyGeneration
+		holdingBuy    = true
+		globalHoldActive = true
+
+		local scale = buyButton:FindFirstChildOfClass("UIScale")
+		if not scale then
+			scale = Instance.new("UIScale")
+			scale.Parent = buyButton
+		end
+
+		pulseTween = TweenService:Create(scale,
+			TweenInfo.new(0.12, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+			{ Scale = 0.88 })
+		pulseTween:Play()
+
+		TryBuy()
+		task.wait(0.3)
+		local holdStart = tick()
+
+		local UserInputService = game:GetService("UserInputService")
+		local epicHoldSpeedLevel   = (epicUpgradeState["epicHoldSpeed"] and epicUpgradeState["epicHoldSpeed"].level) or 0
+		local holdSpeedMultiplier  = 1 + (epicHoldSpeedLevel * 0.3)
+
+		while holdingBuy and buyGeneration == myGen and globalHoldGeneration == myGlobalGen do
+			if not UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
+				holdingBuy = false; globalHoldActive = false; break
+			end
+			local success = TryBuy()
+			if not success then holdingBuy = false; globalHoldActive = false; break end
+			task.wait(math.max(0.02, (0.15 - ((tick() - holdStart) * 0.05)) / holdSpeedMultiplier))
+		end
+
+		globalHoldActive = false
+		if pulseTween then pulseTween:Cancel() end
+		if scale then
+			TweenService:Create(scale, TweenInfo.new(0.2, Enum.EasingStyle.Bounce), { Scale = 1 }):Play()
+		end
+	end)
+
+	local function StopHold()
+		holdingBuy = false
+		globalHoldActive = false
+		if pulseTween then pulseTween:Cancel() end
+		local scale = buyButton:FindFirstChildOfClass("UIScale")
+		if scale then
+			TweenService:Create(scale, TweenInfo.new(0.2, Enum.EasingStyle.Bounce), { Scale = 1 }):Play()
+		end
+	end
+
+	buyButton.MouseButton1Up:Connect(StopHold)
+	buyButton.MouseLeave:Connect(StopHold)
 end
 
-PurchaseUpgrade.OnServerEvent:Connect(function(player, upgradeId)
-	local uid = player.UserId
+-- ─────────────────────────────────────────────────────────────────────────────
+-- BUILD EPIC CARDS
+-- ─────────────────────────────────────────────────────────────────────────────
+local epicOrderIndex = 1
+for _, tierData in ipairs(EpicUpgradeConfig.Tiers) do
+	for upgradeId, cfg in pairs(tierData.upgrades) do
+		BuildCard(EpicScroll, upgradeId, cfg, true, epicCardRefs)
+
+		local ref = epicCardRefs[upgradeId]
+		if ref and ref.frame then
+			ref.baseOrder      = epicOrderIndex
+			ref.frame.LayoutOrder = epicOrderIndex
+			epicOrderIndex    += 1
+			ref.frame.Visible  = false
+			ref.frame.Parent   = EpicScroll
+			if UITheme and UITheme.Apply then UITheme.Apply(ref.frame, "ShopCard") end
+		end
+	end
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- CARD UPDATE FUNCTIONS
+-- ─────────────────────────────────────────────────────────────────────────────
+function UpdateRegularCard(upgradeId)
+	local ref   = regularCardRefs[upgradeId]
+	local state = upgradeState[upgradeId]
+	if not ref or not state then return end
+	if UITheme and UITheme.Apply then UITheme.Apply(ref.frame, "ShopCard") end
+
+	ref.levelLabel.Text = "Lv. " .. state.level .. " / " .. state.maxLevel
+
+	local currentCash   = player:GetAttribute("LiveCurrency") or 0
+	local currentSpend  = player:GetAttribute("LocalSpend") or 0
+	local actualCash    = currentCash - currentSpend
+
+	if state.level >= state.maxLevel then
+		ref.frame.LayoutOrder        = (ref.baseOrder or 0) + 100000
+		ref.levelLabel.TextColor3    = Color3.fromRGB(255, 215, 0)
+		ref.buyButton.Text           = "MAX"
+		ref.buyButton.TextColor3     = Color3.fromRGB(255, 255, 255)
+		ref.buyButton.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+	else
+		ref.frame.LayoutOrder      = ref.baseOrder or 0
+		ref.buyButton.Text         = "$" .. FormatNumber(state.cost)
+		ref.buyButton.TextColor3   = (actualCash < state.cost)
+			and Color3.fromRGB(255, 100, 100) or Color3.fromRGB(255, 255, 255)
+		ref.buyButton.BackgroundColor3 = Color3.fromRGB(60, 170, 80)
+	end
+end
+
+function UpdateEpicCard(upgradeId)
+	local ref   = epicCardRefs[upgradeId]
+	local state = epicUpgradeState[upgradeId]
+	if not ref or not state then return end
+	if UITheme and UITheme.Apply then UITheme.Apply(ref.frame, "ShopCard") end
+
+	ref.levelLabel.Text = "Lv. " .. state.level .. " / " .. state.maxLevel
+
+	local currentAuras  = player:GetAttribute("LiveGoldenAuras") or 0
+	local currentAuraSpend = player:GetAttribute("LocalAuraSpend") or 0
+	local actualAuras   = currentAuras - currentAuraSpend
+
+	if state.level >= state.maxLevel then
+		ref.frame.LayoutOrder        = (ref.baseOrder or 0) + 100000
+		ref.levelLabel.TextColor3    = Color3.fromRGB(255, 215, 0)
+		ref.buyButton.Text           = "MAX"
+		ref.buyButton.TextColor3     = Color3.fromRGB(255, 255, 255)
+		ref.buyButton.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+	else
+		ref.frame.LayoutOrder      = ref.baseOrder or 0
+		ref.buyButton.Text         = "✦ " .. FormatNumber(state.cost)
+		ref.buyButton.TextColor3   = (actualAuras < state.cost)
+			and Color3.fromRGB(255, 100, 100) or Color3.fromRGB(255, 255, 255)
+		ref.buyButton.BackgroundColor3 = Color3.fromRGB(150, 80, 255)
+	end
+end
+
+function UpdateCurrencyDisplay()
+	if activeMainTab == "Upgrades" then
+		local currentCash = player:GetAttribute("LiveCurrency") or 0
+		local currentSpend = player:GetAttribute("LocalSpend") or 0
+		local actualCash = currentCash - currentSpend
+
+		CurrencyLabel.Text       = "$" .. FormatNumber(actualCash)
+		CurrencyLabel.TextColor3 = T.currencyColor
+		CurrencyLabel.Position   = UDim2.new(0, 12, 0, HEADER_H + 34 + 8)
+	end
+end
+
+local function UpdateAllRegularCards() for id in pairs(regularCardRefs) do UpdateRegularCard(id) end end
+local function UpdateAllEpicCards()   for id in pairs(epicCardRefs)    do UpdateEpicCard(id)    end end
+
+UpdateLockedTierProgress = function()
+	local totalUpgradesBought = 0
+	for _, state in pairs(upgradeState) do
+		totalUpgradesBought = totalUpgradesBought + (state.level or 0)
+	end
+
+	local lockedHeader = nil
+	local required = 0
+
+	for _, child in ipairs(RegularScroll:GetChildren()) do
+		if child.Name == "TierHeader_Locked" then
+			lockedHeader = child
+			required = child:GetAttribute("Required") or 0
+			local progressLabel = child:FindFirstChild("ProgressLabel")
+			if progressLabel then
+				progressLabel.Text = totalUpgradesBought .. " / " .. required .. " Upgrades Needed"
+				local progress = totalUpgradesBought / required
+				if progress >= 1 then
+					progressLabel.TextColor3 = Color3.fromRGB(100, 255, 100) 
+				elseif progress >= 0.75 then
+					progressLabel.TextColor3 = Color3.fromRGB(255, 200, 100) 
+				else
+					progressLabel.TextColor3 = Color3.fromRGB(255, 100, 100) 
+				end
+			end
+			break
+		end
+	end
+
+	if lockedHeader and totalUpgradesBought >= required then
+		PlayFeedbackSound("MaxOut", 0.8)
+		PlayUIBurst(ShopPanel, 30, Color3.fromRGB(100, 255, 100))
+		local scroll = ShopPanel:FindFirstChild("RegularScroll")
+		local savedScroll = scroll and scroll.CanvasPosition or Vector2.new(0, 0)
+		RebuildRegularShop()
+		if scroll then scroll.CanvasPosition = savedScroll end
+	end
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- TIER HEADERS
+-- ─────────────────────────────────────────────────────────────────────────────
+local function CreateTierHeader(tierName)
+	local header = Instance.new("Frame")
+	header.Name                 = "TierHeader"
+	header.Size                 = UDim2.new(1, 0, 0, 30)
+	header.BackgroundTransparency = 1
+
+	local label = Instance.new("TextLabel")
+	label.Size                  = UDim2.new(1, 0, 1, -5)
+	label.BackgroundTransparency = 1
+	label.Text                  = string.upper(tierName)
+	label.TextColor3            = Color3.fromRGB(220, 220, 220)
+	label.TextSize              = 16
+	label.Font                  = Enum.Font.GothamBlack
+	label.TextXAlignment        = Enum.TextXAlignment.Left
+	label.Parent                = header
+
+	local line = Instance.new("Frame")
+	line.Size             = UDim2.new(1, 0, 0, 2)
+	line.Position         = UDim2.new(0, 0, 1, -2)
+	line.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+	line.BorderSizePixel  = 0
+	line.Parent           = header
+	return header
+end
+
+local function CreateLockedTierHeader(tierName, current, required)
+	local header = Instance.new("Frame")
+	header.Name                 = "TierHeader_Locked"
+	header.Size                 = UDim2.new(1, 0, 0, 45)
+	header.BackgroundTransparency = 1
+	header:SetAttribute("Required", required)
+
+	local label = Instance.new("TextLabel")
+	label.Size                  = UDim2.new(1, 0, 0.5, 0)
+	label.BackgroundTransparency = 1
+	label.Text                  = string.upper(tierName) .. " (LOCKED)"
+	label.TextColor3            = Color3.fromRGB(150, 150, 150)
+	label.TextSize              = 16
+	label.Font                  = Enum.Font.GothamBlack
+	label.TextXAlignment        = Enum.TextXAlignment.Left
+	label.Parent                = header
+
+	local progress = Instance.new("TextLabel")
+	progress.Name               = "ProgressLabel"
+	progress.Size               = UDim2.new(1, 0, 0.4, 0)
+	progress.Position           = UDim2.new(0, 0, 0.6, 0)
+	progress.BackgroundTransparency = 1
+	progress.Text               = current .. " / " .. required .. " Upgrades Needed"
+	progress.TextColor3         = Color3.fromRGB(255, 100, 100)
+	progress.TextSize           = 12
+	progress.Font               = Enum.Font.GothamBold
+	progress.TextXAlignment     = Enum.TextXAlignment.Left
+	progress.Parent             = header
+
+	local line = Instance.new("Frame")
+	line.Size             = UDim2.new(1, 0, 0, 2)
+	line.Position         = UDim2.new(0, 0, 1, -2)
+	line.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
+	line.BorderSizePixel  = 0
+	line.Parent           = header
+	return header
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- REBUILD REGULAR SHOP
+-- ─────────────────────────────────────────────────────────────────────────────
+RebuildRegularShop = function()
+	for _, child in ipairs(RegularScroll:GetChildren()) do
+		if child:IsA("Frame") and child.Name ~= "CardTemplate" then
+			child:Destroy()
+		end
+	end
+	regularCardRefs = {}
+
+	local totalUpgradesBought = 0
+	for _, state in pairs(upgradeState) do
+		totalUpgradesBought = totalUpgradesBought + (state.level or 0)
+	end
+
+	local listOrder = 1
+
+	for tierNum, tierData in ipairs(UpgradeConfig.Tiers) do
+		if totalUpgradesBought >= tierData.unlockRequirement then
+			local header = CreateTierHeader(tierData.tierName or "Tier " .. tierNum)
+			header.LayoutOrder = listOrder
+			listOrder += 1
+			header.Parent = RegularScroll
+
+			for upgradeId, cfg in pairs(tierData.upgrades) do
+				BuildCard(RegularScroll, upgradeId, cfg, false, regularCardRefs)
+				local ref = regularCardRefs[upgradeId]
+
+				if ref and ref.frame then
+					if ref.buyButton then
+						ref.buyButton.Name = "Buy_" .. upgradeId
+					end
+					ref.baseOrder          = listOrder
+					ref.frame.LayoutOrder  = listOrder
+					listOrder             += 1
+					ref.frame.Visible      = true
+					ref.frame.Parent       = RegularScroll
+					if UITheme and UITheme.Apply then UITheme.Apply(ref.frame, "ShopCard") end
+					local myColor = Color3.fromRGB(45, 30, 55)
+					ref.frame:SetAttribute("TierColor", myColor)
+					ref.frame.BackgroundColor3 = myColor
+				end
+			end
+		else
+			local lockedHeader = CreateLockedTierHeader(
+				tierData.tierName or "Tier " .. tierNum,
+				totalUpgradesBought,
+				tierData.unlockRequirement
+			)
+			lockedHeader.LayoutOrder = listOrder
+			lockedHeader.Parent      = RegularScroll
+			break
+		end
+	end
+	UpdateAllRegularCards()
+end
+
+RebuildRegularShop()
+
+task.delay(5, function() isLoadingData = false end)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- TAB SWITCHING
+-- ─────────────────────────────────────────────────────────────────────────────
+local function SwitchToMainTab(tabName)
+	if shared.PlayUISound then shared.PlayUISound(SoundConfig.UIClick or "") end
+	activeMainTab     = tabName
+	activeShopTabText = (tabName == "Epic") and "Epic Research" or "Regular Upgrades"
+	ShopHoverLabel.Text = activeShopTabText
+
+	for name, data in pairs(mainTabButtons) do
+		data.btn.BackgroundColor3 = (name == tabName) and TAB_COLOR_ACTIVE or TAB_COLOR_BASE
+		data.stroke.Color         = (name == tabName) and T.bodyText or T.panelStroke
+	end
+
+	RegularScroll.Visible = (tabName == "Upgrades")
+	EpicScroll.Visible    = (tabName == "Epic")
+
+	if tabName == "Epic" then
+		for _, ref in pairs(epicCardRefs) do
+			if ref and ref.frame then ref.frame.Visible = true end
+		end
+		if EpicScroll then EpicScroll.CanvasPosition = Vector2.new(0, 0) end
+	end
+end
+
+tabUpgrades.MouseButton1Down:Connect(function() PlayUI(SoundConfig.UIClick); SwitchToMainTab("Upgrades") end)
+tabEpic.MouseButton1Down:Connect(function()     PlayUI(SoundConfig.UIClick); SwitchToMainTab("Epic")     end)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- OPEN / CLOSE
+-- ─────────────────────────────────────────────────────────────────────────────
+local function OpenShop()
+	shopOpen = true
+	ShopPanel.Visible = true
+	ShopPanel.Size    = UDim2.new(0.88, 0, 0, 0)
+	SwitchToMainTab(activeMainTab)
+	TweenService:Create(ShopPanel,
+		TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+		{ Size = UDim2.new(0.88, 0, 0.82, 0) }
+	):Play()
+	UITheme.SetMenuVisible(true)
+	ShopButton.BackgroundColor3 = T.panelStroke
+end
+
+local function CloseShop()
+	shopOpen = false
+	PlayUI(SoundConfig.UIClose)
+	TweenService:Create(ShopPanel,
+		TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+		{ Size = UDim2.new(0.88, 0, 0, 0) }
+	):Play()
+	UITheme.SetMenuVisible(false)
+	task.delay(0.25, function() ShopPanel.Visible = false end)
+	ShopButton.BackgroundColor3 = T.buttonSecondary
+end
+
+ShopButton.MouseButton1Down:Connect(function()
+	if shopOpen then
+		-- LOGIC GATING
+		if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_CloseShop") then return end
+		CloseShop()
+		if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
+	else
+		-- LOGIC GATING
+		if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_OpenShop") then return end
+		OpenShop()
+		if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
+	end
+end)
+
+CloseButton.MouseButton1Down:Connect(function()
+	-- LOGIC GATING
+	if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_CloseShop") then return end
+	CloseShop()
+	if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
+end)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- LIVE UPDATE LOOP
+-- ─────────────────────────────────────────────────────────────────────────────
+local lastCardUpdate = 0
+RunService.Heartbeat:Connect(function()
+	if not shopOpen then return end
 	local now = tick()
-
-	if type(upgradeId) ~= "string" then return end
-	if lastPurchase[uid] and now - lastPurchase[uid] < PURCHASE_COOLDOWN then return end
-	lastPurchase[uid] = now
-
-	local cfg = UpgradeConfig.GetUpgradeConfig(upgradeId)
-	if not cfg then return end
-
-	local data = GameManager.GetData(uid)
-	if not data then return end
-	if not data.upgrades then data.upgrades = {} end
-
-	local currentLevel = data.upgrades[upgradeId] or 0
-	if currentLevel >= cfg.maxLevel then return end
-
-	local cost = UpgradeConfig.CalculateCost(upgradeId, currentLevel)
-	if data.currency < cost then return end
-
-	data.currency            = data.currency - cost
-	data.upgrades[upgradeId] = currentLevel + 1
-	local newLevel           = currentLevel + 1
-
-	local nextCost = 0
-	if newLevel < cfg.maxLevel then
-		nextCost = UpgradeConfig.CalculateCost(upgradeId, newLevel)
+	if now - lastCardUpdate > 0.1 then
+		lastCardUpdate = now
+		if activeMainTab == "Upgrades" then UpdateAllRegularCards() else UpdateAllEpicCards() end
+		UpdateCurrencyDisplay()
 	end
-
-	UpgradeUpdated:FireClient(player, {
-		type      = "purchased",
-		upgradeId = upgradeId,
-		level     = newLevel,
-		maxLevel  = cfg.maxLevel,
-		cost      = nextCost,
-		maxed     = newLevel >= cfg.maxLevel,
-		currency  = data.currency,
-	})
-
-	SendHUDAfterPurchase(player, data)
 end)
 
-Players.PlayerRemoving:Connect(function(player)
-	lastPurchase[player.UserId] = nil
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SERVER EVENTS
+-- ─────────────────────────────────────────────────────────────────────────────
+if UpgradeUpdated then
+	UpgradeUpdated.OnClientEvent:Connect(function(info)
+		if info.type == "fullState" then
+			isLoadingData = false
+			upgradeState   = info.upgrades
+			currentCurrency = info.currency
+			RebuildRegularShop()
+			UpdateCurrencyDisplay()
+
+		elseif info.type == "purchased" then
+			player:SetAttribute("LastServerPurchaseTick", tick())
+			player:SetAttribute("LocalSpend", 0)
+			player:SetAttribute("ForceSyncCurrency", info.currency)
+
+			local current = upgradeState[info.upgradeId]
+			if not current or info.level >= current.level then
+				upgradeState[info.upgradeId] = {
+					level    = info.level,
+					maxLevel = info.maxLevel,
+					cost     = info.cost,
+					maxed    = info.maxed,
+				}
+			end
+			currentCurrency = info.currency
+
+			-- ✨ FIX: Smoothly update the card instead of completely deleting and rebuilding the entire shop!
+			UpdateRegularCard(info.upgradeId)
+			UpdateLockedTierProgress()
+			UpdateCurrencyDisplay()
+		end
+	end)
+end
+
+if EpicUpgradeUpdated then
+	EpicUpgradeUpdated.OnClientEvent:Connect(function(info)
+		if info.type == "fullState" then
+			isLoadingData = false
+			epicUpgradeState = info.upgrades
+			liveGoldenAuras  = info.goldenAuras or liveGoldenAuras
+			UpdateAllEpicCards()
+			UpdateCurrencyDisplay()
+
+		elseif info.type == "purchased" then
+			player:SetAttribute("LastServerPurchaseTick", tick())
+			player:SetAttribute("LocalAuraSpend", 0)
+
+			local current = epicUpgradeState[info.upgradeId]
+			if not current or info.level >= current.level then
+				epicUpgradeState[info.upgradeId] = {
+					level    = info.level,
+					maxLevel = info.maxLevel,
+					cost     = info.cost,
+					maxed    = info.maxed,
+				}
+			end
+			UpdateEpicCard(info.upgradeId)
+			UpdateCurrencyDisplay()
+		end
+	end)
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- BUTTON JUICE
+-- ─────────────────────────────────────────────────────────────────────────────
+local function AddButtonJuice(btn)
+	if not btn then return end
+	local scale = btn:FindFirstChildOfClass("UIScale")
+	if not scale then
+		scale = Instance.new("UIScale")
+		scale.Parent = btn
+	end
+
+	btn.MouseEnter:Connect(function()
+		TweenService:Create(scale, TweenInfo.new(0.15, Enum.EasingStyle.Sine), { Scale = 1.08 }):Play()
+	end)
+	btn.MouseLeave:Connect(function()
+		TweenService:Create(scale, TweenInfo.new(0.15, Enum.EasingStyle.Sine), { Scale = 1 }):Play()
+	end)
+	btn.MouseButton1Down:Connect(function()
+		TweenService:Create(scale, TweenInfo.new(0.1, Enum.EasingStyle.Sine), { Scale = 0.9 }):Play()
+	end)
+	btn.MouseButton1Up:Connect(function()
+		TweenService:Create(scale, TweenInfo.new(0.2, Enum.EasingStyle.Bounce), { Scale = 1.08 }):Play()
+	end)
+end
+
+AddButtonJuice(ShopButton)
+AddButtonJuice(CloseButton)
+AddButtonJuice(tabUpgrades)
+AddButtonJuice(tabEpic)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- REFRESH LOOK
+-- ─────────────────────────────────────────────────────────────────────────────
+local shopShine    = nil
+local titleFlair   = nil
+local flairedExtra = false
+
+local function RefreshLook()
+	UITheme.Apply(ShopPanel, "Panel")
+	UITheme.Apply(ShopPanel, "TitleBar")
+
+	if not shopShine then
+		shopShine  = UITheme.ApplyShine(ShopPanel)
+		UITheme.ApplyShine(TitleBar)
+	end
+
+	if not titleFlair then
+		titleFlair = UITheme.ApplyFlair(TitleLabel, "Ghost")
+	end
+
+	if not flairedExtra then flairedExtra = true end
+
+	for _, scrollName in ipairs({ "RegularScroll", "EpicScroll" }) do
+		local scroll = ShopPanel:FindFirstChild(scrollName)
+		if scroll then
+			local layout = scroll:FindFirstChildOfClass("UIListLayout")
+			if layout then layout.SortOrder = Enum.SortOrder.LayoutOrder end
+		end
+	end
+
+	local outerStroke = ShopPanel:FindFirstChildWhichIsA("UIStroke")
+	if outerStroke then outerStroke.Color = Color3.fromRGB(255, 255, 255) end
+end
+
+task.wait(2)
+RefreshLook()
+
+-- ✨ TUTORIAL OVERRIDE: Close shop when camera pans
+local forceClose = ReplicatedStorage:FindFirstChild("ForceCloseUI") or Instance.new("BindableEvent")
+forceClose.Name = "ForceCloseUI"
+forceClose.Parent = ReplicatedStorage
+forceClose.Event:Connect(function()
+	if shopOpen then CloseShop() end
 end)
