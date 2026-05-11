@@ -780,3 +780,267 @@ end)
 if player.Character then
 	UpdateJumpState(player.Character, jumpEnabled)
 end
+
+-- SoundManager
+-- Location: StarterPlayer > StarterPlayerScripts > SoundManager
+--
+-- MENU GATE: Only the initial area music waits for MenuDismissed.
+-- shared.PlayUISound and all event connections work immediately.
+-- This ensures other scripts can play sounds during loading.
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService      = game:GetService("TweenService")
+local SoundService      = game:GetService("SoundService")
+
+local SoundConfig = require(ReplicatedStorage.Modules.SoundConfig)
+
+local player    = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local SoundGroup = Instance.new("SoundGroup")
+SoundGroup.Name   = "AuraIncSounds"
+SoundGroup.Volume = 1
+SoundGroup.Parent = SoundService
+
+local soundCache = {}
+
+local function GetOrCreateSound(id, volume, looped)
+	if not id or id == "" then return nil end
+	local fullId = "rbxassetid://" .. id
+	if not soundCache[id] then
+		local s = Instance.new("Sound")
+		s.SoundId = fullId; s.Volume = volume or 1
+		s.Looped  = looped or false; s.RollOffMaxDistance = 0
+		s.Parent  = SoundGroup
+		soundCache[id] = s
+	end
+	return soundCache[id]
+end
+
+local sfxEnabled   = true
+local musicEnabled = true
+local MUSIC_VOL    = SoundConfig.Volume and SoundConfig.Volume.music or 0.4
+
+local function Vol(category)
+	return SoundConfig.Volume and SoundConfig.Volume[category] or 0.5
+end
+
+local function Play(id, volume)
+	if not sfxEnabled then return end
+	if not id or id == "" then return end
+	local s = GetOrCreateSound(id, volume, false)
+	if s then s:Play() end
+end
+
+-- Expose for other LocalScripts (PrestigeController, PortalController, etc.)
+shared.PlayUISound = function(id, volume)
+	Play(id, volume or Vol("ui"))
+end
+
+---------------------------------------------------------------
+-- Hold loop
+---------------------------------------------------------------
+local loopingSound = nil
+
+local function PlayLoop(id, volume)
+	if not sfxEnabled then return end
+	if not id or id == "" then return end
+	local s = GetOrCreateSound(id, volume, true)
+	if s and not s.IsPlaying then s:Play(); loopingSound = s end
+end
+
+local function StopLoop()
+	if loopingSound and loopingSound.IsPlaying then loopingSound:Stop() end
+	loopingSound = nil
+end
+
+---------------------------------------------------------------
+-- Area music
+---------------------------------------------------------------
+local currentMusicSound = nil
+
+local function PlayAreaMusic(areaIndex)
+	local id = SoundConfig.AreaMusic and SoundConfig.AreaMusic[areaIndex]
+
+	if not id or id == "" then
+		if currentMusicSound and currentMusicSound.IsPlaying then
+			local old = currentMusicSound; currentMusicSound = nil
+			TweenService:Create(old, TweenInfo.new(1.5), { Volume = 0 }):Play()
+			task.delay(1.6, function() old:Stop() end)
+		end
+		return
+	end
+
+	local fullId = "rbxassetid://" .. id
+	if currentMusicSound and currentMusicSound.SoundId == fullId
+		and currentMusicSound.IsPlaying then return end
+
+	if currentMusicSound and currentMusicSound.IsPlaying then
+		local old = currentMusicSound; currentMusicSound = nil
+		TweenService:Create(old, TweenInfo.new(1.5), { Volume = 0 }):Play()
+		task.delay(1.6, function() old:Stop() end)
+	end
+
+	task.delay(0.5, function()
+		local s = GetOrCreateSound(id, 0, true)
+		if not s then return end
+		s:Play(); currentMusicSound = s
+		local targetVol = musicEnabled and MUSIC_VOL or 0
+		TweenService:Create(s, TweenInfo.new(1.5), { Volume = targetVol }):Play()
+	end)
+end
+
+---------------------------------------------------------------
+-- Settings
+---------------------------------------------------------------
+task.spawn(function()
+	local SettingsChanged = ReplicatedStorage:WaitForChild("SettingsChanged", 20)
+	if not SettingsChanged then
+		warn("[SoundManager] SettingsChanged not found — sound toggles won't work")
+		return
+	end
+
+	SettingsChanged.Event:Connect(function(settingKey, isOn)
+		if settingKey == "sfx" then
+			sfxEnabled = isOn
+			SoundGroup.Volume = isOn and 1 or 0
+			if not isOn then StopLoop() end
+		elseif settingKey == "music" then
+			musicEnabled = isOn
+			if currentMusicSound then
+				if currentMusicSound.IsPlaying then
+					TweenService:Create(currentMusicSound,
+						TweenInfo.new(0.4), { Volume = isOn and MUSIC_VOL or 0 }):Play()
+				elseif isOn then
+					currentMusicSound:Play()
+					TweenService:Create(currentMusicSound,
+						TweenInfo.new(1.0), { Volume = MUSIC_VOL }):Play()
+				end
+			end
+		end
+	end)
+end)
+
+---------------------------------------------------------------
+-- UI button hooks (main HUD buttons)
+---------------------------------------------------------------
+task.spawn(function()
+	local mainHUD = playerGui:WaitForChild("MainHUD")
+
+	local function HookOpen(name)
+		local btn = mainHUD:WaitForChild(name, 10)
+		if btn then
+			btn.MouseButton1Down:Connect(function()
+				Play(SoundConfig.UIOpen, Vol("ui"))
+			end)
+		end
+	end
+
+	HookOpen("ShopButton")
+	HookOpen("StatsButton")
+	HookOpen("PrestigeButton")
+	HookOpen("SettingsButton")
+	HookOpen("BoostsButton")
+end)
+
+---------------------------------------------------------------
+-- PrestigeReady BindableEvent
+---------------------------------------------------------------
+task.spawn(function()
+	local pr = ReplicatedStorage:WaitForChild("PrestigeReady", 30)
+	if not pr then return end
+	pr.Event:Connect(function()
+		Play(SoundConfig.PrestigeReady, Vol("ui"))
+	end)
+end)
+
+---------------------------------------------------------------
+-- Game event sounds
+---------------------------------------------------------------
+local RemoteEvents = ReplicatedStorage:WaitForChild("RemoteEvents")
+
+local AuraSpawned = RemoteEvents:WaitForChild("AuraSpawned")
+AuraSpawned.OnClientEvent:Connect(function(info)
+	if info.tier == "Legendary" then
+		Play(SoundConfig.LegendarySpawn, Vol("mutation"))
+	else
+		Play(SoundConfig.Click, Vol("interaction"))
+	end
+end)
+
+local CubeMutated = RemoteEvents:WaitForChild("CubeMutated")
+CubeMutated.OnClientEvent:Connect(function(info)
+	if info.mutationType == "tierUpgrade" then
+		Play(info.tierName == "Legendary"
+			and SoundConfig.LegendarySpawn or SoundConfig.TierUpgrade, Vol("mutation"))
+	elseif info.mutationType == "valueBonus" then
+		Play(SoundConfig.MutationBonus, Vol("mutation"))
+	end
+end)
+
+local UpdateMultiplier = ReplicatedStorage:WaitForChild("UpdateMultiplier")
+UpdateMultiplier.Event:Connect(function(mult)
+	if mult > 1 then PlayLoop(SoundConfig.HoldLoop, Vol("interaction"))
+	else StopLoop() end
+end)
+
+local ForceStopHold = RemoteEvents:WaitForChild("ForceStopHold")
+ForceStopHold.OnClientEvent:Connect(function()
+	StopLoop()
+	Play(SoundConfig.HatcheryEmpty, Vol("interaction"))
+end)
+
+local HabitatFull = RemoteEvents:WaitForChild("HabitatFull")
+HabitatFull.OnClientEvent:Connect(function()
+	StopLoop()
+	Play(SoundConfig.HabitatFull, Vol("interaction"))
+end)
+
+local ShipAuras = RemoteEvents:WaitForChild("ShipAuras")
+ShipAuras.OnClientEvent:Connect(function(info)
+	if info and info.collected then Play(SoundConfig.PlatformArrive, Vol("shipping")) end
+end)
+
+local UpgradeUpdated = RemoteEvents:WaitForChild("UpgradeUpdated")
+UpgradeUpdated.OnClientEvent:Connect(function(info)
+	if info.type == "purchased" then Play(SoundConfig.Purchase, Vol("mutation")) end
+end)
+
+local PrestigeComplete = RemoteEvents:WaitForChild("PrestigeComplete")
+PrestigeComplete.OnClientEvent:Connect(function(info)
+	StopLoop()
+	if info.isPortalEntry then
+		Play(SoundConfig.PortalEnter, Vol("portal"))
+	else
+		Play(SoundConfig.PrestigeComplete, Vol("prestige"))
+	end
+end)
+
+local AreaUnlocked = RemoteEvents:WaitForChild("AreaUnlocked")
+AreaUnlocked.OnClientEvent:Connect(function()
+	Play(SoundConfig.PortalOpen, Vol("portal"))
+end)
+
+local AreaChanged = RemoteEvents:WaitForChild("AreaChanged")
+AreaChanged.OnClientEvent:Connect(function(info)
+	Play(SoundConfig.PortalEnter, Vol("portal"))
+	PlayAreaMusic(info.newArea or 1)
+end)
+
+---------------------------------------------------------------
+-- MENU GATE: Only the initial area music waits for the menu.
+-- Everything else (SFX, event sounds, shared.PlayUISound) is live.
+---------------------------------------------------------------
+local AreaUpdated = RemoteEvents:WaitForChild("AreaUpdated")
+local joinMusicStarted = false
+AreaUpdated.OnClientEvent:Connect(function(info)
+	if not joinMusicStarted then
+		joinMusicStarted = true
+		task.spawn(function()
+			local _menuGate = ReplicatedStorage:WaitForChild("MenuDismissed")
+			if not _menuGate:GetAttribute("Fired") then _menuGate.Event:Wait() end
+			PlayAreaMusic(info.currentArea or 1)
+		end)
+	end
+end)
