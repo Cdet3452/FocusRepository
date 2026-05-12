@@ -1369,3 +1369,179 @@ forceClose.Parent = ReplicatedStorage
 forceClose.Event:Connect(function()
 	if panelOpen then ClosePanel() end
 end)
+
+-- BoostConfig
+-- Location: ReplicatedStorage > Modules > BoostConfig
+
+local BoostConfig = {}
+
+BoostConfig.Boosts = {
+
+	-- ══════════ PRODUCTION ══════════
+
+	AuraRush = {
+		id          = "AuraRush",
+		displayName = "Aura Rush",
+		description = "Double spawn speed",
+		icon        = "rbxassetid://14916846070", 
+		duration    = 30,
+		cost        = 5,
+		multiplier  = 2.0,
+		effectType  = "spawnSpeed",
+		stackable   = true,
+		maxStack    = 3,
+		category    = "Production",
+		color       = Color3.fromRGB(60, 160, 255),
+	},
+
+	HatcheryRefill = {
+		id          = "HatcheryRefill",
+		displayName = "Fast Refill",
+		description = "2x hatchery refill speed",
+		icon        = "rbxassetid://14916846070",
+		duration    = 60,
+		cost        = 8,
+		multiplier  = 2.0,
+		effectType  = "hatcheryRefill",
+		stackable   = true,
+		maxStack    = 3,
+		category    = "Production",
+		color       = Color3.fromRGB(80, 220, 120),
+	},
+
+	InstaHatchery = {
+		id          = "InstaHatchery",
+		displayName = "Insta Refill",
+		description = "Instantly refill hatchery to max",
+		icon        = "rbxassetid://14916846070",
+		duration    = 0,   -- one-shot
+		cost        = 12,
+		multiplier  = 1,
+		effectType  = "instaRefill",
+		stackable   = false,
+		maxStack    = 1,
+		category    = "Production",
+		color       = Color3.fromRGB(0, 255, 180),
+	},
+
+	-- ══════════ VALUE ══════════
+
+	SpawnBoost = {
+		id          = "SpawnBoost",
+		displayName = "Value Boost",
+		description = "Double cube value",
+		icon        = "rbxassetid://14916846070",
+		duration    = 45,
+		cost        = 8,
+		multiplier  = 2.0,
+		effectType  = "cubeValue",
+		stackable   = true,
+		maxStack    = 3,
+		category    = "Value",
+		color       = Color3.fromRGB(255, 160, 40),
+	},
+
+	SoulBoost = {
+		id          = "SoulBoost",
+		displayName = "Soul Boost",
+		description = "2x Soul Auras on prestige",
+		icon        = "rbxassetid://14916846070",
+		duration    = 120,
+		cost        = 15,
+		multiplier  = 2.0,
+		effectType  = "soulMult",
+		stackable   = false,
+		maxStack    = 1,
+		category    = "Value",
+		color       = Color3.fromRGB(180, 60, 255),
+	},
+
+	CashCheck = {
+		id          = "CashCheck",
+		displayName = "Cash Check",
+		description = "Get 5x your farm evaluation as cash!",
+		icon        = "rbxassetid://14916846070",
+		duration    = 0,   -- one-shot
+		cost        = 20,
+		multiplier  = 5,   
+		effectType  = "cashCheck",
+		stackable   = false,
+		maxStack    = 1,
+		category    = "Value",
+		color       = Color3.fromRGB(80, 255, 80),
+	},
+
+	-- ══════════ PREMIUM — BOOST MULTIPLIERS ══════════
+
+	BoostBeacon2x = {
+		id          = "BoostBeacon2x",
+		displayName = "Boost Beacon x2",
+		description = "Double all active boost effects!",
+		icon        = "rbxassetid://14916846070",
+		duration    = 30,
+		cost        = 25,
+		multiplier  = 2,
+		effectType  = "boostMultiplier",
+		stackable   = false,
+		maxStack    = 1,
+		category    = "Premium",
+		color       = Color3.fromRGB(255, 100, 100),
+	},
+
+	BoostBeacon10x = {
+		id          = "BoostBeacon10x",
+		displayName = "Boost Beacon x10",
+		description = "10x all active boost effects!",
+		icon        = "rbxassetid://14916846070",
+		duration    = 15,
+		cost        = 100,
+		multiplier  = 10,
+		effectType  = "boostMultiplier",
+		stackable   = false,
+		maxStack    = 1,
+		category    = "Premium",
+		color       = Color3.fromRGB(255, 60, 60),
+	},
+
+	BoostBeacon50x = {
+		id          = "BoostBeacon50x",
+		displayName = "Boost Beacon x50",
+		description = "50x all active boost effects!! Insane!",
+		icon        = "rbxassetid://14916846070",
+		duration    = 10,
+		cost        = 500,
+		multiplier  = 50,
+		effectType  = "boostMultiplier",
+		stackable   = false,
+		maxStack    = 1,
+		category    = "Premium",
+		color       = Color3.fromRGB(255, 30, 30),
+	},
+}
+
+BoostConfig.ShopOrder = {
+	"AuraRush", "HatcheryRefill", "InstaHatchery",
+	"SpawnBoost", "SoulBoost", "CashCheck",
+	"BoostBeacon2x", "BoostBeacon10x", "BoostBeacon50x",
+}
+
+BoostConfig.Categories = { "Production", "Value", "Premium" }
+
+BoostConfig.CategoryColors = {
+	Production = Color3.fromRGB(60, 180, 255),
+	Value      = Color3.fromRGB(255, 200, 60),
+	Premium    = Color3.fromRGB(255, 60, 80),
+}
+
+function BoostConfig.Get(id) return BoostConfig.Boosts[id] end
+
+function BoostConfig.GetByCategory(category)
+	local result = {}
+	for _, id in ipairs(BoostConfig.ShopOrder) do
+		local b = BoostConfig.Boosts[id]
+		if b and b.category == category then table.insert(result, b) end
+	end
+	return result
+end
+
+return BoostConfig
