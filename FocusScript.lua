@@ -1,692 +1,785 @@
--- PortalController
--- Location: StarterPlayer > StarterPlayerScripts > PortalController
+-- TutorialConfig
+-- Location: ReplicatedStorage > Modules > TutorialConfig
 
-local Players           = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService        = game:GetService("RunService")
-local TweenService      = game:GetService("TweenService")
-local CollectionService = game:GetService("CollectionService")
+local TutorialConfig = {}
 
-local AreaRegistry = require(ReplicatedStorage.Modules.AreaRegistry)
-local SoundConfig  = require(ReplicatedStorage.Modules.SoundConfig)
-local C            = require(ReplicatedStorage.Modules.UIConfig)
-local Formatter    = require(ReplicatedStorage.Modules.NumberFormatter) 
-local UITheme      = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("UITheme"))
-local T            = UITheme.Get("Custom")
+TutorialConfig.TutorialEndArea = 5
 
-local AreaUpdated      = ReplicatedStorage.RemoteEvents:WaitForChild("AreaUpdated")
-local AreaUnlocked     = ReplicatedStorage.RemoteEvents:WaitForChild("AreaUnlocked")
-local EnterPortal      = ReplicatedStorage.RemoteEvents:WaitForChild("EnterPortal")
-local TravelToArea     = ReplicatedStorage.RemoteEvents:WaitForChild("TravelToArea")
-local AreaChanged      = ReplicatedStorage.RemoteEvents:WaitForChild("AreaChanged")
-local PrestigeComplete = ReplicatedStorage.RemoteEvents:WaitForChild("PrestigeComplete")
+-- The Ghost Hand / Pointer asset
+TutorialConfig.PointerImage = "rbxassetid://14914009728"
+TutorialConfig.PointerSize = UDim2.new(0, 75, 0, 75)
 
--- ✨ BRIDGENET2 UPGRADE
-local BridgeNet2      = require(ReplicatedStorage.Modules:WaitForChild("BridgeNet2"))
-local UpdateHUDBridge = BridgeNet2.ClientBridge("UpdateHUD")
+-- Default Styling
+TutorialConfig.DefaultColor = Color3.fromRGB(100, 200, 255)
+TutorialConfig.DefaultIcon  = "rbxassetid://14914018910"
 
-local player    = Players.LocalPlayer
-local playerGui = player:WaitForChild("PlayerGui")
-local mainHUD   = playerGui:WaitForChild("MainHUD")
+-- THE FSM SEQUENCE
+TutorialConfig.Steps = {
 
-local PositionPart = workspace:WaitForChild("AuraHolder"):WaitForChild("Position")
+	-- ✨ STEP 1: Welcome & First Click
+	[1] = {
+		id           = "a1_welcome_click",
+		action       = "Action_ClickRedButton",
+		targetTag    = "Tutorial_ClickButton",
 
-local promptAdded   = false
-local currentArea   = 1
-local portalReady   = false
-local panelOpen     = false
-local browseIndex   = 1
-local liveFarmEval  = 0
-local unlockedAreas = { 1 }
-local MAX_AREA      = AreaRegistry.GetMaxArea()
+		bannerTitle  = "Welcome to Aura Inc!",
+		bannerBody   = "Spam Click the Red Button below to produce your first Auras.",
 
-local PW = C.Panels.AreaTravelW
-local PH = C.Panels.AreaTravelH
-local PR = C.Panels.CornerRadius
-local BW = C.Banners.AreaBannerW
-local BY = C.Banners.AreaBannerY
-local BR = C.Banners.CornerRadius
-
-local function PlayUI(id)
-	if shared.PlayUISound then shared.PlayUISound(id) end
-end
-
-local function IsUnlocked(idx)
-	for _, v in ipairs(unlockedAreas) do if v == idx then return true end end
-	return false
-end
-
-local AreaAssets = ReplicatedStorage:WaitForChild("AreaAssets")
-
--- ✨ FLIPBOOK ANIMATION SYSTEM
-local flipbookConnection = nil
-local currentFlipbook = nil
-local flipbookFrame = 1
-local flipbookTime = 0
-
-local function StopFlipbook()
-	if flipbookConnection then
-		flipbookConnection:Disconnect()
-		flipbookConnection = nil
-	end
-	currentFlipbook = nil
-end
-
-local function StartFlipbook(areaIdx, AreaIcon)
-	StopFlipbook()
-
-	local flipbookData = AreaRegistry.GetFlipbook(areaIdx)
-	if not flipbookData then return end
-
-	currentFlipbook = flipbookData
-	flipbookFrame = 1
-	flipbookTime = 0
-
-	if not AreaIcon then return end
-
-	AreaIcon.Image = flipbookData.image
-	AreaIcon.ImageRectSize = Vector2.new(flipbookData.frameW, flipbookData.frameH)
-	AreaIcon.ImageRectOffset = Vector2.new(0, 0)
-
-	flipbookConnection = RunService.RenderStepped:Connect(function(dt)
-		flipbookTime += dt
-		local frameTime = 1 / flipbookData.fps
-
-		if flipbookTime >= frameTime then
-			flipbookTime = flipbookTime % frameTime
-			flipbookFrame = flipbookFrame + 1
-
-			if flipbookFrame > flipbookData.frames then
-				flipbookFrame = 1
-			end
-
-			local col = (flipbookFrame - 1) % flipbookData.columns
-			local row = math.floor((flipbookFrame - 1) / flipbookData.columns)
-			local offsetX = col * flipbookData.frameW
-			local offsetY = row * flipbookData.frameH
-
-			AreaIcon.ImageRectOffset = Vector2.new(offsetX, offsetY)
-		end
-	end)
-end
-
--- ✨ UI Setup (AreaPanel)
-local AreaPanel = Instance.new("Frame")
-AreaPanel.Name="AreaTravelPanel"; AreaPanel.Size = UDim2.new(0.88, 0, 0.82, 0)
-AreaPanel.Position = UDim2.new(0.5, 0, 0.5, 0)
-AreaPanel.AnchorPoint = Vector2.new(0.5, 0.5)
-AreaPanel.BackgroundColor3=T.panelBG; AreaPanel.BorderSizePixel=0
-AreaPanel.Visible=false; AreaPanel.ZIndex=30; AreaPanel.ClipsDescendants=true
-AreaPanel.Parent=mainHUD
-CollectionService:AddTag(AreaPanel, "Tutorial_TravelPanel") -- Tutorial Tracker Tag
-Instance.new("UICorner",AreaPanel).CornerRadius=UDim.new(0,PR)
-
-local sizeConstraint = Instance.new("UISizeConstraint")
-sizeConstraint.MaxSize = Vector2.new(PW, PH) 
-sizeConstraint.Parent = AreaPanel
-
-local panelStroke=Instance.new("UIStroke"); panelStroke.Color=T.panelStroke; panelStroke.Thickness=2; panelStroke.Parent=AreaPanel
-
-local HeaderBar=Instance.new("Frame"); HeaderBar.Size=UDim2.new(1,0,0,46); HeaderBar.BackgroundColor3=T.headerBG
-HeaderBar.BorderSizePixel=0; HeaderBar.ZIndex=31; HeaderBar.Parent=AreaPanel
-Instance.new("UICorner",HeaderBar).CornerRadius=UDim.new(0,PR)
-local HeaderLabel=Instance.new("TextLabel"); HeaderLabel.Size=UDim2.new(1,-50,1,0); HeaderLabel.Position=UDim2.new(0,16,0,0)
-HeaderLabel.BackgroundTransparency=1; HeaderLabel.Text="AREA TRAVEL"; HeaderLabel.TextColor3=T.headerText
-HeaderLabel.TextScaled=true; HeaderLabel.Font=T.font; HeaderLabel.TextXAlignment=Enum.TextXAlignment.Left
-HeaderLabel.ZIndex=32; HeaderLabel.Parent=HeaderBar
-local CloseBtn=Instance.new("TextButton"); CloseBtn.Size=UDim2.new(0,32,0,32); CloseBtn.Position=UDim2.new(1,-40,0.5,-16)
-CloseBtn.BackgroundColor3=T.buttonRed; CloseBtn.BorderSizePixel=0; CloseBtn.Text="X"; CloseBtn.TextColor3=T.bodyText
-CloseBtn.TextScaled=true; CloseBtn.Font=T.font; CloseBtn.ZIndex=33; CloseBtn.Parent=HeaderBar
-CollectionService:AddTag(CloseBtn, "Tutorial_TravelCloseBtn") -- Tutorial Tracker Tag
-Instance.new("UICorner",CloseBtn).CornerRadius=UDim.new(0,6)
-
-local ScrollContainer = Instance.new("ScrollingFrame")
-ScrollContainer.Name = "ScrollContainer"
-ScrollContainer.Size = UDim2.new(1, 0, 1, -46) 
-ScrollContainer.Position = UDim2.new(0, 0, 0, 46) 
-ScrollContainer.BackgroundTransparency = 1
-ScrollContainer.BorderSizePixel = 0
-ScrollContainer.CanvasSize = UDim2.new(0, 0, 0, 0)
-ScrollContainer.AutomaticCanvasSize = Enum.AutomaticSize.Y 
-ScrollContainer.ScrollBarThickness = 6
-ScrollContainer.Parent = AreaPanel
-
-local listLayout = Instance.new("UIListLayout")
-listLayout.SortOrder = Enum.SortOrder.LayoutOrder
-listLayout.Padding = UDim.new(0, 10) 
-listLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center 
-listLayout.Parent = ScrollContainer
-
-local topPadding = Instance.new("UIPadding")
-topPadding.PaddingTop = UDim.new(0, 10)
-topPadding.PaddingBottom = UDim.new(0, 10)
-topPadding.Parent = ScrollContainer
-
-local GoalSection=Instance.new("Frame"); GoalSection.Size=UDim2.new(1,-24,0,90)
-GoalSection.BackgroundColor3=T.cardBG; GoalSection.BorderSizePixel=0; GoalSection.ZIndex=31; GoalSection.Parent=ScrollContainer
-Instance.new("UICorner",GoalSection).CornerRadius=UDim.new(0,8)
-local FarmEvalTitle=Instance.new("TextLabel"); FarmEvalTitle.Size=UDim2.new(1,-12,0,16); FarmEvalTitle.Position=UDim2.new(0,12,0,6)
-FarmEvalTitle.BackgroundTransparency=1; FarmEvalTitle.Text="FARM EVALUATION"; FarmEvalTitle.TextColor3=T.subText
-FarmEvalTitle.TextScaled=true; FarmEvalTitle.Font=T.font; FarmEvalTitle.TextXAlignment=Enum.TextXAlignment.Left
-FarmEvalTitle.ZIndex=32; FarmEvalTitle.Parent=GoalSection
-local FarmEvalNumber=Instance.new("TextLabel"); FarmEvalNumber.Name="FarmEvalNumber"
-FarmEvalNumber.Size=UDim2.new(1,-12,0,28); FarmEvalNumber.Position=UDim2.new(0,12,0,22)
-FarmEvalNumber.BackgroundTransparency=1; FarmEvalNumber.Text="$0"; FarmEvalNumber.TextColor3=T.accentGreen
-FarmEvalNumber.TextScaled=true; FarmEvalNumber.Font=T.font; FarmEvalNumber.TextXAlignment=Enum.TextXAlignment.Left
-FarmEvalNumber.ZIndex=32; FarmEvalNumber.Parent=GoalSection
-local ProgressBG=Instance.new("Frame"); ProgressBG.Size=UDim2.new(1,-24,0,8); ProgressBG.Position=UDim2.new(0,12,0,54)
-ProgressBG.BackgroundColor3=Color3.fromRGB(40,50,70); ProgressBG.BorderSizePixel=0; ProgressBG.ZIndex=32; ProgressBG.Parent=GoalSection
-Instance.new("UICorner",ProgressBG).CornerRadius=UDim.new(0,4)
-local ProgressFill=Instance.new("Frame"); ProgressFill.Name="ProgressFill"; ProgressFill.Size=UDim2.new(0,0,1,0)
-ProgressFill.BackgroundColor3=T.accentGreen; ProgressFill.BorderSizePixel=0; ProgressFill.ZIndex=33; ProgressFill.Parent=ProgressBG
-Instance.new("UICorner",ProgressFill).CornerRadius=UDim.new(0,4)
-local ProgressLabel=Instance.new("TextLabel"); ProgressLabel.Name="ProgressLabel"
-ProgressLabel.Size=UDim2.new(1,-12,0,14); ProgressLabel.Position=UDim2.new(0,12,0,66)
-ProgressLabel.BackgroundTransparency=1; ProgressLabel.Text=""; ProgressLabel.TextColor3=T.subText
-ProgressLabel.TextScaled=true; ProgressLabel.Font=T.fontBody; ProgressLabel.TextXAlignment=Enum.TextXAlignment.Left
-ProgressLabel.ZIndex=32; ProgressLabel.Parent=GoalSection
-
-local AreaBrowser=Instance.new("Frame"); AreaBrowser.Size=UDim2.new(1,-24,0,260)
-AreaBrowser.BackgroundColor3=T.cardBG; AreaBrowser.BorderSizePixel=0; AreaBrowser.ZIndex=31; AreaBrowser.Parent=ScrollContainer
-Instance.new("UICorner",AreaBrowser).CornerRadius=UDim.new(0,8)
-local BrowseAreaName=Instance.new("TextLabel"); BrowseAreaName.Size=UDim2.new(0.6, 0, 0, 24)
-BrowseAreaName.AnchorPoint=Vector2.new(0.5, 0)
-BrowseAreaName.Position=UDim2.new(0.5, 0, 0, 8)
-BrowseAreaName.BackgroundTransparency=1; BrowseAreaName.Text="Starter Area"; BrowseAreaName.TextColor3=T.accentBlue
-BrowseAreaName.TextScaled=true; BrowseAreaName.Font=T.font; BrowseAreaName.TextXAlignment=Enum.TextXAlignment.Center
-BrowseAreaName.ZIndex=32; BrowseAreaName.Parent=AreaBrowser
-local AreaIndexLabel=Instance.new("TextLabel"); AreaIndexLabel.Size=UDim2.new(0,60,0,20); AreaIndexLabel.Position=UDim2.new(1,-66,0,10)
-AreaIndexLabel.BackgroundTransparency=1; AreaIndexLabel.Text="1/5"; AreaIndexLabel.TextColor3=T.subText
-AreaIndexLabel.TextScaled=true; AreaIndexLabel.Font=T.fontBody; AreaIndexLabel.TextXAlignment=Enum.TextXAlignment.Right
-AreaIndexLabel.ZIndex=32; AreaIndexLabel.Parent=AreaBrowser
-local BrowseAreaMult=Instance.new("TextLabel"); BrowseAreaMult.Size=UDim2.new(1,-20,0,18); BrowseAreaMult.Position=UDim2.new(0,10,0,34)
-BrowseAreaMult.BackgroundTransparency=1; BrowseAreaMult.Text="Cube Value: 1.0x base"; BrowseAreaMult.TextColor3=T.accentGold
-BrowseAreaMult.TextScaled=true; BrowseAreaMult.Font=T.fontBody; BrowseAreaMult.TextXAlignment=Enum.TextXAlignment.Center
-BrowseAreaMult.ZIndex=32; BrowseAreaMult.Parent=AreaBrowser
-local LeftArrow=Instance.new("TextButton"); LeftArrow.Size=UDim2.new(0,36,0,36); LeftArrow.Position=UDim2.new(0,8,0,62)
-LeftArrow.BackgroundColor3=T.headerBG; LeftArrow.BorderSizePixel=0; LeftArrow.Text="<"; LeftArrow.TextColor3=T.bodyText
-LeftArrow.TextScaled=true; LeftArrow.Font=T.font; LeftArrow.ZIndex=33; LeftArrow.Parent=AreaBrowser
-CollectionService:AddTag(LeftArrow, "Tutorial_LeftArrow") -- Tutorial Tracker Tag
-Instance.new("UICorner",LeftArrow).CornerRadius=UDim.new(0,18)
-local RightArrow=Instance.new("TextButton"); RightArrow.Size=UDim2.new(0,36,0,36); RightArrow.Position=UDim2.new(1,-44,0,62)
-RightArrow.BackgroundColor3=T.headerBG; RightArrow.BorderSizePixel=0; RightArrow.Text=">"; RightArrow.TextColor3=T.bodyText
-RightArrow.TextScaled=true; RightArrow.Font=T.font; RightArrow.ZIndex=33; RightArrow.Parent=AreaBrowser
-CollectionService:AddTag(RightArrow, "Tutorial_RightArrow") -- Tutorial Tracker Tag
-Instance.new("UICorner",RightArrow).CornerRadius=UDim.new(0,18)
-local AreaIcon = Instance.new("ImageLabel")
-AreaIcon.Name = "AreaIcon" 
-AreaIcon.AnchorPoint = Vector2.new(0.5, 0)
-AreaIcon.Size = UDim2.new(0, 110, 0, 110)
-AreaIcon.Position = UDim2.new(0.5, 0, 0, 54)
-AreaIcon.BackgroundTransparency = 1
-AreaIcon.BorderSizePixel = 0
-AreaIcon.ZIndex = 33
-AreaIcon.Image = "" 
-AreaIcon.Parent = AreaBrowser
-local BrowseStatus=Instance.new("TextLabel"); BrowseStatus.Size=UDim2.new(1,-24,0,20); BrowseStatus.Position=UDim2.new(0,12,0,172)
-BrowseStatus.BackgroundTransparency=1; BrowseStatus.Text="CURRENT AREA"; BrowseStatus.TextColor3=T.subText
-BrowseStatus.TextScaled=true; BrowseStatus.Font=T.font; BrowseStatus.TextXAlignment=Enum.TextXAlignment.Center
-BrowseStatus.ZIndex=32; BrowseStatus.Parent=AreaBrowser
-local BrowseProgress=Instance.new("TextLabel"); BrowseProgress.Size=UDim2.new(1,-24,0,28); BrowseProgress.Position=UDim2.new(0,12,0,194)
-BrowseProgress.BackgroundTransparency=1; BrowseProgress.Text=""; BrowseProgress.TextColor3=T.subText
-BrowseProgress.TextScaled=true; BrowseProgress.Font=T.fontBody; BrowseProgress.TextWrapped=true
-BrowseProgress.TextXAlignment=Enum.TextXAlignment.Center; BrowseProgress.ZIndex=32; BrowseProgress.Parent=AreaBrowser
-local TravelBtn=Instance.new("TextButton"); TravelBtn.Size=UDim2.new(1,-24,0,38); TravelBtn.Position=UDim2.new(0,12,0,220)
-TravelBtn.BackgroundColor3=T.buttonGreen; TravelBtn.BorderSizePixel=0; TravelBtn.Text="TRAVEL"; TravelBtn.TextColor3=T.bodyText
-TravelBtn.TextScaled=true; TravelBtn.Font=T.font; TravelBtn.Visible=false; TravelBtn.ZIndex=33; TravelBtn.Parent=AreaBrowser
-CollectionService:AddTag(TravelBtn, "Tutorial_TravelConfirm") -- Tutorial Tracker Tag
-Instance.new("UICorner",TravelBtn).CornerRadius=UDim.new(0,8)
-
-local function AddButtonJuice(btn)
-	local scale = btn:FindFirstChildOfClass("UIScale") or Instance.new("UIScale", btn)
-	btn.MouseEnter:Connect(function() TweenService:Create(scale, TweenInfo.new(0.15, Enum.EasingStyle.Sine), {Scale = 1.08}):Play() end)
-	btn.MouseLeave:Connect(function() TweenService:Create(scale, TweenInfo.new(0.15, Enum.EasingStyle.Sine), {Scale = 1}):Play() end)
-	btn.MouseButton1Down:Connect(function() TweenService:Create(scale, TweenInfo.new(0.1, Enum.EasingStyle.Sine), {Scale = 0.9}):Play() end)
-	btn.MouseButton1Up:Connect(function() TweenService:Create(scale, TweenInfo.new(0.2, Enum.EasingStyle.Bounce), {Scale = 1.08}):Play() end)
-end
-
-AddButtonJuice(LeftArrow)
-AddButtonJuice(RightArrow)
-AddButtonJuice(TravelBtn)
-AddButtonJuice(CloseBtn)
-
-TravelBtn.MouseButton1Down:Connect(function()
-	-- LOGIC GATING
-	if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_TravelConfirm") then return end
-	if browseIndex == currentArea then return end
-
-	TravelToArea:FireServer(browseIndex)
-
-	if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
-end)
-
-local function UpdateGoalSection()
-	FarmEvalNumber.Text = "$" .. Formatter.Format(liveFarmEval)
-	local nextGoalArea, nextGoalThreshold = nil, nil
-	for i = currentArea + 1, MAX_AREA do
-		local area = AreaRegistry.Get(i)
-		if area and liveFarmEval < (area.threshold or 0) then
-			nextGoalArea = i; nextGoalThreshold = area.threshold; break
-		end
-	end
-	if nextGoalThreshold and nextGoalThreshold > 0 then
-		local pct = math.clamp(liveFarmEval / nextGoalThreshold, 0, 1)
-		TweenService:Create(ProgressFill, TweenInfo.new(0.3), { Size = UDim2.new(pct,0,1,0) }):Play()
-		ProgressFill.BackgroundColor3 = pct >= 1 and Color3.fromRGB(80,255,160) or T.accentGreen
-		local needed = math.max(0, nextGoalThreshold - liveFarmEval)
-		ProgressLabel.Text = needed <= 0
-			and "New areas available! Browse below."
-			or "$" .. Formatter.Format(needed) .. " to unlock " .. AreaRegistry.GetName(nextGoalArea)
-		ProgressLabel.TextColor3 = needed <= 0 and T.accentTeal or T.subText
-	elseif portalReady then
-		ProgressFill.Size = UDim2.new(1,0,1,0); ProgressFill.BackgroundColor3 = T.accentTeal
-		ProgressLabel.Text = "Areas available! Pick a destination."; ProgressLabel.TextColor3 = T.accentTeal
-	elseif currentArea >= MAX_AREA then
-		ProgressFill.Size = UDim2.new(1,0,1,0); ProgressFill.BackgroundColor3 = T.accentGold
-		ProgressLabel.Text = "Maximum area reached."; ProgressLabel.TextColor3 = T.accentGold
-	end
-end
-
-local function RefreshBrowser()
-	local idx = browseIndex
-	local areaData = AreaRegistry.Get(idx)	
-	if not areaData then return end
-	AreaIndexLabel.Text = idx .. " / " .. MAX_AREA
-	LeftArrow.Visible  = idx > 1
-	RightArrow.Visible = AreaRegistry.Get(idx+1) ~= nil
-
-	local highestUnlocked = 1
-	for _, v in ipairs(unlockedAreas) do
-		if v > highestUnlocked then highestUnlocked = v end
-	end
-
-	local unlockReq = areaData.threshold or 0
-	local discReq = areaData.discoveryThreshold or (unlockReq * 0.25) 
-
-	if idx <= highestUnlocked then
-		local flipbookData = AreaRegistry.GetFlipbook(idx)
-		if flipbookData then
-			StartFlipbook(idx, AreaIcon)
-			AreaIcon.ImageColor3 = Color3.fromRGB(255, 255, 255)
-		else
-			StopFlipbook()
-			AreaIcon.Image = areaData.icon or areaData.auraPreviewImage or ""
-			AreaIcon.ImageRectSize = Vector2.new(0, 0)
-			AreaIcon.ImageRectOffset = Vector2.new(0, 0)
-			AreaIcon.ImageColor3 = Color3.fromRGB(255, 255, 255)
-		end
-		BrowseAreaName.Text = AreaRegistry.GetName(idx)
-		BrowseAreaMult.Text = "Cube Value: " .. string.format("%.1f", AreaRegistry.GetMultiplier(idx)) .. "x base"
-
-		if idx == currentArea then
-			BrowseStatus.Text = "CURRENT AREA"; BrowseStatus.TextColor3 = T.accentGreen
-			BrowseProgress.Text = "This is your active farm."
-			BrowseProgress.TextColor3 = T.accentTeal
-			TravelBtn.Visible = false
-		else
-			BrowseStatus.Text = "PREVIOUS AREA"; BrowseStatus.TextColor3 = T.accentGreen
-			BrowseProgress.Text = "Travel back for free (no reset)."
-			BrowseProgress.TextColor3 = T.accentGreen
-			TravelBtn.Visible = true; TravelBtn.Text = "Travel"
-			TravelBtn.BackgroundColor3 = Color3.fromRGB(60,100,60)
-		end
-
-	elseif idx == highestUnlocked + 1 then
-		if liveFarmEval >= unlockReq then
-			local flipbookData = AreaRegistry.GetFlipbook(idx)
-			if flipbookData then
-				StartFlipbook(idx, AreaIcon)
-				AreaIcon.ImageColor3 = Color3.fromRGB(255, 255, 255)
-			else
-				StopFlipbook()
-				AreaIcon.Image = areaData.icon or areaData.auraPreviewImage or ""
-				AreaIcon.ImageRectSize = Vector2.new(0, 0)
-				AreaIcon.ImageRectOffset = Vector2.new(0, 0)
-				AreaIcon.ImageColor3 = Color3.fromRGB(255, 255, 255)
-			end
-			BrowseAreaName.Text = AreaRegistry.GetName(idx)
-			BrowseAreaMult.Text = "Cube Value: " .. string.format("%.1f", AreaRegistry.GetMultiplier(idx)) .. "x base"
-			BrowseStatus.Text = "UNLOCKED"; BrowseStatus.TextColor3 = T.accentTeal
-			BrowseProgress.Text = "Travel here (resets current run)."
-			BrowseProgress.TextColor3 = T.accentTeal
-			TravelBtn.Visible = true; TravelBtn.Text = "TRAVEL"
-			TravelBtn.BackgroundColor3 = T.buttonGreen
-
-		elseif liveFarmEval >= discReq then
-			local flipbookData = AreaRegistry.GetFlipbook(idx)
-			if flipbookData then
-				StartFlipbook(idx, AreaIcon)
-				AreaIcon.ImageColor3 = Color3.fromRGB(180, 180, 180)
-			else
-				StopFlipbook()
-				AreaIcon.Image = areaData.icon or areaData.auraPreviewImage or ""
-				AreaIcon.ImageRectSize = Vector2.new(0, 0)
-				AreaIcon.ImageRectOffset = Vector2.new(0, 0)
-				AreaIcon.ImageColor3 = Color3.fromRGB(180, 180, 180)
-			end
-			BrowseAreaName.Text = AreaRegistry.GetName(idx)
-			BrowseAreaMult.Text = "Cube Value: " .. string.format("%.1f", AreaRegistry.GetMultiplier(idx)) .. "x base"
-			BrowseStatus.Text = "DISCOVERED"; BrowseStatus.TextColor3 = T.accentPurple
-
-			local needed = math.max(0, unlockReq - liveFarmEval)
-			BrowseProgress.Text = "Requires $"..Formatter.Format(unlockReq).." Farm Eval\n$"..Formatter.Format(needed).." remaining"
-			BrowseProgress.TextColor3 = T.subText
-			TravelBtn.Visible = false
-
-		else
-			StopFlipbook()
-			AreaIcon.Image = areaData.icon or areaData.auraPreviewImage or ""
-			AreaIcon.ImageRectSize = Vector2.new(0, 0)
-			AreaIcon.ImageRectOffset = Vector2.new(0, 0)
-			AreaIcon.ImageColor3 = Color3.fromRGB(0, 0, 0) 
-			BrowseAreaName.Text = "???"
-			BrowseAreaMult.Text = "???x base"
-			BrowseStatus.Text = "UNDISCOVERED"; BrowseStatus.TextColor3 = T.subText
-
-			local needed = math.max(0, discReq - liveFarmEval)
-			BrowseProgress.Text = "Keep growing to discover what's next.\n$"..Formatter.Format(needed).." to Discover"
-			BrowseProgress.TextColor3 = T.subText
-			TravelBtn.Visible = false
-		end
-
-	else
-		StopFlipbook()
-		AreaIcon.Image = areaData.icon or areaData.auraPreviewImage or ""
-		AreaIcon.ImageRectSize = Vector2.new(0, 0)
-		AreaIcon.ImageRectOffset = Vector2.new(0, 0)
-		AreaIcon.ImageColor3 = Color3.fromRGB(0, 0, 0)
-		BrowseAreaName.Text = "???"
-		BrowseAreaMult.Text = "???x base"
-		BrowseStatus.Text = "LOCKED"; BrowseStatus.TextColor3 = T.subText
-		BrowseProgress.Text = "Unlock previous areas first."
-		BrowseProgress.TextColor3 = T.subText
-		TravelBtn.Visible = false
-	end
-end
-
-LeftArrow.MouseButton1Down:Connect(function()
-	if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_ClickLeftArrow") then return end
-	if browseIndex > 1 then browseIndex -= 1; PlayUI(SoundConfig.UIArrow); RefreshBrowser() end
-end)
-RightArrow.MouseButton1Down:Connect(function()
-	if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_ClickRightArrow") then return end
-	if AreaRegistry.Get(browseIndex+1) then browseIndex += 1; PlayUI(SoundConfig.UIArrow); RefreshBrowser() end
-	if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
-end)
-
-local AreaTravelBtn = Instance.new("TextButton")
-AreaTravelBtn.Name = "AreaTravelButton"
-AreaTravelBtn.Size = UDim2.new(0, C.HUD.NextAreaButtonW, 0, C.HUD.NextAreaButtonH)
-AreaTravelBtn.Position = UDim2.new(0, 156, 1, C.HUD.BottomButtonY)
-AreaTravelBtn.BackgroundColor3 = T.headerBG; AreaTravelBtn.BorderSizePixel = 0
-AreaTravelBtn.Text = "Area Travel"
-AreaTravelBtn.TextColor3 = T.bodyText; AreaTravelBtn.TextScaled = true; AreaTravelBtn.Font = T.font
-AreaTravelBtn.Visible = true -- ✨ ALWAYS VISIBLE NOW!
-AreaTravelBtn.ZIndex = 10; AreaTravelBtn.Parent = mainHUD
-CollectionService:AddTag(AreaTravelBtn, "Tutorial_TravelButton") -- Tutorial Tracker Tag
-Instance.new("UICorner", AreaTravelBtn).CornerRadius = UDim.new(0, 8)
-AddButtonJuice(AreaTravelBtn)
-
--- ✨ NEW: Dynamic button coloring based on travel availability
-local function UpdateTravelButtonVisual()
-	local canTravel = (#unlockedAreas > 1) or portalReady
-	if canTravel then
-		TweenService:Create(AreaTravelBtn, TweenInfo.new(0.3), {
-			BackgroundColor3 = Color3.fromRGB(40, 130, 210), -- Bright active blue
-			TextColor3 = Color3.fromRGB(255, 255, 255)
-		}):Play()
-	else
-		TweenService:Create(AreaTravelBtn, TweenInfo.new(0.3), {
-			BackgroundColor3 = Color3.fromRGB(50, 55, 70), -- Dull locked color
-			TextColor3 = Color3.fromRGB(180, 180, 180)
-		}):Play()
-	end
-end
-
-local function OpenPanel()
-	panelOpen=true; browseIndex=currentArea; UpdateGoalSection(); RefreshBrowser()
-	AreaPanel.Visible=true
-	AreaPanel.Size=UDim2.new(0.88, 0, 0, 0)
-	TweenService:Create(AreaPanel, TweenInfo.new(0.35,Enum.EasingStyle.Back,Enum.EasingDirection.Out),
-		{ Size=UDim2.new(0.88, 0, 0.82, 0) }):Play()
-	UITheme.SetMenuVisible(true)
-end
-
-local function ClosePanel()
-	panelOpen=false; StopFlipbook(); PlayUI(SoundConfig.UIClose)
-	TweenService:Create(AreaPanel, TweenInfo.new(0.25,Enum.EasingStyle.Quad,Enum.EasingDirection.In),
-		{ Size=UDim2.new(0.88, 0, 0, 0) }):Play()
-	UITheme.SetMenuVisible(false)
-	task.delay(0.3, function() AreaPanel.Visible=false end)
-end
-
-AreaTravelBtn.MouseButton1Down:Connect(function()
-	if panelOpen then
-		-- LOGIC GATING
-		if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_CloseTravel") then return end
-		ClosePanel()
-		if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
-	else
-		-- LOGIC GATING
-		if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_OpenTravel") then return end
-		OpenPanel()
-		if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
-	end
-end)
-
-CloseBtn.MouseButton1Down:Connect(function()
-	-- LOGIC GATING
-	if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_CloseTravel") then return end
-	ClosePanel()
-	if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
-end)
-
-local function ShowAreaBanner(info)
-	if info.travelType == "backward" then return end
-	local areaIndex = info.newArea or 2
-	local areaData = AreaRegistry.Get(areaIndex)
-	local areaName = info.areaName or AreaRegistry.GetName(areaIndex)
-	local multText = "Cube Value: "..string.format("%.1f", info.areaMultiplier or 1.0).."x"
-	local saText = (info.newSoulAuras and info.newSoulAuras > 0)
-		and ("+"..Formatter.Format(info.newSoulAuras).." Soul Auras") or nil
-	local accentColor = (areaData and areaData.auraHolderGlow) or T.accentTeal
-	local bannerH = saText and 82 or 64
-	local banner=Instance.new("Frame"); banner.Size=UDim2.new(0,BW,0,bannerH)
-	banner.Position=UDim2.new(0,-(BW+10),0,BY); banner.BackgroundColor3=T.panelBG; banner.BorderSizePixel=0
-	banner.ZIndex=55; banner.ClipsDescendants=true; banner.Parent=mainHUD
-	Instance.new("UICorner",banner).CornerRadius=UDim.new(0,BR)
-	local bs=Instance.new("UIStroke"); bs.Color=accentColor; bs.Thickness=1.5; bs.Parent=banner
-	local nameLabel=Instance.new("TextLabel"); nameLabel.Size=UDim2.new(1,-12,0,22); nameLabel.Position=UDim2.new(0,10,0,6)
-	nameLabel.BackgroundTransparency=1; nameLabel.Text=areaName; nameLabel.TextColor3=accentColor
-	nameLabel.TextScaled=true; nameLabel.Font=T.font; nameLabel.TextXAlignment=Enum.TextXAlignment.Left
-	nameLabel.ZIndex=56; nameLabel.Parent=banner
-	local multLabel=Instance.new("TextLabel"); multLabel.Size=UDim2.new(1,-12,0,18); multLabel.Position=UDim2.new(0,10,0,30)
-	multLabel.BackgroundTransparency=1; multLabel.Text=multText; multLabel.TextColor3=T.accentGold
-	multLabel.TextScaled=true; multLabel.Font=T.fontBody; multLabel.TextXAlignment=Enum.TextXAlignment.Left
-	multLabel.ZIndex=56; multLabel.Parent=banner
-	if saText then
-		local saLabel=Instance.new("TextLabel"); saLabel.Size=UDim2.new(1,-12,0,16); saLabel.Position=UDim2.new(0,10,0,52)
-		saLabel.BackgroundTransparency=1; saLabel.Text=saText; saLabel.TextColor3=T.accentPurple
-		saLabel.TextScaled=true; saLabel.Font=T.fontBody; saLabel.TextXAlignment=Enum.TextXAlignment.Left
-		saLabel.ZIndex=56; saLabel.Parent=banner
-	end
-	TweenService:Create(banner, TweenInfo.new(0.4,Enum.EasingStyle.Back,Enum.EasingDirection.Out),
-		{ Position=UDim2.new(0,10,0,BY) }):Play()
-	task.delay(4, function()
-		TweenService:Create(banner, TweenInfo.new(0.35,Enum.EasingStyle.Quad,Enum.EasingDirection.In),
-			{ Position=UDim2.new(0,-(BW+10),0,BY) }):Play()
-		task.delay(0.4, function() if banner and banner.Parent then banner:Destroy() end end)
-	end)
-end
-
-UpdateHUDBridge:Connect(function(stats)
-	if stats.farmEvaluation ~= nil then liveFarmEval = stats.farmEvaluation end
-	if panelOpen then UpdateGoalSection(); RefreshBrowser() end
-end)
-
-AreaUpdated.OnClientEvent:Connect(function(info)
-	currentArea = info.currentArea or 1
-	if currentArea > 1 then player:SetAttribute("TutorialCompleted", true) end
-	portalReady = info.portalReady == true
-	if info.unlockedAreas then unlockedAreas = info.unlockedAreas end
-	MAX_AREA = info.maxArea or AreaRegistry.GetMaxArea()
-	if info.portalReady then AddPortalPrompt() else RemovePortalPrompt() end
-
-	-- ✨ Automatically colors the button grey or blue
-	UpdateTravelButtonVisual()
-
-	if panelOpen then UpdateGoalSection(); RefreshBrowser() end
-end)
-
-AreaUnlocked.OnClientEvent:Connect(function(info)
-	portalReady = true; AddPortalPrompt()
-	if info.unlockedAreas then unlockedAreas = info.unlockedAreas end
-
-	-- ✨ Lights the button up bright blue when an area unlocks!
-	UpdateTravelButtonVisual()
-
-	local count = info.newAreasCount or 1
-	local highestName = info.highestNewName or "New Area"
-	local PBW = C.Banners.PortalBannerW; local PBH = C.Banners.PortalBannerH
-	local banner=Instance.new("Frame"); banner.Size=UDim2.new(0,PBW,0,PBH)
-	banner.Position=UDim2.new(0.5,-PBW/2,0,-PBH-10); banner.BackgroundColor3=T.panelBG; banner.BorderSizePixel=0
-	banner.ZIndex=60; banner.Parent=mainHUD
-	Instance.new("UICorner",banner).CornerRadius=UDim.new(0,BR)
-	local bStroke=Instance.new("UIStroke"); bStroke.Color=T.accentTeal; bStroke.Thickness=2; bStroke.Parent=banner
-	local bLabel=Instance.new("TextLabel"); bLabel.Size=UDim2.new(1,-20,1,0); bLabel.Position=UDim2.new(0,10,0,0)
-	bLabel.BackgroundTransparency=1
-	bLabel.Text = count == 1
-		and (highestName.." unlocked! Open Area Travel.")
-		or (count.." new areas unlocked! Open Area Travel to choose.")
-	bLabel.TextColor3=T.accentTeal; bLabel.TextScaled=true; bLabel.Font=T.font; bLabel.ZIndex=61; bLabel.Parent=banner
-	TweenService:Create(banner, TweenInfo.new(0.4,Enum.EasingStyle.Back,Enum.EasingDirection.Out),
-		{ Position=UDim2.new(0.5,-PBW/2,0,14) }):Play()
-	task.delay(5, function()
-		TweenService:Create(banner, TweenInfo.new(0.35,Enum.EasingStyle.Quad,Enum.EasingDirection.In),
-			{ Position=UDim2.new(0.5,-PBW/2,0,-PBH-10) }):Play()
-		task.delay(0.4, function() if banner and banner.Parent then banner:Destroy() end end)
-	end)
-end)
-
-PrestigeComplete.OnClientEvent:Connect(function(info)
-	if info.isPortalEntry then
-		portalReady=false; liveFarmEval=0; RemovePortalPrompt()
-		UpdateTravelButtonVisual() 
-		if panelOpen then ClosePanel() end
-	end
-end)
-
-AreaChanged.OnClientEvent:Connect(function(info)
-	currentArea = info.newArea or currentArea; browseIndex = currentArea; portalReady = false
-	if info.unlockedAreas then unlockedAreas = info.unlockedAreas end
-	UpdateTravelButtonVisual()
-	if panelOpen then ClosePanel() end
-	ShowAreaBanner(info)
-end)
-
-function AddPortalPrompt()
-	if promptAdded then return end; promptAdded = true
-	local prompt=Instance.new("ProximityPrompt"); prompt.Name="PortalPrompt"; prompt.ObjectText="Portal"
-	prompt.ActionText="Open Area Travel"; prompt.HoldDuration=0.5; prompt.MaxActivationDistance=12
-	prompt.Parent=PositionPart
-	prompt.Triggered:Connect(function(p) 
-		if p == player and not panelOpen then 
-			if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_OpenTravel") then return end
-			OpenPanel() 
-			if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
-		end 
-	end)
-end
-
-function RemovePortalPrompt()
-	promptAdded=false; local e=PositionPart:FindFirstChild("PortalPrompt"); if e then e:Destroy() end
-end
-
-local function RefreshLook()
-	UITheme.Apply(AreaPanel, "Panel")
-	UITheme.Apply(HeaderBar, "TitleBar")
-	UITheme.Apply(GoalSection, "ShopCard")
-	UITheme.Apply(AreaBrowser, "ShopCard")
-	UITheme.Apply(HeaderBar, "Panel")
-	UITheme.Apply(RightArrow, "Panel")
-	UITheme.Apply(LeftArrow, "Panel")
-	UITheme.Apply(AreaTravelBtn, "Panel")
-	UITheme.ApplyShine(AreaBrowser)
-	UITheme.ApplyShine(GoalSection)
-	UITheme.ApplyShine(AreaPanel)
-	GoalSection.BackgroundColor3 = T.cardBG 
-	AreaBrowser.BackgroundColor3 = T.cardBG
-	local outerStroke = AreaPanel:FindFirstChildWhichIsA("UIStroke")
-	if outerStroke then outerStroke.Color = Color3.fromRGB(255, 255, 255) end
-end
-
-task.wait(2)
-RefreshLook()
-
--- ✨ TUTORIAL OVERRIDE: Close portal travel when camera pans
-local forceClose = ReplicatedStorage:FindFirstChild("ForceCloseUI") or Instance.new("BindableEvent")
-forceClose.Name = "ForceCloseUI"
-forceClose.Parent = ReplicatedStorage
-forceClose.Event:Connect(function()
-	if panelOpen then ClosePanel() end
-end)
-
--- AchievementConfig
--- Location: ReplicatedStorage > Modules > AchievementConfig
-
-local AchievementConfig = {}
-
--- 🏆 YOUR CHALLENGES / BOOST UNLOCKS
-AchievementConfig.Challenges = {
-	{
-		id = "unlock_aurarush",
-		boostId = "AuraRush",
-		title = "Aura Tycoon",
-		desc = "Spawn 100 Auras",
-		iconId = "rbxassetid://14916846070", 
-		statKey = "totalCubesProduced", 
-		goal = 10,
-		rewardText = "Unlocks: Aura Rush Boost"
+		icon         = "rbxassetid://14922082255", 
+		color        = Color3.fromRGB(143, 255, 131), -- Green
 	},
-	{
-		id = "unlock_spawnboost",
-		boostId = "SpawnBoost",
-		title = "Explorer",
-		desc = "Reach Area 2",
-		iconId = "rbxassetid://14916846070", -- PLACEHOLDER
-		statKey = "currentArea",
-		goal = 2,
-		rewardText = "Unlocks: Value Boost"
+
+	-- ✨ STEP 2: Cinematic Camera Follow! Watch the Aura move.
+	[2] = {
+		id               = "a1_watch_aura",
+		action           = "Action_Wait",
+
+		cameraTrackMode  = "FollowAura", 
+		target3D         = "Aura",       
+		duration         = 10,          
+
+		bannerTitle  = "Generating Profit",
+		bannerBody   = "Each Aura generates cash every second based on its rarity.",
+		
+		icon         = "rbxassetid://14914018910",
+		color        = Color3.fromRGB(255, 255, 255), 
 	},
-	{
-		id = "unlock_soulboost",
-		boostId = "SoulBoost",
-		title = "Soul Searcher",
-		desc = "Prestige 5 Times",
-		iconId = "rbxassetid://14916846070", -- PLACEHOLDER
-		statKey = "prestigeCount",
-		goal = 5,
-		rewardText = "Unlocks: Soul Boost"
-	}
+
+	-- ✨ STEP 3: Produce Bulk
+	[3] = {
+		id           = "a1_produce_25",
+		action       = "Action_ClickRedButton",
+		targetTag    = "Tutorial_ClickButton",
+
+		-- Look back at the general factory area
+		cameraTarget = "Tutorial_AuraHolderCam",
+
+		requireCubesProduced = 25,
+		failsafeDuration = 35, -- ✨ NEW: Autocompletes after 35 seconds if they get stuck!
+		bannerTitle  = "Producing Auras",
+		bannerBody   = "Keep clicking to produce 25 Auras! The more you make, the more money you earn.",
+		duration     = 0, 
+
+		icon         = "rbxassetid://14914018910",
+		color        = Color3.fromRGB(130, 226, 255), -- Cyan
+	},
+
+	-- ✨ STEP 4: Farm up Cash
+	[4] = {
+		id           = "a1_farm_150",
+		action       = "Action_ClickRedButton",
+
+		requireCurrency = 150,
+
+		bannerTitle  = "Stacking Cash",
+		bannerBody   = "Your Auras are passively generating income while on the Conveyer. Keep producing until you save up $150!",
+		duration     = 0,
+		failsafeDuration = 25, -- ✨ NEW: Autocompletes after 35 seconds if they get stuck!
+		icon         = "rbxassetid://14924185885",
+		color        = Color3.fromRGB(150, 255, 150), -- Light Green
+	},
+
+	-- ✨ STEP 5: Unlock Shop
+	[5] = {
+		id           = "a1_open_shop",
+		action       = "Action_OpenShop",
+		targetTag    = "Tutorial_ShopButton",
+
+		unlockTags    = {"Tutorial_ShopButton"},
+		unlockActions = {"Action_OpenShop", "Action_CloseShop"},
+
+		bannerTitle  = "Open The Shop",
+		bannerBody   = "You have enough Money! Click the Shop icon to view your upgrades.",
+		
+		icon         = "rbxassetid://14915225073",
+		color        = Color3.fromRGB(123, 216, 250), -- Grey
+	},
+
+	-- ✨ STEP 6: First Upgrade
+	[6] = {
+		id             = "a1_buy_blockValue",
+		action         = "Action_BuyUpgrade",
+		targetTag      = "Tutorial_Buy_blockValue",
+
+		unlockTags     = {"Tutorial_Buy_blockValue"},
+		-- ✨ FIX: Removed duration = 0 so it doesn't auto-skip!
+
+		menuTag        = "Tutorial_ShopPanel",
+		menuOpenBtnTag = "Tutorial_ShopButton",
+
+		bannerTitle  = "Increase Value",
+		bannerBody   = "Buy the Value upgrade to increase the Value of your Auras by +10%",
+
+		icon         = "rbxassetid://14917128076",
+		color        = Color3.fromRGB(142, 206, 255), 
+	},
+
+	-- ✨ STEP 7: The "Trap". Waiting for the physical bin to fill up.
+	[7] = {
+		id           = "a1_fill_habitat",
+		action       = "Action_ClickRedButton",
+		targetTag    = "Tutorial_ClickButton",
+
+		requireHabitatFull = true,
+		duration           = 0, 
+
+		bannerTitle  = "Keep Producing",
+		bannerBody   = "Close the shop and keep Producing Auras. Spam Click or HOLD the red button To keep producing Auras.",
+
+		icon         = "rbxassetid://14914018910",
+		color        = Color3.fromRGB(130, 226, 255), -- Cyan
+	},
+
+	-- ✨ STEP 8: Watch the Aura Die (Zoomed Out). 
+	[8] = {
+		id               = "a1_watch_aura_die",
+		action           = "Action_Wait",
+
+		cameraTrackMode  = "FollowAura",
+		cameraOffset     = Vector3.new(0, 22, 28), 
+
+		requireRateZero  = true, 
+		duration         = 0, 
+
+		bannerTitle  = "Incinerated!",
+		bannerBody   = "Since your habitat Got full, Auras get incinerated. Wait for your Rate to hit $0.",
+
+		icon         = "rbxassetid://14916846070",
+		color        = Color3.fromRGB(255, 0, 4), -- Red
+	},
+
+	-- ✨ STEP 9: Pan to Habitat to show the full bin
+	[9] = {
+		id           = "a1_look_at_habitat",
+		action       = "Action_Wait",
+		cameraTarget = "Tutorial_HabitatCam",
+
+		duration     = 7, 
+
+		bannerTitle  = "Habitat is Full!",
+		bannerBody   = "Your storage is completely Full. You need to clear some Space.",
+
+		icon         = "rbxassetid://14916846070",
+		color        = Color3.fromRGB(255, 155, 155), -- Red
+	},
+
+	-- ✨ STEP 10: The Solution (Send Button)
+	[10] = {
+		id           = "a1_send_ship",
+		action       = "Action_SendShip",
+		targetTag    = "Tutorial_SendShipBtn",
+
+		unlockTags    = {"Tutorial_SendShipBtn"},
+		unlockActions = {"Action_SendShip"},
+
+		bannerTitle  = "Clear Space",
+		bannerBody   = "Click the newly unlocked SEND button to clear out your habitat of the Auras.",
+
+		icon         = "rbxassetid://14915225073",
+		color        = Color3.fromRGB(100, 255, 255), -- Cyan
+	},
+
+	-- ✨ STEP 11: Watch the Ship!
+	[11] = {
+		id           = "a1_wait_for_ship",
+		action       = "Action_Wait",
+		cameraTarget = "Tutorial_ShippingCam",
+
+		requirePlatformsShipped = 2,
+
+		bannerTitle  = "Ship Delivery",
+		bannerBody   = "Ships collect all your Auras and pay out the cash directly to your wallet. Send 2 Ships Out.",
+		duration     = 0,
+
+		icon         = "rbxassetid://14914018910",
+		color        = Color3.fromRGB(150, 200, 255), -- Light Blue
+	},
+
+	-- ✨ STEP 12: Automate it
+	[12] = {
+		id           = "a1_toggle_auto",
+		action       = "Action_ToggleAutoShip",
+		targetTag    = "Tutorial_ToggleShipBtn",
+
+		unlockTags    = {"Tutorial_ToggleShipBtn"},
+		unlockActions = {"Action_ToggleAutoShip"},
+
+		bannerTitle  = "Automate Ships",
+		bannerBody   = "Click the new unlocked Toggle Button to automate your shipments!",
+
+		icon         = "rbxassetid://14915225073",
+		color        = Color3.fromRGB(50, 150, 50), -- Dark Green
+	},
+
+	-- ✨ STEP 13: Business as usual
+	[13] = {
+		id           = "a1_farm_500",
+		action       = "Action_ClickRedButton",
+
+		requireCurrency = 500,
+
+		bannerTitle  = "More Upgrades!",
+		bannerBody   = "Make $500 to afford your next upgrade.",
+		duration     = 0,
+
+		icon         = "rbxassetid://14924185885",
+		color        = Color3.fromRGB(150, 255, 150), -- Light Green
+	},
+
+	[14] = {
+		id             = "a1_buy_auraExpansion",
+		action         = "Action_BuyUpgrade",
+		targetTag      = "Tutorial_Buy_hatcheryCapacity",
+
+		unlockTags     = {"Tutorial_Buy_hatcheryCapacity"},
+
+		menuTag        = "Tutorial_ShopPanel",
+		menuOpenBtnTag = "Tutorial_ShopButton",
+
+		bannerTitle  = "More Hatchery",
+		bannerBody   = "Buy the Aura Expansion upgrade to increase your Hatchery space!",
+
+		icon         = "rbxassetid://14917128076",
+		color        = Color3.fromRGB(105, 255, 250), 
+	},
+
+	[15] = {
+		id           = "a1_farm_1500",
+		action       = "Action_ClickRedButton",
+
+		requireCurrency = 1500,
+
+		bannerTitle  = "Growing the Factory",
+		bannerBody   = "Make $1500 to afford the Habitat upgrade, allowing you to store more auras! Buy the aura value upgrade if you feel stuck.",
+		duration     = 0,
+
+		icon         = "rbxassetid://14924185885",
+		color        = Color3.fromRGB(87, 255, 98),
+	},
+
+	[16] = {
+		id             = "a1_buy_habitatCapacity",
+		action         = "Action_BuyUpgrade",
+		targetTag      = "Tutorial_Buy_habitatCapacity",
+
+		unlockTags     = {"Tutorial_Buy_habitatCapacity"},
+
+		menuTag        = "Tutorial_ShopPanel",
+		menuOpenBtnTag = "Tutorial_ShopButton",
+
+		bannerTitle  = "More Habitat Space",
+		bannerBody   = "Buy the Habitat Reservoir Upgrade to store more Auras before they get Incinirated!",
+
+		icon         = "rbxassetid://14917128076",
+		color        = Color3.fromRGB(120, 248, 255),
+	},
+
+	[17] = {
+		id           = "a1_multiply",
+		action       = "Action_ClickRedButton",
+
+		reachMultiplier = 5,
+
+		bannerTitle  = "Hatchery Multipliers",
+		bannerBody   = "Hold the Red button to reach the legendary multiplier! Make sure you have enough Hatchery and Space",
+		duration     = 0,
+
+		icon         = "rbxassetid://14924185885",
+		color        = Color3.fromRGB(255, 255, 0), 
+	},
+	
+	[18] = {
+		id           = "a1_farm_25000",
+		action       = "Action_ClickRedButton",
+
+		requireCurrency = 5000,
+
+		bannerTitle  = "Mythic Multiplier",
+		bannerBody   = "Multipliers Increase Ship and Aura Value. Save up $5,000 to afford the Mythic Multiplier! Upgrade Aura Value If Stuck.",
+		duration     = 0,
+
+		icon         = "rbxassetid://14924185885",
+		color        = Color3.fromRGB(137, 255, 110), -- White
+	},
+
+	[19] = {
+		id             = "a1_buy_mythicMult",
+		action         = "Action_BuyUpgrade",
+		targetTag      = "Tutorial_Buy_unlockMythicMult", 
+
+		unlockTags     = {"Tutorial_Buy_unlockMythicMult"},
+
+		menuTag        = "Tutorial_ShopPanel",
+		menuOpenBtnTag = "Tutorial_ShopButton",
+
+		bannerTitle  = "Mythic Multiplier",
+		bannerBody   = "Buy the Mythic Multiplier to hold past the legendary multiplier limit!",
+
+		icon         = "rbxassetid://14917128076",
+		color        = Color3.fromRGB(80, 246, 255),
+	},
+	
+	[20] = {
+		id           = "a1_multiply",
+		action       = "Action_ClickRedButton",
+
+		reachMultiplier = 10,
+
+		bannerTitle  = "Hatchery Multipliers",
+		bannerBody   = "Hold the Red button to reach the Mythic multiplier! Make sure to have plenty of Hatchery and Space",
+		duration     = 0,
+
+		icon         = "rbxassetid://14924185885",
+		color        = Color3.fromRGB(134, 24, 161), 
+	},
+
+	[21] = {
+		id           = "a1_open_prestige",
+		action       = "Action_OpenPrestige",
+		targetTag    = "Tutorial_PrestigeButton",
+
+		-- We intentionally don't unlock the Confirm button yet!
+		unlockTags    = {"Tutorial_PrestigeButton", "Tutorial_PrestigeCloseBtn"},
+		unlockActions = {"Action_OpenPrestige", "Action_ClosePrestige"},
+
+		bannerTitle  = "How to Prestige",
+		bannerBody   = "Click the Prestige button to restart with a massive permanent earnings multiplier.",
+
+		icon         = "rbxassetid://14916846070",
+		color        = Color3.fromRGB(180, 100, 255),
+	},
+
+	[22] = {
+		id             = "a1_confirm_prestige",
+		action         = "Action_PrestigeConfirm",
+		targetTag      = "Tutorial_PrestigeConfirm",
+
+		-- Now we unlock the actual Confirm Button
+		unlockTags     = {"Tutorial_PrestigeConfirm"},
+		unlockActions  = {"Action_PrestigeConfirm"},
+
+		-- If they close the menu by mistake, the pointer will snap back to the HUD Prestige button!
+		menuTag        = "Tutorial_PrestigePanel",
+		menuOpenBtnTag = "Tutorial_PrestigeButton",
+		
+		bannerTitle  = "Confirm Prestige",
+		bannerBody   = "Click 'Prestige Now' to get your Soul Auras and increase your earnings permentantly.",
+
+		icon         = "rbxassetid://14916846070",
+		color        = Color3.fromRGB(215, 121, 255),
+	},
+	[23] = {
+		id           = "a1_post_prestige_pan",
+		action       = "Action_Wait", -- ✨ THE FIX: Wait for collection instead of clicking!
+		duration     = 0,             -- ✨ Auto-advances instantly when the condition is met
+		allowClicking = true, -- ✨ THE FIX
+		cameraTrackMode = "FollowPhysicsAura", 
+		cameraOffset    = Vector3.new(0, 15, 25), 
+
+		requireStepGoldenAuras = 10, -- ✨ THE FIX: Only counts GA collected DURING this step!
+	
+		bannerTitle  = "Golden Auras",
+		bannerBody   = "Collect Auras that spawn from the Producer OR claim your mailbox rewards!",
+
+		icon         = "rbxassetid://4483362458",
+		color        = Color3.fromRGB(255, 215, 0),
+	},
+
+	-- ✨ STEP 24: Farm for the next area
+	[24] = {
+		id           = "a1_farm_area2",
+		action       = "Action_Wait", -- ✨ THE FIX: Monitor passively instead of requiring a click!
+		duration     = 0,             -- ✨ Auto-advances instantly when the condition is met
+		allowClicking = true, -- ✨ THE FIX
+		requireFarmEval = 50000, 
+		unlockTags    = {"Tutorial_TravelButton", "Tutorial_TravelCloseBtn"},
+		unlockActions = {"Action_OpenTravel", "Action_CloseTravel"},
+		bannerTitle  = "Reaching More Areas",
+		bannerBody   = "Open the travel menu to unlock the next Area. Your farm evaluation is based on the total amount of money made in that area.",
+
+		icon         = "rbxassetid://14924185885",
+		color        = Color3.fromRGB(126, 255, 212),
+	},
+
+	-- ✨ STEP 25: Open Area Travel
+	[25] = {
+		id           = "a1_open_travel",
+		action       = "Action_OpenTravel",
+		targetTag    = "Tutorial_TravelButton",
+
+		bannerTitle  = "New Area Unlocked!",
+		bannerBody   = "Click the Area Travel button to open the travel menu.",
+
+		icon         = "rbxassetid://14916846070",
+		color        = Color3.fromRGB(100, 200, 255),
+	},
+
+	-- ✨ STEP 26: Browse to Area 2 (Click Right Arrow)
+	[26] = {
+		id             = "a1_travel_arrow",
+		action         = "Action_ClickRightArrow",
+		targetTag      = "Tutorial_RightArrow",
+
+		unlockTags     = {"Tutorial_RightArrow"},
+		unlockActions  = {"Action_ClickRightArrow", "Action_ClickLeftArrow"},
+
+		menuTag        = "Tutorial_TravelPanel",
+		menuOpenBtnTag = "Tutorial_TravelButton",
+		fallbackStepId = "a1_open_travel", -- Sends them back if they closed the UI
+
+		bannerTitle  = "Browse Areas",
+		bannerBody   = "Click the Arrows to view the newly unlocked area and other areas.",
+
+		icon         = "rbxassetid://14916846070",
+		color        = Color3.fromRGB(150, 200, 255),
+	},
+
+	-- ✨ STEP 27: Confirm Travel
+	[27] = {
+		id             = "a1_confirm_travel",
+		action         = "Action_TravelConfirm",
+		targetTag      = "Tutorial_TravelConfirm",
+
+		unlockTags     = {"Tutorial_TravelConfirm"},
+		unlockActions  = {"Action_TravelConfirm"},
+
+		menuTag        = "Tutorial_TravelPanel",
+		menuOpenBtnTag = "Tutorial_TravelButton",
+		fallbackStepId = "a1_open_travel",
+
+		bannerTitle  = "Travel Now",
+		bannerBody   = "Click TRAVEL to jump to the new Area!",
+
+		icon         = "rbxassetid://14916846070",
+		color        = Color3.fromRGB(107, 255, 161),
+	},
+
+	[28] = {
+		id           = "a1_open_boosts",
+		action       = "Action_OpenBoostShop",
+		targetTag    = "Tutorial_BoostMenuBtn",
+
+		-- Unlock the tabs so the FSM can use them!
+		unlockTags    = {"Tutorial_BoostMenuBtn", "Tutorial_BoostShopClose", "Tutorial_BoostTab_Shop", "Tutorial_BoostTab_Inventory"},
+		unlockActions = {"Action_OpenBoostShop", "Action_CloseBoostShop", "Action_BoostTab_Shop", "Action_BoostTab_Inventory"},
+
+		bannerTitle  = "Area Boosts and Multipliers",
+		bannerBody   = "Auras in this area have much higher base values! Open the new Boosts menu.",
+
+		icon         = "rbxassetid://14916846070",
+		color        = Color3.fromRGB(75, 255, 174),
+	},
+
+	-- ✨ STEP 29: Buy Aura Spawner Boost
+	[29] = {
+		id           = "a1_buy_boost1",
+		action       = "Action_BuyBoost_AuraRush",
+		targetTag    = "Tutorial_BuyBoost_AuraRush",
+
+		unlockTags    = {"Tutorial_BuyBoost_AuraRush"},
+		unlockActions = {"Action_BuyBoost_AuraRush"},
+
+		menuTag        = "Tutorial_BoostShopPanel",
+		menuOpenBtnTag = "Tutorial_BoostMenuBtn",
+
+		requireBoostBought = { id = "AuraRush", count = 1 },
+
+		bannerTitle  = "Buy a Boost",
+		bannerBody   = "Buy the Aura Rush Boost using your Golden Auras.",
+
+		icon         = "rbxassetid://4483362458",
+		color        = Color3.fromRGB(114, 213, 255),
+	},
+
+	-- ✨ STEP 30 (NEW): Switch to Inventory Tab
+	[30] = {
+		id           = "a1_click_inv_tab",
+		action       = "Action_BoostTab_Inventory",
+		targetTag    = "Tutorial_BoostTab_Inventory",
+
+		menuTag        = "Tutorial_BoostShopPanel",
+		menuOpenBtnTag = "Tutorial_BoostMenuBtn",
+
+		bannerTitle  = "Check Inventory",
+		bannerBody   = "Click the INVENTORY tab at the top of the menu to view the boosts you own.",
+
+		icon         = "rbxassetid://14916846070",
+		color        = Color3.fromRGB(103, 111, 255),
+	},
+
+	-- ✨ STEP 31: Use Aura Spawner Boost
+	[31] = {
+		id           = "a1_use_boost1",
+		action       = "Action_UseBoost_AuraRush",
+		targetTag    = "Tutorial_UseBoost_AuraRush",
+
+		unlockTags    = {"Tutorial_UseBoost_AuraRush"},
+		unlockActions = {"Action_UseBoost_AuraRush"},
+
+		menuTag        = "Tutorial_BoostShopPanel",
+		menuOpenBtnTag = "Tutorial_BoostMenuBtn",
+
+		requireBoostUsed = { id = "AuraRush", count = 1 },
+
+		bannerTitle  = "Activate the Boost",
+		bannerBody   = "Click ACTIVATE to use your new Aura Rush boost!",
+
+		icon         = "rbxassetid://14916846070",
+		color        = Color3.fromRGB(103, 111, 255),
+	},
+
+	-- ✨ STEP 32: Spawn 30 Auras 
+	[32] = {
+		id           = "a1_spawn_30",
+		action       = "Action_Wait", 
+		targetTag    = "Tutorial_ClickButton",
+		allowClicking = true, 
+
+		requireCubesProduced = 30,
+
+		bannerTitle  = "Double Spawn Speed",
+		bannerBody   = "Your boost is now active. Produce 30 Auras with the increased spawn speed.",
+
+		icon         = "rbxassetid://14914018910",
+		color        = Color3.fromRGB(105, 255, 200),
+	},
+
+	-- ✨ STEP 33: Open Boost Shop Again
+	[33] = {
+		id           = "a1_open_boosts2",
+		action       = "Action_OpenBoostShop",
+		targetTag    = "Tutorial_BoostMenuBtn",
+
+		bannerTitle  = "Buy More Boosts",
+		bannerBody   = "Open up the boosts menu again to buy more boosts.",
+
+		icon         = "rbxassetid://14916846070",
+		color        = Color3.fromRGB(106, 255, 188),
+	},
+
+	-- ✨ STEP 34 (NEW): Switch back to Shop Tab
+	[34] = {
+		id           = "a1_click_shop_tab",
+		action       = "Action_BoostTab_Shop",
+		targetTag    = "Tutorial_BoostTab_Shop",
+
+		menuTag        = "Tutorial_BoostShopPanel",
+		menuOpenBtnTag = "Tutorial_BoostMenuBtn",
+
+		bannerTitle  = "Return to Shop",
+		bannerBody   = "Click the SHOP tab to view the boosts available for purchase.",
+
+		icon         = "rbxassetid://14916846070",
+		color        = Color3.fromRGB(114, 213, 255),
+	},
+
+	-- ✨ STEP 35: Buy 5 Aura Spawners
+	[35] = {
+		id           = "a1_buy_boost3",
+		action       = "Action_BuyBoost_AuraRush",
+		targetTag    = "Tutorial_BuyBoost_AuraRush",
+
+		menuTag        = "Tutorial_BoostShopPanel",
+		menuOpenBtnTag = "Tutorial_BoostMenuBtn",
+
+		requireBoostBought = { id = "AuraRush", count = 5 },
+
+		bannerTitle  = "Buy More Aura Rush Boosts",
+		bannerBody   = "Buy 5 more Aura Rush Boosts. Note Boosts can stack for even faster production and MONEY.",
+
+		icon         = "rbxassetid://4483362458",
+		color        = Color3.fromRGB(101, 255, 199),
+	},
+
+	-- ✨ STEP 36: Mass Produce 150 Auras
+	[36] = {
+		id           = "a1_spawn_150",
+		action       = "Action_Wait",
+		targetTag    = "Tutorial_ClickButton",
+		allowClicking = true, 
+
+		requireCubesProduced = 150,
+
+		bannerTitle  = "Mass Production",
+		bannerBody   = "Produce 150 Auras. Don't forget you can use those boosts you just bought!",
+
+		icon         = "rbxassetid://14914018910",
+		color        = Color3.fromRGB(130, 226, 255),
+	},
+	[36] = {
+		id           = "a1_claim_boost_chal",
+		action       = "Action_ClaimChallenge_unlock_spawnboost",
+		targetTag    = "Tutorial_AchieveRow_Chal_unlock_spawnboost",
+
+		unlockTags    = {"Tutorial_AchieveRow_Chal_unlock_spawnboost"},
+		unlockActions = {"Action_ClaimChallenge_unlock_spawnboost"},
+
+		menuTag        = "Tutorial_AchievePanel",
+		menuOpenBtnTag = "Tutorial_AchieveMenuBtn",
+
+		bannerTitle  = "Claim Your Rewards",
+		bannerBody   = "You reached Area 2! Click the green 'CLAIM' button on the Explorer challenge to unlock the Value Boost.",
+
+		icon         = "rbxassetid://14916846070",
+		color        = Color3.fromRGB(80, 255, 100),
+	},
+
+	-- ✨ STEP 37: View Aura Index
+	[37] = {
+		id           = "a1_click_index_tab",
+		action       = "Action_ClickAchieveTab_Index",
+		targetTag    = "Tutorial_AchieveTab_Index",
+
+		unlockTags    = {"Tutorial_AchieveTab_Index"},
+		unlockActions = {"Action_ClickAchieveTab_Index"},
+
+		menuTag        = "Tutorial_AchievePanel",
+		menuOpenBtnTag = "Tutorial_AchieveMenuBtn",
+
+		bannerTitle  = "The Aura Index",
+		bannerBody   = "Click the Auras tab. Here you can track every single Aura you have discovered across all Areas!",
+
+		icon         = "rbxassetid://14916846070",
+		color        = Color3.fromRGB(100, 200, 255),
+	},
+
+	-- ✨ STEP 38: Claim Golden Auras from Index
+	[38] = {
+		id           = "a1_claim_index_reward",
+		action       = "Action_ClaimAura_1_Common",
+		targetTag    = "Tutorial_AchieveRow_Index_1",
+
+		unlockTags    = {"Tutorial_AchieveRow_Index_1"},
+		unlockActions = {"Action_ClaimAura_1_Common"},
+
+		menuTag        = "Tutorial_AchievePanel",
+		menuOpenBtnTag = "Tutorial_AchieveMenuBtn",
+
+		bannerTitle  = "Discovery Bonus",
+		bannerBody   = "Click on the Area 1 Common Aura to claim a Golden Aura bonus for discovering it!",
+
+		icon         = "rbxassetid://4483362458",
+		color        = Color3.fromRGB(255, 215, 0),
+	},
+
+	-- ✨ STEP 39: View Badges Tab
+	[39] = {
+		id           = "a1_click_badges_tab",
+		action       = "Action_ClickAchieveTab_Badges",
+		targetTag    = "Tutorial_AchieveTab_Badges",
+
+		unlockTags    = {"Tutorial_AchieveTab_Badges"},
+		unlockActions = {"Action_ClickAchieveTab_Badges"},
+
+		menuTag        = "Tutorial_AchievePanel",
+		menuOpenBtnTag = "Tutorial_AchieveMenuBtn",
+
+		bannerTitle  = "Roblox Badges",
+		bannerBody   = "Click the Badges tab. You can officially earn Roblox Badges for reaching massive milestones.",
+
+		icon         = "rbxassetid://14916846070",
+		color        = Color3.fromRGB(255, 100, 255),
+	},
+
+	-- ✨ STEP 40: Claim First Prestige Badge
+	[40] = {
+		id           = "a1_claim_badge_1",
+		action       = "Action_ClaimBadge_1", 
+		targetTag    = "Tutorial_AchieveRow_Badge_1",
+
+		unlockTags    = {"Tutorial_AchieveRow_Badge_1"},
+		unlockActions = {"Action_ClaimBadge_1"},
+
+		menuTag        = "Tutorial_AchievePanel",
+		menuOpenBtnTag = "Tutorial_AchieveMenuBtn",
+
+		bannerTitle  = "Claim Badge",
+		bannerBody   = "Click the First Prestige badge to officially unlock it on your Roblox profile!",
+
+		icon         = "rbxassetid://14916846070",
+		color        = Color3.fromRGB(200, 150, 255),
+	},
+
+	-- ✨ STEP 41: View Leaderboard
+	[41] = {
+		id           = "a1_click_leaderboard",
+		action       = "Action_ClickAchieveTab_Leaderboard",
+		targetTag    = "Tutorial_AchieveTab_Leaderboard",
+
+		unlockTags    = {"Tutorial_AchieveTab_Leaderboard"},
+		unlockActions = {"Action_ClickAchieveTab_Leaderboard"},
+
+		menuTag        = "Tutorial_AchievePanel",
+		menuOpenBtnTag = "Tutorial_AchieveMenuBtn",
+
+		bannerTitle  = "Global Rankings",
+		bannerBody   = "Click the Top 10 tab to view the Global Leaderboard. Can you become the richest player in the world?",
+
+		icon         = "rbxassetid://14916846070",
+		color        = Color3.fromRGB(255, 150, 50),
+	},
+
+	-- ✨ STEP 42: View Settings
+	[42] = {
+		id           = "a1_click_settings",
+		action       = "Action_ClickAchieveTab_Settings",
+		targetTag    = "Tutorial_AchieveTab_Settings",
+
+		unlockTags    = {"Tutorial_AchieveTab_Settings"},
+		unlockActions = {"Action_ClickAchieveTab_Settings"},
+
+		menuTag        = "Tutorial_AchievePanel",
+		menuOpenBtnTag = "Tutorial_AchieveMenuBtn",
+
+		bannerTitle  = "Customize Your Farm",
+		bannerBody   = "Finally, click the Settings tab. You can customize the game audio and mechanics here.",
+
+		icon         = "rbxassetid://14923131909",
+		color        = Color3.fromRGB(150, 255, 255),
+	},
+
+	-- ✨ STEP 43: Toggle Jumping
+	[43] = {
+		id           = "a1_toggle_jump",
+		action       = "Action_ToggleSetting_jump",
+		targetTag    = "Tutorial_SettingToggle_jump",
+
+		unlockTags    = {"Tutorial_SettingToggle_jump"},
+		unlockActions = {"Action_ToggleSetting_jump"},
+
+		menuTag        = "Tutorial_AchievePanel",
+		menuOpenBtnTag = "Tutorial_AchieveMenuBtn",
+
+		bannerTitle  = "Disable Jumping",
+		bannerBody   = "Click to disable Jumping. (You can also quick-toggle jumping at any time by pressing 'T' on your keyboard!)",
+
+		icon         = "rbxassetid://14923131909",
+		color        = Color3.fromRGB(255, 100, 100),
+	},
+
+	-- ✨ STEP 44: End of Tutorial
+	[44] = {
+		id           = "a1_final_travel",
+		action       = "Action_OpenTravel",
+		targetTag    = "Tutorial_TravelButton",
+
+		bannerTitle  = "goober",
+		bannerBody   = "yay piggy bank",
+
+		icon         = "rbxassetid://14916846070",
+		color        = Color3.fromRGB(100, 255, 150),
+	},
 }
 
--- 🏅 YOUR ROBLOX BADGES
-AchievementConfig.Badges = {
-	{ id = 000000000, title = "First Prestige", desc = "Prestige for the first time.", iconId = "rbxassetid://14916846070" }, 
-	{ id = 000000000, title = "Millionaire", desc = "Hold $1,000,000 at once.", iconId = "rbxassetid://14916846070" }, 
-}
-
--- Helper function to check if a boost is unlocked
-function AchievementConfig.IsBoostUnlocked(boostId, playerData)
-	for _, challenge in ipairs(AchievementConfig.Challenges) do
-		if challenge.boostId == boostId then
-			local currentAmount = playerData[challenge.statKey] or 0
-			if currentAmount < challenge.goal then
-				return false, challenge.desc -- Returns false and tells you why!
-			end
-		end
-	end
-	return true, ""
+function TutorialConfig.GetStepByIndex(index)
+	return TutorialConfig.Steps[index]
 end
 
-return AchievementConfig
+function TutorialConfig.GetStepById(id)
+	for _, step in ipairs(TutorialConfig.Steps) do
+		if step.id == id then return step end
+	end
+	return nil
+end
+
+return TutorialConfig
