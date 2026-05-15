@@ -1,229 +1,501 @@
--- AreaTransitionController
--- Location: StarterPlayer > StarterPlayerScripts > AreaTransitionController
+-- UIController
+-- Location: StarterPlayer > StarterPlayerScripts > UIController
 
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TweenService      = game:GetService("TweenService")
-local Lighting          = game:GetService("Lighting")
+local Debris            = game:GetService("Debris")
+local UserInputService  = game:GetService("UserInputService") 
+local CollectionService = game:GetService("CollectionService")
 
-local AreaRegistry = require(ReplicatedStorage.Modules.AreaRegistry)
-local VFX_API = require(ReplicatedStorage:WaitForChild("vfx"))
+local AdminConfig       = require(ReplicatedStorage.Modules.AdminConfig)
+local Formatter         = require(ReplicatedStorage.Modules.NumberFormatter)
+local UITheme           = require(ReplicatedStorage.Modules.UITheme)
 
-local AreaChanged = ReplicatedStorage.RemoteEvents:WaitForChild("AreaChanged")
-local AreaUpdated = ReplicatedStorage.RemoteEvents:WaitForChild("AreaUpdated")
+local BridgeNet2             = require(ReplicatedStorage.Modules:WaitForChild("BridgeNet2"))
+local UpdateHUDBridge        = BridgeNet2.ClientBridge("UpdateHUD")
+local ShipAurasBridge        = BridgeNet2.ClientBridge("ShipAuras")
+local UpdateHatcheryBridge   = BridgeNet2.ClientBridge("UpdateHatchery")
 
-local player = Players.LocalPlayer
+local player    = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
-local Map        = workspace:WaitForChild("Map")
-local AuraHolder = workspace:WaitForChild("AuraHolder")
-local HabitatHolder = workspace:WaitForChild("HabitatHolder") 
-local AreaAssets = ReplicatedStorage:WaitForChild("AreaAssets")
-local MapIgnore  = Map:FindFirstChild("Ignore")
-local HabitatPositionPart = HabitatHolder:WaitForChild("Position") 
-local PositionPart = AuraHolder:WaitForChild("Position")
+local HabitatFull = ReplicatedStorage.RemoteEvents:WaitForChild("HabitatFull")
+local mainHUD   = playerGui:WaitForChild("MainHUD")
 
-local DECORATION_CONTAINER = Map:WaitForChild("Path")
+local isAutoMode          = AdminConfig.AutoDispatch
+local HabitatHolder       = workspace:WaitForChild("HabitatHolder")
+local GoldenAurasLabel    = mainHUD:WaitForChild("GoldenAurasLabel")
 
-local MAP_PART_COLORS = {
-	Floor      = "grassColor",
-	AssetFloor = "grassColor",
-	Path       = "pathColor",
-}
+local displayedCurrency   = 0
+local liveGoldenAuras     = 0
+local ratePerSecond       = 0
+local pendingAuras        = 0
+local habitatCapacity     = AdminConfig.BaseHabitatCapacity
+local passiveInterval     = AdminConfig.PassiveInterval
+local currentCooldownTime = 15
+local isShipOnCooldown    = false
+local sharedCooldownEnd   = 0
+local manualCooldownLoopID = 0
+local autoLoopID          = 0
+local currentHatcheryLevel = AdminConfig.HatcheryMax or 150 
 
-local currentAuraModel = nil
-local currentHabitatModel = nil
+local function FormatCurrency(n)
+	local num = tonumber(n) or 0
+	if num < 1000 then return string.format("%.2f", num)
+	else return Formatter.Format(num) end
+end
 
--- ✨ THE FIX: A clean white flash transition to hide the instant model swapping!
-local function PlayAreaFlash()
-	local flash = Instance.new("Frame")
-	flash.Size = UDim2.new(1, 0, 1, 0)
-	flash.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-	flash.BackgroundTransparency = 1
-	flash.ZIndex = 100000
+local function FormatNumber(n) return Formatter.Format(math.floor(tonumber(n) or 0)) end
 
-	local gui = Instance.new("ScreenGui")
-	gui.Name = "AreaFlashGui"
-	gui.IgnoreGuiInset = true
-	gui.DisplayOrder = 100000
-	flash.Parent = gui
-	gui.Parent = playerGui
+local hud        = playerGui:WaitForChild("MainHUD")
+local curr       = hud:WaitForChild("CurrencyLabel")
+local rate       = hud:WaitForChild("RateLabel")
+local sendButton = hud:WaitForChild("SendButton")
+local modeToggle = hud:WaitForChild("ModeToggle")
 
-	TweenService:Create(flash, TweenInfo.new(0.2, Enum.EasingStyle.Sine), {BackgroundTransparency = 0}):Play()
+CollectionService:AddTag(sendButton, "Tutorial_SendShipBtn")
+CollectionService:AddTag(modeToggle, "Tutorial_ToggleShipBtn")
 
-	task.delay(0.3, function()
-		local tOut = TweenService:Create(flash, TweenInfo.new(0.8, Enum.EasingStyle.Sine), {BackgroundTransparency = 1})
-		tOut:Play()
-		tOut.Completed:Connect(function() gui:Destroy() end)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ✨ INSTANT UI RESPONSIVENESS (Purchases & Juice Masks) ✨
+-- ─────────────────────────────────────────────────────────────────────────────
+local function UpdateWalletVisual()
+	local pendingCash = player:GetAttribute("LocalPendingPayout") or 0
+	curr.Text = "Currency: $" .. FormatCurrency(math.max(0, displayedCurrency - pendingCash))
+end
+
+local function UpdateAuraVisual()
+	local pendingAurasVis = player:GetAttribute("LocalPendingAuras") or 0
+	GoldenAurasLabel.Text = "GAURAS: " .. FormatNumber(math.max(0, liveGoldenAuras - pendingAurasVis))
+end
+
+player:GetAttributeChangedSignal("LocalSpend"):Connect(function()
+	local spend = player:GetAttribute("LocalSpend") or 0
+	if spend > 0 then
+		displayedCurrency = math.max(0, displayedCurrency - spend)
+		UpdateWalletVisual()
+		player:SetAttribute("LocalSpend", 0)
+	end
+end)
+
+player:GetAttributeChangedSignal("LocalAuraSpend"):Connect(function()
+	local spend = player:GetAttribute("LocalAuraSpend") or 0
+	if spend > 0 then
+		liveGoldenAuras = math.max(0, liveGoldenAuras - spend)
+		UpdateAuraVisual()
+		player:SetAttribute("LocalAuraSpend", 0)
+	end
+end)
+
+player:GetAttributeChangedSignal("LocalPendingPayout"):Connect(UpdateWalletVisual)
+player:GetAttributeChangedSignal("LocalPendingAuras"):Connect(UpdateAuraVisual)
+
+local function FormatRate(perSecond)
+	if perSecond <= 0 then return "$0.00/sec" end
+	return "$" .. FormatCurrency(perSecond) .. "/sec"
+end
+
+local function GetRateColor(pending, capacity)
+	local ratio = math.clamp((pending or 0) / (capacity or 50), 0, 1)
+	if ratio >= 1        then return Color3.fromRGB(255, 60,  60)
+	elseif ratio >= 0.75 then return Color3.fromRGB(255, 200,  0)
+	elseif ratio >= 0.5  then return Color3.fromRGB(80,  255, 80)
+	else                      return Color3.fromRGB(80,  180, 80)
+	end
+end
+
+local function UpdateHabitatBar(actualPending, capacity)
+	-- ✨ SYNC: Add our visual mask so the bar only drains when the magnet works
+	local offset = player:GetAttribute("HabitatVisualOffset") or 0
+	local visualPending = actualPending + offset
+
+	local ratio    = math.clamp(visualPending / (capacity or 50), 0, 1)
+	local color    = GetRateColor(visualPending, capacity)
+	local model    = HabitatHolder:FindFirstChild("HabitatModel")
+	if model then
+		local gui    = model:FindFirstChild("HabitatGui")
+		local barBg  = gui and gui:FindFirstChild("BarBackground")
+		local barFill = barBg and barBg:FindFirstChild("BarFill")
+		if barFill then
+			TweenService:Create(barFill, TweenInfo.new(0.3), {
+				Size = UDim2.new(ratio, 0, 1, 0),
+				BackgroundColor3 = color,
+			}):Play()
+		end
+	end
+end
+
+-- Allow the UI to react instantly whenever the magnet consumes a block
+player:GetAttributeChangedSignal("HabitatVisualOffset"):Connect(function()
+	UpdateHabitatBar(pendingAuras, habitatCapacity)
+end)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ✨ WARNING POPUP SYSTEM
+-- ─────────────────────────────────────────────────────────────────────────────
+local activeAlerts = {}
+
+local function ShowAlertPopup(alertType, text, iconColor)
+	if tick() - (activeAlerts[alertType] or 0) < 2.5 then return end
+	activeAlerts[alertType] = tick()
+
+	local ratePos = rate.AbsolutePosition
+	local rateSize = rate.AbsoluteSize
+
+	local alertW = 200
+	local alertH = 40
+	local padding = 15
+
+	local endX = ratePos.X - padding
+	local startX = endX + 40
+	local startY = ratePos.Y + (rateSize.Y / 2)
+
+	local effectGui = Instance.new("ScreenGui")
+	effectGui.Name = "AlertGui_" .. alertType
+	effectGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	effectGui.Parent = playerGui
+
+	local alertFrame = Instance.new("Frame")
+	alertFrame.Size = UDim2.new(0, alertW, 0, alertH)
+	alertFrame.AnchorPoint = Vector2.new(1, 0.5)
+	alertFrame.Position = UDim2.new(0, startX, 0, startY)
+	alertFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+	alertFrame.BorderSizePixel = 0
+	alertFrame.BackgroundTransparency = 1 
+	alertFrame.Parent = effectGui
+
+	local corner = Instance.new("UICorner", alertFrame)
+	corner.CornerRadius = UDim.new(0.5, 0)
+
+	local stroke = Instance.new("UIStroke", alertFrame)
+	stroke.Color = iconColor
+	stroke.Thickness = 2
+	stroke.Transparency = 1
+
+	local icon = Instance.new("ImageLabel", alertFrame)
+	icon.Size = UDim2.new(0, 20, 0, 20)
+	icon.Position = UDim2.new(0, 10, 0.5, -10)
+	icon.BackgroundTransparency = 1
+	icon.Image = "rbxassetid://7733658504" 
+	icon.ImageColor3 = iconColor
+	icon.ImageTransparency = 1
+
+	local msg = Instance.new("TextLabel", alertFrame)
+	msg.Size = UDim2.new(1, -40, 1, 0)
+	msg.Position = UDim2.new(0, 35, 0, 0)
+	msg.BackgroundTransparency = 1
+	msg.Text = text
+	msg.TextColor3 = iconColor
+	msg.Font = Enum.Font.GothamBold
+	msg.TextScaled = true
+	msg.TextTransparency = 1
+	msg.TextXAlignment = Enum.TextXAlignment.Left
+
+	local sfxFolder = ReplicatedStorage:FindFirstChild("SFX") or ReplicatedStorage:FindFirstChild("Sounds")
+	if sfxFolder and sfxFolder:FindFirstChild("ErrorBuzz") then
+		local sfx = sfxFolder.ErrorBuzz:Clone()
+		sfx.Parent = game:GetService("SoundService")
+		sfx.Volume = 0.5
+		sfx:Play()
+		Debris:AddItem(sfx, 2)
+	end
+
+	TweenService:Create(alertFrame, TweenInfo.new(0.4, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+		Position = UDim2.new(0, endX, 0, startY),
+		BackgroundTransparency = 0.1
+	}):Play()
+	TweenService:Create(stroke, TweenInfo.new(0.4), {Transparency = 0}):Play()
+	TweenService:Create(icon, TweenInfo.new(0.4), {ImageTransparency = 0}):Play()
+	TweenService:Create(msg, TweenInfo.new(0.4), {TextTransparency = 0}):Play()
+
+	task.delay(2, function()
+		if not alertFrame.Parent then return end
+		TweenService:Create(alertFrame, TweenInfo.new(0.3, Enum.EasingStyle.Sine, Enum.EasingDirection.In), {
+			Position = UDim2.new(0, startX, 0, startY),
+			BackgroundTransparency = 1
+		}):Play()
+		TweenService:Create(stroke, TweenInfo.new(0.3), {Transparency = 1}):Play()
+		TweenService:Create(icon, TweenInfo.new(0.3), {ImageTransparency = 1}):Play()
+		TweenService:Create(msg, TweenInfo.new(0.3), {TextTransparency = 1}):Play()
+		Debris:AddItem(effectGui, 0.4)
 	end)
 end
 
-local function GetAuraTemplate(areaIndex)
-	local folder  = AreaAssets:FindFirstChild("Area" .. areaIndex)
-	local rsModel = folder and folder:FindFirstChild("AuraModel")
-	if rsModel then return rsModel end
+HabitatFull.OnClientEvent:Connect(function()
+	ShowAlertPopup("HabitatFull", "HABITAT FULL!", Color3.fromRGB(255, 80, 80))
+end)
 
-	if MapIgnore then
-		local ignoreModel = MapIgnore:FindFirstChild("Area" .. areaIndex .. "Aura")
-		if ignoreModel then return ignoreModel end
+UpdateHatcheryBridge:Connect(function(info)
+	currentHatcheryLevel = info.current
+	if info.current <= 0 then
+		ShowAlertPopup("HatcheryEmpty", "HATCHERY EMPTY!", Color3.fromRGB(255, 180, 50))
 	end
-	return nil
-end
+end)
 
-local function SwapAuraHolder(areaIndex)
-	local template = GetAuraTemplate(areaIndex)
-	if not template then return end
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 
-	-- Instant swap prevents all transparency bugs
-	for _, child in ipairs(AuraHolder:GetChildren()) do
-		if child ~= PositionPart then 
-			pcall(function() VFX_API.disable(child) end)
-			child:Destroy() 
-		end
-	end
-	currentAuraModel = nil
-
-	local newModel = template:Clone()
-	newModel.Parent = AuraHolder
-	currentAuraModel = newModel
-	pcall(function() VFX_API.enable(newModel) end)
-end
-
-local function GetHabitatTemplate(areaIndex)
-	local folder  = AreaAssets:FindFirstChild("Area" .. areaIndex)
-	local rsModel = folder and folder:FindFirstChild("HabitatModel")
-	if rsModel then return rsModel end
-
-	if MapIgnore then
-		local ignoreModel = MapIgnore:FindFirstChild("Area" .. areaIndex .. "Habitat")
-		if ignoreModel then return ignoreModel end
-	end
-	return nil
-end
-
-local function SwapHabitat(areaIndex)
-	local template = GetHabitatTemplate(areaIndex)
-	if not template then return end
-
-	for _, child in ipairs(HabitatHolder:GetChildren()) do
-		if child ~= HabitatPositionPart then child:Destroy() end
-	end
-	currentHabitatModel = nil
-	local newModel = template:Clone()
-	newModel.Parent = HabitatHolder
-	currentHabitatModel = newModel
-end
-
-local function ApplyMapColors(areaData)
-	for _, part in ipairs(Map:GetChildren()) do
-		if part:IsA("BasePart") then
-			local key   = MAP_PART_COLORS[part.Name]
-			local color = key and areaData[key]
-			if color then
-				pcall(function() part.Color = color end)
+		local clickedMainButton = false
+		if gameProcessed then
+			local guis = playerGui:GetGuiObjectsAtPosition(input.Position.X, input.Position.Y)
+			for _, gui in ipairs(guis) do
+				if gui.Name == "ClickButton" then
+					clickedMainButton = true
+					break
+				end
 			end
 		end
-	end
-end
 
-local function ApplyLighting(areaIndex)
-	local preset = AreaRegistry.GetLighting(areaIndex)
+		if not clickedMainButton then return end
 
-	local props = {}
-	if preset.ClockTime then props.ClockTime = preset.ClockTime end
-	if preset.Brightness then props.Brightness = preset.Brightness end
-	if preset.FogEnd then props.FogEnd = preset.FogEnd end
-	if preset.FogStart then props.FogStart = preset.FogStart end
-	if preset.Ambient then props.Ambient = preset.Ambient end
-	if preset.FogColor then props.FogColor = preset.FogColor end 
-
-	for prop, val in pairs(props) do pcall(function() Lighting[prop] = val end) end
-
-	local atmosphere = Lighting:FindFirstChildOfClass("Atmosphere")
-	if atmosphere then
-		local atmoProps = {}
-		if preset.Density then atmoProps.Density = preset.Density end
-		if preset.Haze then atmoProps.Haze = preset.Haze end
-		if preset.AtmosphereColor then atmoProps.Color = preset.AtmosphereColor end
-
-		for prop, val in pairs(atmoProps) do pcall(function() atmosphere[prop] = val end) end
-	end
-
-	local sunRays = Lighting:FindFirstChildOfClass("SunRaysEffect")
-	if sunRays then
-		local rayProps = { Intensity = preset.SunRaysIntensity or 0.25 }
-		for prop, val in pairs(rayProps) do pcall(function() sunRays[prop] = val end) end
-	end
-end
-
-local function ApplySkybox(areaIndex)
-	local preset = AreaRegistry.GetLighting(areaIndex)
-	local sky = Lighting:FindFirstChildOfClass("Sky")
-	if not sky then return end
-
-	if preset.skyboxBk and preset.skyboxBk ~= "" then pcall(function() sky.SkyboxBk = preset.skyboxBk end) end
-	if preset.skyboxDn and preset.skyboxDn ~= "" then pcall(function() sky.SkyboxDn = preset.skyboxDn end) end
-	if preset.skyboxFt and preset.skyboxFt ~= "" then pcall(function() sky.SkyboxFt = preset.skyboxFt end) end
-	if preset.skyboxLf and preset.skyboxLf ~= "" then pcall(function() sky.SkyboxLf = preset.skyboxLf end) end
-	if preset.skyboxRt and preset.skyboxRt ~= "" then pcall(function() sky.SkyboxRt = preset.skyboxRt end) end
-	if preset.skyboxUp and preset.skyboxUp ~= "" then pcall(function() sky.SkyboxUp = preset.skyboxUp end) end
-end
-
-local function ApplyAuraHolderTint(areaData)
-	if not areaData.auraHolderColor and not areaData.auraHolderGlow then return end
-	for _, part in ipairs(AuraHolder:GetDescendants()) do
-		if currentAuraModel and part:IsDescendantOf(currentAuraModel) then continue end
-		if part == PositionPart then continue end
-		if part:IsA("BasePart") and areaData.auraHolderColor then
-			pcall(function() part.Color = areaData.auraHolderColor end)
+		if currentHatcheryLevel <= 0.5 then
+			ShowAlertPopup("HatcheryEmpty", "HATCHERY EMPTY!", Color3.fromRGB(255, 180, 50))
+		elseif pendingAuras >= habitatCapacity then
+			ShowAlertPopup("HabitatFull", "HABITAT FULL!", Color3.fromRGB(255, 80, 80))
 		end
-		if part:IsA("PointLight") and areaData.auraHolderGlow then
-			pcall(function() part.Color = areaData.auraHolderGlow end)
-		end
-	end
-end
-
-local function SwapDecorations(areaIndex)
-	local folder = AreaAssets:FindFirstChild("Area" .. areaIndex)
-	local newDec = folder and folder:FindFirstChild("Decorations")
-
-	for _, child in ipairs(DECORATION_CONTAINER:GetChildren()) do child:Destroy() end
-
-	if newDec then
-		for _, obj in ipairs(newDec:GetChildren()) do
-			obj:Clone().Parent = DECORATION_CONTAINER
-		end
-	end
-end
-
-local function ApplyAreaConfig(areaIndex, isTeleporting)
-	local areaData = AreaRegistry.Get(areaIndex)
-
-	if isTeleporting then
-		PlayAreaFlash()
-		task.wait(0.2) 
-	end
-
-	SwapAuraHolder(areaIndex)
-	SwapHabitat(areaIndex) 
-	SwapDecorations(areaIndex)
-
-	if areaData then
-		ApplyMapColors(areaData)
-		ApplyLighting(areaIndex) 
-		ApplySkybox(areaIndex)   
-		ApplyAuraHolderTint(areaData)
-	end
-end
-
-local appliedOnJoin = false
-AreaUpdated.OnClientEvent:Connect(function(info)
-	if not appliedOnJoin then
-		appliedOnJoin = true
-		ApplyAreaConfig(info.currentArea or 1, false) 
 	end
 end)
 
-AreaChanged.OnClientEvent:Connect(function(info)
-	ApplyAreaConfig(info.newArea or 1, true) 
+local function SyncManualCooldownVisuals()
+	if isAutoMode or not sendButton.Visible then return end
+
+	local progressContainer = sendButton:FindFirstChild("CooldownProgress")
+	local fillPart          = progressContainer and progressContainer:FindFirstChild("Fill")
+	local textTarget        = sendButton:FindFirstChildOfClass("TextLabel") or sendButton
+
+	local uiStroke = sendButton:FindFirstChildOfClass("UIStroke") or Instance.new("UIStroke", sendButton)
+	uiStroke.Thickness = 1.5
+
+	if not fillPart then return end
+
+	sendButton.ClipsDescendants = true
+	progressContainer.Size     = UDim2.new(1, 0, 1, 0)
+	progressContainer.Position = UDim2.new(0, 0, 0, 0)
+	progressContainer.AnchorPoint = Vector2.new(0, 0)
+
+	fillPart.BorderSizePixel = 0
+	fillPart.AnchorPoint     = Vector2.new(0, 1)
+	fillPart.Position        = UDim2.new(0, 0, 1, 0)
+
+	manualCooldownLoopID += 1
+	local currentLoop = manualCooldownLoopID
+	local timeLeft    = sharedCooldownEnd - tick()
+
+	sendButton.BackgroundColor3    = Color3.fromRGB(0, 160, 255)
+	uiStroke.Color                 = Color3.fromRGB(0, 220, 255)
+	fillPart.BackgroundColor3      = Color3.fromRGB(0, 0, 0)
+	fillPart.BackgroundTransparency = 0.55
+
+	if timeLeft > 0 then
+		isShipOnCooldown = true
+		if textTarget ~= sendButton then sendButton.Text = "" end
+
+		task.spawn(function()
+			while timeLeft > 0 and manualCooldownLoopID == currentLoop do
+				local pct = timeLeft / currentCooldownTime
+				TweenService:Create(fillPart, TweenInfo.new(0.1, Enum.EasingStyle.Linear), {
+					Size = UDim2.new(1, 0, pct, 0)
+				}):Play()
+				task.wait(0.1)
+				timeLeft = sharedCooldownEnd - tick()
+			end
+
+			if manualCooldownLoopID == currentLoop then
+				isShipOnCooldown  = false
+				textTarget.Text   = ""
+				fillPart.Size     = UDim2.new(1, 0, 0, 0)
+			end
+		end)
+	else
+		isShipOnCooldown = false
+		textTarget.Text  = ""
+		fillPart.Size    = UDim2.new(1, 0, 0, 0)
+	end
+end
+
+local function UpdateSendButton()
+	if AdminConfig.DisableShipping then sendButton.Visible = false; return end
+	sendButton.Visible = not isAutoMode and pendingAuras > 0
+	if sendButton.Visible then
+		SyncManualCooldownVisuals()
+	end
+end
+
+local autoProgressContainer = Instance.new("Frame")
+autoProgressContainer.Name             = "AutoProgressContainer"
+autoProgressContainer.Size             = UDim2.new(0, 12, 1, 0)
+autoProgressContainer.Position         = UDim2.new(1, 8, 0, 0)
+autoProgressContainer.BackgroundColor3 = Color3.fromRGB(24, 60, 24)
+autoProgressContainer.BorderSizePixel  = 0
+autoProgressContainer.Visible          = false
+autoProgressContainer.Parent           = modeToggle
+Instance.new("UICorner", autoProgressContainer).CornerRadius = UDim.new(0.5, 0)
+
+local autoFillClip = Instance.new("Frame")
+autoFillClip.Size                 = UDim2.new(1, 0, 1, 0)
+autoFillClip.BackgroundTransparency = 1
+autoFillClip.ClipsDescendants     = true
+autoFillClip.Parent               = autoProgressContainer
+Instance.new("UICorner", autoFillClip).CornerRadius = UDim.new(0.5, 0)
+
+local autoFill = Instance.new("Frame")
+autoFill.Name             = "Fill"
+autoFill.Size             = UDim2.new(1, 0, 1, 0)
+autoFill.Position         = UDim2.new(0, 0, 1, 0)
+autoFill.AnchorPoint      = Vector2.new(0, 1)
+autoFill.BackgroundColor3 = Color3.fromRGB(0, 255, 128)
+autoFill.BorderSizePixel  = 0
+autoFill.Parent           = autoFillClip
+
+local function UpdateModeToggleVisuals()
+	local textLabel = modeToggle:FindFirstChildOfClass("TextLabel") or modeToggle
+	local uiStroke  = modeToggle:FindFirstChildOfClass("UIStroke")
+
+	autoLoopID += 1
+	local currentLoop = autoLoopID
+
+	if isAutoMode then
+		modeToggle.BackgroundColor3 = Color3.fromRGB(24, 60, 24)
+		textLabel.Text              = "[AUTO ACTIVE]"
+		textLabel.TextColor3        = Color3.fromRGB(0, 255, 128)
+		if uiStroke then uiStroke.Color = Color3.fromRGB(0, 255, 128) end
+
+		autoProgressContainer.Visible = true
+
+		task.spawn(function()
+			while isAutoMode and autoLoopID == currentLoop do
+				local timeLeft = sharedCooldownEnd - tick()
+
+				if timeLeft <= 0 then
+					sharedCooldownEnd = tick() + currentCooldownTime
+					timeLeft = currentCooldownTime
+
+					if pendingAuras > 0 then
+						ShipAurasBridge:Fire({ action = "manual" })
+						if type(shared.TutorialRecordShipSent) == "function" then shared.TutorialRecordShipSent() end
+					end
+				end
+
+				local pct = timeLeft / currentCooldownTime
+				autoFill.Size = UDim2.new(1, 0, pct, 0)
+
+				local tween = TweenService:Create(autoFill, TweenInfo.new(timeLeft, Enum.EasingStyle.Linear), {
+					Size = UDim2.new(1, 0, 0, 0)
+				})
+				tween:Play()
+
+				local elapsed = 0
+				while elapsed < timeLeft and isAutoMode and autoLoopID == currentLoop do
+					task.wait(0.1)
+					elapsed += 0.1
+				end
+
+				if tween then tween:Cancel() end
+			end
+		end)
+	else
+		modeToggle.BackgroundColor3 = Color3.fromRGB(38, 38, 45)
+		textLabel.Text              = "Mode: Manual"
+		textLabel.TextColor3        = Color3.fromRGB(220, 230, 240)
+		if uiStroke then uiStroke.Color = Color3.fromRGB(100, 180, 220) end
+
+		autoProgressContainer.Visible = false
+	end
+end
+
+---------------------------------------------------------------
+-- ✨ SEND BUTTON CLICK
+---------------------------------------------------------------
+sendButton.MouseButton1Down:Connect(function()
+	if AdminConfig.DisableShipping then return end
+	if isAutoMode or isShipOnCooldown or pendingAuras <= 0 then return end
+
+	if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_SendShip") then return end
+
+	ShipAurasBridge:Fire({ action = "manual" })
+	sharedCooldownEnd = tick() + currentCooldownTime
+	SyncManualCooldownVisuals()
+
+	if type(shared.TutorialRecordShipSent) == "function" then shared.TutorialRecordShipSent() end
+	if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
 end)
+
+modeToggle.MouseButton1Down:Connect(function()
+	if AdminConfig.DisableShipping then return end
+
+	if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_ToggleAutoShip") then return end
+
+	isAutoMode = not isAutoMode
+	ShipAurasBridge:Fire({ action = "setMode", value = isAutoMode and "auto" or "manual" })
+
+	UpdateModeToggleVisuals()
+	UpdateSendButton()
+
+	if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
+end)
+
+UpdateModeToggleVisuals()
+sendButton.Visible = false
+
+if AdminConfig.DisableShipping then
+	isAutoMode         = false
+	sendButton.Visible = false
+	modeToggle.Visible = false
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ✨ STRICT SERVER AUTHORITY LISTENER ✨
+-- ─────────────────────────────────────────────────────────────────────────────
+UpdateHUDBridge:Connect(function(stats)
+
+	if stats.currency ~= nil then
+		displayedCurrency = stats.currency
+		player:SetAttribute("LiveCurrency", displayedCurrency)
+		UpdateWalletVisual()
+	end
+
+	if stats.goldenAuras ~= nil then
+		liveGoldenAuras = stats.goldenAuras
+		player:SetAttribute("LiveGoldenAuras", liveGoldenAuras)
+		UpdateAuraVisual()
+	end
+
+	if stats.pendingAuras ~= nil then
+		pendingAuras    = stats.pendingAuras
+		habitatCapacity = stats.habitatCapacity or habitatCapacity
+		UpdateHabitatBar(pendingAuras, habitatCapacity)
+		UpdateSendButton()
+	end
+
+	if stats.rate ~= nil then
+		passiveInterval = stats.passiveInterval or passiveInterval
+		local serverRate = stats.rate
+		ratePerSecond = (passiveInterval > 0 and serverRate > 0) and serverRate / passiveInterval or 0
+
+		rate.Text = FormatRate(ratePerSecond)
+		TweenService:Create(rate, TweenInfo.new(0.3), { TextColor3 = GetRateColor(pendingAuras, habitatCapacity) }):Play()
+	end
+
+	if stats.shipCooldown ~= nil then
+		currentCooldownTime = stats.shipCooldown
+	end
+end)
+
+-- ✨ FLASH GREEN WHEN SHIP PAYS OUT
+ShipAurasBridge:Connect(function(info)
+	if type(info) == "table" and info.action == "payoutConfirmed" then
+		local amt = info.amount or 0
+		if amt > 0 then
+			if type(shared.TutorialRecordEarned) == "function" then shared.TutorialRecordEarned(amt) end
+			curr.TextColor3 = Color3.fromRGB(80, 255, 80)
+			TweenService:Create(curr, TweenInfo.new(0.5), { TextColor3 = Color3.fromRGB(255, 255, 255) }):Play()
+		end
+	end
+end)
+
+local function RefreshLook()
+	UITheme.ApplyFlair(GoldenAurasLabel, "GoldStroke")
+end
+task.wait(2)
+RefreshLook()
