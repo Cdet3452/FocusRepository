@@ -1,743 +1,725 @@
--- TutorialController
--- Location: StarterPlayer > StarterPlayerScripts > TutorialController
+-- MainMenuController
+-- Location: StarterPlayer > StarterPlayerScripts > MainMenuController
+--
+-- Shows a title screen on join with the live game world as the background.
+-- Camera locks to area-specific "MenuCamPos_N" Parts in Workspace.
+-- Background is blurred using the existing UITheme MenuBlur system.
+-- All sizes/positions driven by UIConfig.MainMenu, all colors from UITheme.
+-- Player clicks PLAY → black fade transition → camera released → game begins.
 
-local Players = game:GetService("Players")
+local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local CollectionService = game:GetService("CollectionService")
-local RunService = game:GetService("RunService")
-local TweenService = game:GetService("TweenService")
-local Workspace = game:GetService("Workspace")
+local TweenService      = game:GetService("TweenService")
+local RunService        = game:GetService("RunService")
+local ContentProvider   = game:GetService("ContentProvider")
 
-local TutorialConfig = require(ReplicatedStorage.Modules.TutorialConfig)
 local UITheme = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("UITheme"))
 local T = UITheme.Get("Custom")
-local SoundConfig = require(ReplicatedStorage.Modules.SoundConfig)
-local Formatter = require(ReplicatedStorage.Modules.NumberFormatter)
+local C = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("UIConfig"))
+local M = C.MainMenu
+
+-- ✨ IMPORT POOL MANAGER
+local PoolManager = require(ReplicatedStorage.Modules:WaitForChild("PoolManager"))
+
+local player    = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local mainHUD   = playerGui:WaitForChild("MainHUD")
+local camera    = workspace.CurrentCamera
 
 local RemoteEvents = ReplicatedStorage:WaitForChild("RemoteEvents")
-local TutorialStepComplete = RemoteEvents:WaitForChild("TutorialStepComplete", 10)
+local AreaUpdated  = RemoteEvents:WaitForChild("AreaUpdated")
 
-local BridgeNet2 = require(ReplicatedStorage.Modules:WaitForChild("BridgeNet2"))
-local UpdateHUDBridge = BridgeNet2.ClientBridge("UpdateHUD")
+---------------------------------------------------------------
+-- GATE: Create the BindableEvent other scripts wait on
+---------------------------------------------------------------
+local MenuDismissed = Instance.new("BindableEvent")
+MenuDismissed.Name = "MenuDismissed"
+MenuDismissed.Parent = ReplicatedStorage
 
-local ForceCloseUI = ReplicatedStorage:FindFirstChild("ForceCloseUI")
-if not ForceCloseUI then
-	ForceCloseUI = Instance.new("BindableEvent")
-	ForceCloseUI.Name = "ForceCloseUI"
-	ForceCloseUI.Parent = ReplicatedStorage
+---------------------------------------------------------------
+-- DEV TOGGLE: Set to false to skip the menu entirely
+---------------------------------------------------------------
+local MENU_ENABLED = true
+
+if not MENU_ENABLED then
+	MenuDismissed:SetAttribute("Fired", true)
+	MenuDismissed:Fire()
+	return
 end
 
-local player = Players.LocalPlayer
-local playerGui = player:WaitForChild("PlayerGui")
-local camera = Workspace.CurrentCamera
+---------------------------------------------------------------
+-- CONSTANTS (driven by UIConfig.MainMenu)
+---------------------------------------------------------------
+local FADE_IN_TIME   = M.FadeInTime or 0.8
+local FADE_HOLD_TIME = M.FadeHoldTime or 1
+local FADE_OUT_TIME  = M.FadeOutTime or 1.2
+local IDLE_SPEED     = M.IdleSpeed or 5
+local LEFT           = M.LeftMargin
+local TITLE_FONT     = T.font or Enum.Font.FredokaOne
+local BODY_FONT      = T.fontBody or Enum.Font.FredokaOne
+local DEFAULT_AREA   = 1
 
 ---------------------------------------------------------------
 -- STATE
 ---------------------------------------------------------------
-local currentStepIndex = 1
-local tutorialComplete = false
-local tutorialActive = false
-
-local activeFallbackStep = nil
-local lastDisplayedStepId = nil 
-
-local actionMatchedForAdvance = false 
-local isAdvancing = false 
-
-local liveStats = {
-	currency = 0,
-	totalEarned = 0,
-	farmEvaluation = 0,
-	soulAuras = 0,
-	goldenAuras = 0,
-	prestigeCount = 0,
-	currentArea = 1,
-	totalCubesProduced = 0,
-	totalPlatformsShipped = 0,
-	totalLegendaryCubes = 0,
-	piggyBank = 0,
-
-	pendingAuras = 0,
-	habitatCapacity = 99999,
-	rate = 0,
-	currentMultiplier = 1,
-
-	boostsBought = {},
-	boostsUsed = {}
-}
-
-local UpdateMultiplier = ReplicatedStorage:WaitForChild("UpdateMultiplier")
-UpdateMultiplier.Event:Connect(function(mult)
-	liveStats.currentMultiplier = mult
-end)
-
-local baselineCubes = 0
-local baselineShipped = 0
-local baselineGoldenAuras = 0
-local baselineBoostsBought = {}
-local baselineBoostsUsed = {}
-
-local function GetStepCubes() return math.max(0, liveStats.totalCubesProduced - baselineCubes) end
-local function GetStepShipped() return math.max(0, liveStats.totalPlatformsShipped - baselineShipped) end
-local function GetStepBoostsBought(id) return math.max(0, (liveStats.boostsBought[id] or 0) - (baselineBoostsBought[id] or 0)) end
-local function GetStepBoostsUsed(id) return math.max(0, (liveStats.boostsUsed[id] or 0) - (baselineBoostsUsed[id] or 0)) end
-
-local function GetStepGoldenAuras() 
-	local current = player:GetAttribute("LiveGoldenAuras") or liveStats.goldenAuras
-	return math.max(0, current - baselineGoldenAuras) 
-end
-
-local lockedAura = nil
-
-local function GetActiveAura()
-	if lockedAura and lockedAura.Parent and lockedAura.Parent.Name == "AuraHolder" and lockedAura:GetAttribute("AuraCube") then 
-		return lockedAura 
-	end
-	local auraHolder = Workspace:FindFirstChild("AuraHolder")
-	if auraHolder then
-		local children = auraHolder:GetChildren()
-		for i = #children, 1, -1 do
-			local child = children[i]
-			if child:GetAttribute("AuraCube") then lockedAura = child; return child end
-		end
-	end
-	return nil
-end
-
-local currentTrackedPhysicsAura = nil
-
-local function GetActivePhysicsAura()
-	if currentTrackedPhysicsAura and currentTrackedPhysicsAura.Parent and currentTrackedPhysicsAura.Parent.Name == "AuraHolder" and not currentTrackedPhysicsAura:GetAttribute("Landed") then
-		return currentTrackedPhysicsAura
-	end
-
-	local auras = CollectionService:GetTagged("PhysicsAura")
-	for _, aura in ipairs(auras) do
-		if aura and aura.Parent and aura.Parent.Name == "AuraHolder" and not aura:GetAttribute("Landed") then
-			currentTrackedPhysicsAura = aura
-			return aura
-		end
-	end
-
-	currentTrackedPhysicsAura = nil
-	return nil
-end
-
-shared.TutorialRecordAuraSpawned = function() liveStats.totalCubesProduced += 1 end
-shared.TutorialRecordShipSent = function() task.delay(4, function() liveStats.totalPlatformsShipped += 1 end) end
-shared.TutorialRecordBoostBought = function(id) liveStats.boostsBought[id] = (liveStats.boostsBought[id] or 0) + 1 end
-shared.TutorialRecordBoostUsed = function(id) liveStats.boostsUsed[id] = (liveStats.boostsUsed[id] or 0) + 1 end
-
-local tutorialGui = nil
-local activePointer = nil
-local activeHighlight = nil
-local questBanner = nil
-local trackingConnection = nil
+local currentArea     = DEFAULT_AREA
+local hasPlayed       = false
+local idleConn        = nil
+local areaConn        = nil
 
 ---------------------------------------------------------------
--- VISIBILITY & GATING EVALUATION
+-- 1. HIDE THE GAME HUD IMMEDIATELY
 ---------------------------------------------------------------
-local function IsVisibleOnScreen(guiObject)
-	local current = guiObject
-	while current and current ~= game do
-		if current:IsA("GuiObject") and not current.Visible then return false
-		elseif current:IsA("LayerCollector") and not current.Enabled then return false end
-		current = current.Parent
-	end
-	return true
-end
-
-local function MeetsStrictGates(step)
-	if not step then return false end
-
-	local currentCash = player:GetAttribute("LiveCurrency") or liveStats.currency
-	local currentGoldenAuras = player:GetAttribute("LiveGoldenAuras") or liveStats.goldenAuras
-
-	if step.requireHabitatFull and liveStats.pendingAuras < liveStats.habitatCapacity then return false end
-	if step.requireRateZero and liveStats.rate > 0.1 then return false end
-	if step.reachMultiplier and liveStats.currentMultiplier < step.reachMultiplier then return false end
-
-	if step.requireCubesProduced and GetStepCubes() < step.requireCubesProduced then return false end
-	if step.requirePlatformsShipped and GetStepShipped() < step.requirePlatformsShipped then return false end
-	if step.requireBoostBought and GetStepBoostsBought(step.requireBoostBought.id) < step.requireBoostBought.count then return false end
-	if step.requireBoostUsed and GetStepBoostsUsed(step.requireBoostUsed.id) < step.requireBoostUsed.count then return false end
-
-	if step.requireGoldenAuras and currentGoldenAuras < step.requireGoldenAuras then return false end
-	if step.requireStepGoldenAuras and GetStepGoldenAuras() < step.requireStepGoldenAuras then return false end
-
-	if step.requireCurrency and currentCash < step.requireCurrency then return false end
-	if step.requireFarmEval and liveStats.farmEvaluation < step.requireFarmEval then return false end
-	if step.requireSoulAuras and liveStats.soulAuras < step.requireSoulAuras then return false end
-	if step.requirePrestigeCount and liveStats.prestigeCount < step.requirePrestigeCount then return false end
-	if step.requireArea and liveStats.currentArea < step.requireArea then return false end
-	if step.requireLegendaryCubes and liveStats.totalLegendaryCubes < step.requireLegendaryCubes then return false end
-	if step.requirePiggyBankValue and liveStats.piggyBank < step.requirePiggyBankValue then return false end
-
-	return true
-end
+mainHUD.Enabled = false
 
 ---------------------------------------------------------------
--- LOGIC-LEVEL GATING (The Soft Lock)
+-- 2. LOCK CAMERA + BLUR
 ---------------------------------------------------------------
-shared.TutorialCanPerform = function(requestedAction)
-	actionMatchedForAdvance = false 
+local savedCamType    = camera.CameraType
+local savedCamSubject = camera.CameraSubject
 
-	if tutorialComplete or not tutorialActive then return true end
+camera.CameraType = Enum.CameraType.Scriptable
 
-	local activeStep = activeFallbackStep or TutorialConfig.GetStepByIndex(currentStepIndex)
-	if not activeStep then return true end
-
-	if activeStep.action == "Action_Wait" and not activeStep.allowClicking then
-		if activeStep.duration and activeStep.duration > 0 then
-			if shared.PlayUISound then shared.PlayUISound(SoundConfig.ErrorBuzz or "") end
-			return false
-		end
-		if requestedAction == "Action_ClickRedButton" then
-			if shared.PlayUISound then shared.PlayUISound(SoundConfig.ErrorBuzz or "") end
-			return false
-		end
-	end
-
-	if not activeStep.action then return true end
-	if activeStep.action == requestedAction then actionMatchedForAdvance = true; return true end
-
-	local isPermanentlyUnlocked = false
-	for i = 1, currentStepIndex do
-		local pastStep = TutorialConfig.GetStepByIndex(i)
-		if pastStep then
-			if i < currentStepIndex and pastStep.action == requestedAction then
-				isPermanentlyUnlocked = true; break
-			end
-			if pastStep.unlockActions then
-				for _, act in ipairs(pastStep.unlockActions) do
-					if act == requestedAction then isPermanentlyUnlocked = true; break end
-				end
-			end
-		end
-	end
-	if isPermanentlyUnlocked then return true end
-
-	if requestedAction == "Action_ClickRedButton" and not MeetsStrictGates(activeStep) then return true end
-	if shared.PlayUISound then shared.PlayUISound(SoundConfig.ErrorBuzz or "") end
-	return false
-end
+-- Enable the existing UITheme blur system
+UITheme.SetMenuVisible(true)
 
 ---------------------------------------------------------------
--- INITIALIZATION & UI
+-- CAMERA HELPERS
 ---------------------------------------------------------------
-local function InitTutorialUI()
-	tutorialGui = Instance.new("ScreenGui"); tutorialGui.Name = "TutorialOverlays"; tutorialGui.DisplayOrder = 1000 
-	tutorialGui.ResetOnSpawn = false; tutorialGui.Parent = playerGui
-
-	activeHighlight = Instance.new("Frame"); activeHighlight.Name = "TutorialHighlight"
-	activeHighlight.BackgroundColor3 = Color3.new(1, 1, 1); activeHighlight.BackgroundTransparency = 1 
-	activeHighlight.Interactable = false; activeHighlight.Active = false; activeHighlight.Visible = false
-	activeHighlight.ZIndex = 99; activeHighlight.Parent = tutorialGui
-
-	local highlightStroke = Instance.new("UIStroke", activeHighlight)
-	highlightStroke.Color = TutorialConfig.DefaultColor; highlightStroke.Thickness = 3; highlightStroke.Transparency = 0.2
-	Instance.new("UICorner", activeHighlight).CornerRadius = UDim.new(0, 8)
-	TweenService:Create(highlightStroke, TweenInfo.new(0.6, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {Transparency = 0.8}):Play()
-
-	activePointer = Instance.new("ImageLabel"); activePointer.Name = "GhostHand"
-	activePointer.Size = TutorialConfig.PointerSize; activePointer.BackgroundTransparency = 1
-	activePointer.Image = TutorialConfig.PointerImage; activePointer.AnchorPoint = Vector2.new(0.5, 0)
-	activePointer.Visible = false; activePointer.Active = false; activePointer.ZIndex = 100; activePointer.Parent = tutorialGui
-
-	questBanner = Instance.new("Frame"); questBanner.Name = "QuestBanner"
-	questBanner.Size = UDim2.new(0.85, 0, 0, 130); questBanner.AnchorPoint = Vector2.new(0.5, 0)
-	questBanner.Position = UDim2.new(0.5, 0, 0, -250); questBanner.BackgroundColor3 = T.panelBG or Color3.fromRGB(20, 20, 30)
-	questBanner.BorderSizePixel = 0; questBanner.Visible = false; questBanner.Active = false; questBanner.Parent = tutorialGui
-	Instance.new("UICorner", questBanner).CornerRadius = UDim.new(0, 12)
-
-	local sizeConstraint = Instance.new("UISizeConstraint", questBanner)
-	sizeConstraint.MaxSize = Vector2.new(650, 130); sizeConstraint.MinSize = Vector2.new(280, 85)
-	Instance.new("UIScale", questBanner)
-
-	local bgGrad = Instance.new("UIGradient", questBanner)
-	bgGrad.Rotation = 90
-	bgGrad.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.3), NumberSequenceKeypoint.new(1, 0.95) })
-
-	local stroke = Instance.new("UIStroke", questBanner); stroke.Name = "BannerStroke"
-	stroke.Color = TutorialConfig.DefaultColor; stroke.Thickness = 2.5; stroke.Transparency = 0.1
-	local strokeGrad = Instance.new("UIGradient", stroke); strokeGrad.Name = "StrokeGradient"; strokeGrad.Rotation = 45
-
-	local iconFrame = Instance.new("Frame", questBanner); iconFrame.Name = "IconFrame"
-	iconFrame.Size = UDim2.new(0, 72, 0, 72); iconFrame.AnchorPoint = Vector2.new(0, 0.5)
-	iconFrame.Position = UDim2.new(0, 14, 0.5, 0); iconFrame.BackgroundColor3 = TutorialConfig.DefaultColor
-	iconFrame.BackgroundTransparency = 0.85; iconFrame.Active = false
-	Instance.new("UICorner", iconFrame).CornerRadius = UDim.new(0, 12)
-	Instance.new("UIStroke", iconFrame).Color = TutorialConfig.DefaultColor
-
-	local icon = Instance.new("ImageLabel", iconFrame); icon.Name = "IconImage"
-	icon.Size = UDim2.new(0.65, 0, 0.65, 0); icon.Position = UDim2.new(0.175, 0, 0.175, 0)
-	icon.BackgroundTransparency = 1; icon.Image = TutorialConfig.DefaultIcon
-	icon.ScaleType = Enum.ScaleType.Fit; icon.Active = false
-
-	local title = Instance.new("TextLabel", questBanner); title.Name = "Title"
-	title.Size = UDim2.new(1, -100, 0.35, 0); title.Position = UDim2.new(0, 96, 0.08, 0)
-	title.BackgroundTransparency = 1; title.TextColor3 = TutorialConfig.DefaultColor
-	title.TextScaled = true; title.Font = Enum.Font.FredokaOne; title.TextXAlignment = Enum.TextXAlignment.Left; title.Active = false
-	local titleConstraint = Instance.new("UITextSizeConstraint", title); titleConstraint.MaxTextSize = 34; titleConstraint.MinTextSize = 14
-
-	local titleShadow = title:Clone(); titleShadow.Name = "TitleShadow"; titleShadow.TextColor3 = Color3.new(0, 0, 0)
-	titleShadow.TextTransparency = 0.6; titleShadow.Position = UDim2.new(0, 98, 0.08, 2)
-	titleShadow.ZIndex = title.ZIndex - 1; titleShadow.Parent = questBanner
-
-	local body = Instance.new("TextLabel", questBanner); body.Name = "Body"
-	body.Size = UDim2.new(1, -100, 0.5, 0); body.Position = UDim2.new(0, 96, 0.45, 0)
-	body.BackgroundTransparency = 1; body.TextColor3 = T.bodyText or Color3.fromRGB(230, 230, 240)
-	body.TextWrapped = true; body.TextScaled = true; body.RichText = true
-	body.Font = Enum.Font.GothamMedium; body.TextXAlignment = Enum.TextXAlignment.Left
-	body.TextYAlignment = Enum.TextYAlignment.Top; body.Active = false
-	local bodyConstraint = Instance.new("UITextSizeConstraint", body); bodyConstraint.MaxTextSize = 22; bodyConstraint.MinTextSize = 10
+local function GetMenuAnchor(area)
+	return workspace:FindFirstChild("MenuCamPos_" .. area)
+		or workspace:FindFirstChild("MenuCamPos_1")
+		or workspace:FindFirstChild("MenuCamPos")
+		or workspace:WaitForChild("MenuCamPos", 5)
 end
 
-local function AutoScrollToTarget(target)
-	local scrollFrame = target:FindFirstAncestorOfClass("ScrollingFrame")
-	if scrollFrame then
-		local relativeY = (target.AbsolutePosition.Y - scrollFrame.AbsolutePosition.Y) + scrollFrame.CanvasPosition.Y
-		local targetCanvasY = relativeY - (scrollFrame.AbsoluteSize.Y / 2) + (target.AbsoluteSize.Y / 2)
-		local maxScroll = math.max(0, scrollFrame.AbsoluteCanvasSize.Y - scrollFrame.AbsoluteSize.Y)
-		TweenService:Create(scrollFrame, TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-			CanvasPosition = Vector2.new(scrollFrame.CanvasPosition.X, math.clamp(targetCanvasY, 0, maxScroll))
-		}):Play()
-	end
+local function SnapCameraToArea(area)
+	local anchor = GetMenuAnchor(area)
+	if not anchor then return end
+	camera.CFrame = anchor.CFrame
 end
 
-local function HideBanner()
-	if not questBanner or not questBanner.Visible then return end
-	TweenService:Create(questBanner, TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Position = UDim2.new(0.5, 0, 0, -250) }):Play()
-	task.delay(0.4, function() if lastDisplayedStepId == nil then questBanner.Visible = false end end)
-end
+local function StartIdleDrift(area)
+	if idleConn then idleConn:Disconnect(); idleConn = nil end
 
-local function ShowBanner(step)
-	local stepColor = step.color or TutorialConfig.DefaultColor
-	questBanner.Title.Text = step.bannerTitle; questBanner.TitleShadow.Text = step.bannerTitle; questBanner.Body.Text = step.bannerBody
-	questBanner.Title.TextColor3 = stepColor; questBanner.IconFrame.BackgroundColor3 = stepColor; questBanner.IconFrame.UIStroke.Color = stepColor
-	questBanner.IconFrame.IconImage.Image = step.icon or TutorialConfig.DefaultIcon
+	local anchor = GetMenuAnchor(area)
+	if not anchor then return end
 
-	if activeHighlight then
-		local stroke = activeHighlight:FindFirstChildOfClass("UIStroke")
-		if stroke then stroke.Color = stepColor end
-	end
+	local baseCF = anchor.CFrame
+	local basePos = baseCF.Position
+	local lookTarget = basePos + baseCF.LookVector * 50
+	local angle = 0
 
-	local strokeGrad = questBanner.BannerStroke:FindFirstChild("StrokeGradient")
-	if strokeGrad then
-		strokeGrad.Color = ColorSequence.new({ ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1)), ColorSequenceKeypoint.new(1, stepColor) })
-	end
-
-	if not questBanner.Visible then
-		questBanner.Position = UDim2.new(0.5, 0, 0, -250); questBanner.Visible = true
-		-- ✨ THE FIX: Restored this back to 15 (Very top) instead of 180!
-		TweenService:Create(questBanner, TweenInfo.new(0.6, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Position = UDim2.new(0.5, 0, 0, 15) }):Play()
-	else
-		local scale = questBanner:FindFirstChildOfClass("UIScale")
-		if scale then
-			scale.Scale = 0.85
-			TweenService:Create(scale, TweenInfo.new(0.4, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1 }):Play()
-		end
-	end
-	if shared.PlayUISound then shared.PlayUISound(SoundConfig.TutorialHint or "6895079853") end
-end
-
----------------------------------------------------------------
--- CORE LOOP (RenderStepped)
----------------------------------------------------------------
-local function StartTrackingLoop()
-	if trackingConnection then trackingConnection:Disconnect() end
-
-	local bounceTime = 0
-	local isAutoScrolling = false
-
-	trackingConnection = RunService.RenderStepped:Connect(function(dt)
-		local allLockedTags = {}; local currentUnlockedTags = {}
-
-		for i, stp in ipairs(TutorialConfig.Steps) do
-			if stp.unlockTags then
-				for _, tag in ipairs(stp.unlockTags) do
-					allLockedTags[tag] = true
-					if tutorialComplete or i <= currentStepIndex then currentUnlockedTags[tag] = true end
-				end
-			end
-		end
-
-		for tag, _ in pairs(allLockedTags) do
-			local isUnlocked = currentUnlockedTags[tag] or tutorialComplete
-			local elements = CollectionService:GetTagged(tag)
-			for _, el in ipairs(elements) do
-				local overlay = el:FindFirstChild("TutorialLockOverlay")
-				if not isUnlocked then
-					if not overlay then
-						overlay = Instance.new("TextButton"); overlay.Name = "TutorialLockOverlay"; overlay.Size = UDim2.new(1, 0, 1, 0)
-						overlay.Position = UDim2.new(0, 0, 0, 0); overlay.AnchorPoint = Vector2.new(0, 0)
-						overlay.BackgroundColor3 = Color3.fromRGB(15, 15, 20); overlay.BackgroundTransparency = 0.5
-						overlay.ZIndex = 99998; overlay.Text = ""; overlay.AutoButtonColor = false
-
-						local corner = el:FindFirstChildOfClass("UICorner")
-						if corner then corner:Clone().Parent = overlay end
-
-						local icon = Instance.new("ImageLabel"); icon.Name = "PadlockIcon"; icon.Size = UDim2.new(0, 24, 0, 24)
-						icon.AnchorPoint = Vector2.new(0.5, 0.5); icon.Position = UDim2.new(0.5, 0, 0.5, 0)
-						icon.BackgroundTransparency = 1; icon.Image = "rbxassetid://7059346373"; icon.ImageColor3 = Color3.fromRGB(255, 255, 255)
-						icon.ScaleType = Enum.ScaleType.Fit; icon.ZIndex = 99999; icon.Parent = overlay
-
-						overlay.Parent = el
-					end
-				else
-					if overlay then overlay:Destroy() end
-				end
-			end
-		end
-
-		if tutorialComplete then 
-			if activePointer then activePointer.Visible = false end
-			if activeHighlight then activeHighlight.Visible = false end
-			HideBanner()
-			if trackingConnection then trackingConnection:Disconnect() end
-			return 
-		end
-
-		bounceTime += dt * 5
-		local bounceOffset = math.abs(math.sin(bounceTime)) * 15
-
-		local step = activeFallbackStep or TutorialConfig.GetStepByIndex(currentStepIndex)
-		if not step then return end
-
-		if not activeFallbackStep then
-			if not MeetsStrictGates(step) then
-				if step.fallbackStepId then
-					local foundFallback = TutorialConfig.GetStepById(step.fallbackStepId)
-					if foundFallback then activeFallbackStep = foundFallback; step = activeFallbackStep end
-				end
-			end
-		else
-			local originalStep = TutorialConfig.GetStepByIndex(currentStepIndex)
-			if originalStep and MeetsStrictGates(originalStep) then
-				activeFallbackStep = nil; step = originalStep
-			end
-		end
-
-		if not step then return end 
-
-		if step.bannerTitle then
-			if lastDisplayedStepId ~= step.id then
-				lastDisplayedStepId = step.id
-				ShowBanner(step)
-				if step.cameraTarget or step.cameraTrackMode then ForceCloseUI:Fire() end
-			end
-
-			local progressText = ""
-			local checkStep = activeFallbackStep and TutorialConfig.GetStepByIndex(currentStepIndex) or step
-
-			if checkStep.requireCubesProduced then
-				local capCubes = math.min(GetStepCubes(), checkStep.requireCubesProduced)
-				progressText = "\n<b><font color='rgb(100, 255, 100)'>Progress: " .. capCubes .. " / " .. checkStep.requireCubesProduced .. "</font></b>"
-			elseif checkStep.requirePlatformsShipped then
-				local capShipped = math.min(GetStepShipped(), checkStep.requirePlatformsShipped)
-				progressText = "\n<b><font color='rgb(100, 255, 100)'>Progress: " .. capShipped .. " / " .. checkStep.requirePlatformsShipped .. "</font></b>"
-			elseif checkStep.requireCurrency then
-				local currentCash = player:GetAttribute("LiveCurrency") or liveStats.currency
-				local capCash = math.min(math.floor(currentCash), checkStep.requireCurrency)
-				progressText = "\n<b><font color='rgb(100, 255, 100)'>Progress: $" .. capCash .. " / $" .. checkStep.requireCurrency .. "</font></b>"
-			elseif checkStep.reachMultiplier then
-				local currentMult = liveStats.currentMultiplier or 1
-				local capMult = math.min(currentMult, checkStep.reachMultiplier)
-				progressText = "\n<b><font color='rgb(255, 255, 50)'>Progress: " .. string.format("%.1f", capMult) .. "x / " .. string.format("%.1f", checkStep.reachMultiplier) .. "x</font></b>"
-			elseif checkStep.requireStepGoldenAuras then
-				local capGA = math.min(GetStepGoldenAuras(), checkStep.requireStepGoldenAuras)
-				progressText = "\n<b><font color='rgb(255, 215, 0)'>Progress: " .. capGA .. " / " .. checkStep.requireStepGoldenAuras .. " GA</font></b>"
-			elseif checkStep.requireFarmEval then
-				local capFE = math.min(math.floor(liveStats.farmEvaluation), checkStep.requireFarmEval)
-				progressText = "\n<b><font color='rgb(100, 255, 100)'>Progress: $" .. Formatter.Format(capFE) .. " / $" .. Formatter.Format(checkStep.requireFarmEval) .. "</font></b>"
-			elseif checkStep.requireBoostBought then
-				local cap = math.min(GetStepBoostsBought(checkStep.requireBoostBought.id), checkStep.requireBoostBought.count)
-				progressText = "\n<b><font color='rgb(100, 255, 100)'>Progress: " .. cap .. " / " .. checkStep.requireBoostBought.count .. "</font></b>"
-			elseif checkStep.requireBoostUsed then
-				local cap = math.min(GetStepBoostsUsed(checkStep.requireBoostUsed.id), checkStep.requireBoostUsed.count)
-				progressText = "\n<b><font color='rgb(100, 255, 100)'>Progress: " .. cap .. " / " .. checkStep.requireBoostUsed.count .. "</font></b>"
-			end
-			questBanner.Body.Text = step.bannerBody .. progressText
-
-		else
-			if lastDisplayedStepId ~= nil then lastDisplayedStepId = nil; HideBanner() end
-		end
-
-		local targetToTrack2D = nil
-		local targetToTrack3D = nil
-
-		if step.target3D then
-			if string.find(string.lower(step.target3D), "aura") then
-				local aura = GetActiveAura()
-				if aura then targetToTrack3D = aura:IsA("Model") and aura:GetPivot().Position or aura.Position end
-			else
-				local obj = CollectionService:GetTagged(step.target3D)[1]
-				if obj then targetToTrack3D = obj:IsA("Model") and obj:GetPivot().Position or obj.Position end
-			end
-		elseif step.targetTag then
-			if step.menuTag and step.menuOpenBtnTag then
-				local menuInstances = CollectionService:GetTagged(step.menuTag)
-				local menuIsOpen = false
-				for _, menu in ipairs(menuInstances) do
-					if IsVisibleOnScreen(menu) then menuIsOpen = true; break end
-				end
-				targetToTrack2D = menuIsOpen and CollectionService:GetTagged(step.targetTag)[1] or CollectionService:GetTagged(step.menuOpenBtnTag)[1]
-			else
-				targetToTrack2D = CollectionService:GetTagged(step.targetTag)[1]
-			end
-		end
-
-		if targetToTrack3D then
-			local screenPos, onScreen = camera:WorldToViewportPoint(targetToTrack3D)
-			if onScreen and screenPos.Z > 0 then
-				activePointer.Visible = true; activeHighlight.Visible = false 
-				activePointer.Position = UDim2.new(0, screenPos.X, 0, screenPos.Y - (activePointer.Size.Y.Offset / 2) - bounceOffset)
-			else
-				activePointer.Visible = false; activeHighlight.Visible = false
-			end
-
-		elseif targetToTrack2D and targetToTrack2D:IsA("GuiObject") then
-			if targetToTrack2D.AbsoluteSize.Magnitude > 0 and IsVisibleOnScreen(targetToTrack2D) then
-				activePointer.Visible = true; activeHighlight.Visible = true
-
-				local tgtRelX = targetToTrack2D.AbsolutePosition.X; local tgtRelY = targetToTrack2D.AbsolutePosition.Y
-				activeHighlight.Size = UDim2.new(0, targetToTrack2D.AbsoluteSize.X + 12, 0, targetToTrack2D.AbsoluteSize.Y + 12)
-				activeHighlight.Position = UDim2.new(0, tgtRelX - 6, 0, tgtRelY - 6)
-
-				local targetCorner = targetToTrack2D:FindFirstChildOfClass("UICorner")
-				local highlightCorner = activeHighlight:FindFirstChildOfClass("UICorner")
-				if targetCorner and highlightCorner then highlightCorner.CornerRadius = targetCorner.CornerRadius end
-
-				local centerPos = targetToTrack2D.AbsolutePosition + (targetToTrack2D.AbsoluteSize / 2)
-				activePointer.Position = UDim2.new(0, centerPos.X, 0, targetToTrack2D.AbsolutePosition.Y - activePointer.Size.Y.Offset - bounceOffset)
-
-				local scrollFrame = targetToTrack2D:FindFirstAncestorOfClass("ScrollingFrame")
-				if scrollFrame and not isAutoScrolling then
-					local targetY = targetToTrack2D.AbsolutePosition.Y; local scrollY = scrollFrame.AbsolutePosition.Y
-					local scrollBottom = scrollY + scrollFrame.AbsoluteSize.Y
-
-					if (targetY + targetToTrack2D.AbsoluteSize.Y < scrollY) or (targetY > scrollBottom) then
-						isAutoScrolling = true; AutoScrollToTarget(targetToTrack2D)
-						task.delay(0.5, function() isAutoScrolling = false end)
-					end
-				end
-			else
-				activePointer.Visible = false; activeHighlight.Visible = false
-			end
-		else
-			activePointer.Visible = false; activeHighlight.Visible = false
-		end
-
-		if step.cameraTrackMode == "FollowAura" then
-			local aura = GetActiveAura()
-			if aura then
-				if camera.CameraType ~= Enum.CameraType.Scriptable then camera.CameraType = Enum.CameraType.Scriptable end
-				local targetPos = aura:IsA("Model") and aura:GetPivot().Position or aura.Position
-				local offset = step.cameraOffset or Vector3.new(0, 8, 10) 
-				camera.CFrame = camera.CFrame:Lerp(CFrame.new(targetPos + offset, targetPos), 0.025) 
-			else
-				local fallbackCam = CollectionService:GetTagged("Tutorial_AuraHolderCam")[1]
-				if fallbackCam then
-					if camera.CameraType ~= Enum.CameraType.Scriptable then camera.CameraType = Enum.CameraType.Scriptable end
-					local desiredCFrame = fallbackCam:IsA("Model") and fallbackCam:GetPivot() or fallbackCam.CFrame
-					camera.CFrame = camera.CFrame:Lerp(desiredCFrame, 0.025)
-				end
-			end
-
-		elseif step.cameraTrackMode == "FollowPhysicsAura" then
-			local physicsAura = GetActivePhysicsAura()
-
-			local cameraTimeExpired = false
-			if step.cameraDuration then
-				if not step._cameraStartTime then step._cameraStartTime = tick() end
-				if tick() - step._cameraStartTime >= step.cameraDuration then
-					cameraTimeExpired = true
-				end
-			end
-
-			if physicsAura and not cameraTimeExpired then
-				step._returningToPlayer = nil 
-				if camera.CameraType ~= Enum.CameraType.Scriptable then camera.CameraType = Enum.CameraType.Scriptable end
-				local targetPos = physicsAura:IsA("Model") and physicsAura:GetPivot().Position or physicsAura.Position
-				local offset = step.cameraOffset or Vector3.new(0, 15, 25) 
-				camera.CFrame = camera.CFrame:Lerp(CFrame.new(targetPos + offset, targetPos), 0.05) 
-			else
-				if camera.CameraType == Enum.CameraType.Scriptable then
-					if not step._returningToPlayer then
-						step._returningToPlayer = true
-						local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
-						if hrp then
-							local targetCF = CFrame.new(hrp.Position + Vector3.new(0, 8, 12), hrp.Position)
-							local tween = TweenService:Create(camera, TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {CFrame = targetCF})
-							tween:Play()
-							tween.Completed:Once(function()
-								if step._returningToPlayer then
-									camera.CameraType = Enum.CameraType.Custom
-									camera.CameraSubject = player.Character:FindFirstChild("Humanoid")
-								end
-							end)
-						else
-							camera.CameraType = Enum.CameraType.Custom
-						end
-					end
-				end
-			end
-
-		elseif step.cameraTarget then
-			local camTarget = CollectionService:GetTagged(step.cameraTarget)[1]
-			if not camTarget or not camTarget.Parent then
-				if camera.CameraType ~= Enum.CameraType.Custom then
-					camera.CameraType = Enum.CameraType.Custom
-					if player.Character and player.Character:FindFirstChild("Humanoid") then
-						camera.CameraSubject = player.Character:FindFirstChild("Humanoid")
-					end
-				end
-			else
-				if camera.CameraType ~= Enum.CameraType.Scriptable then camera.CameraType = Enum.CameraType.Scriptable end
-				local desiredCFrame = camTarget:IsA("Model") and camTarget:GetPivot() or camTarget.CFrame
-				camera.CFrame = camera.CFrame:Lerp(desiredCFrame, 0.03)
-			end
-		else
-			if camera.CameraType ~= Enum.CameraType.Custom then
-				camera.CameraType = Enum.CameraType.Custom
-				if player.Character and player.Character:FindFirstChild("Humanoid") then
-					camera.CameraSubject = player.Character:FindFirstChild("Humanoid")
-				end
-			end
-		end
-
-		if not step._startTime then step._startTime = tick() end
-
-		if step.duration and step.duration > 0 then
-			if tick() - step._startTime >= step.duration then shared.AdvanceTutorialStep(true) end
-		elseif step.duration == 0 then
-			if MeetsStrictGates(step) and not activeFallbackStep then shared.AdvanceTutorialStep(true) 
-			elseif step.failsafeDuration and (tick() - step._startTime >= step.failsafeDuration) then shared.AdvanceTutorialStep(true) end
-		end
+	idleConn = RunService.RenderStepped:Connect(function(dt)
+		angle += dt * IDLE_SPEED
+		local offset = CFrame.Angles(0, math.rad(angle * 0.3), 0).LookVector * 0.5
+		camera.CFrame = CFrame.lookAt(basePos + offset, lookTarget)
 	end)
 end
 
----------------------------------------------------------------
--- EXTERNAL ADVANCEMENT (Server or Local UI)
----------------------------------------------------------------
-shared.AdvanceTutorialStep = function(forceAdvance)
-	if isAdvancing then return end 
-	if tutorialComplete then return end
-	if activeFallbackStep then return end
+-- Set initial camera
+SnapCameraToArea(DEFAULT_AREA)
+StartIdleDrift(DEFAULT_AREA)
 
-	local currentStepData = TutorialConfig.GetStepByIndex(currentStepIndex)
-	if currentStepData and currentStepData.duration ~= 0 and not forceAdvance then
-		if not actionMatchedForAdvance then return end
+-- Lift the Blackout Curtain
+local blackoutGui = playerGui:FindFirstChild("PreloadBlackout")
+if blackoutGui then
+	local blackoutFrame = blackoutGui:FindFirstChild("BlackoutFrame")
+	if blackoutFrame then
+		TweenService:Create(blackoutFrame, TweenInfo.new(1.0, Enum.EasingStyle.Sine), {
+			BackgroundTransparency = 1
+		}):Play()
 	end
-
-	actionMatchedForAdvance = false; lockedAura = nil 
-
-	if currentStepData and currentStepData.duration == 0 and not forceAdvance then
-		if not MeetsStrictGates(currentStepData) then return end
-	end
-
-	isAdvancing = true 
-
-	if currentStepData then TutorialStepComplete:FireServer(currentStepData.id) end
-	currentStepIndex += 1
-
-	baselineCubes = liveStats.totalCubesProduced
-	baselineShipped = liveStats.totalPlatformsShipped
-	baselineGoldenAuras = player:GetAttribute("LiveGoldenAuras") or liveStats.goldenAuras
-	for k, v in pairs(liveStats.boostsBought) do baselineBoostsBought[k] = v end
-	for k, v in pairs(liveStats.boostsUsed) do baselineBoostsUsed[k] = v end
-
-	local nextStep = TutorialConfig.GetStepByIndex(currentStepIndex)
-
-	if not nextStep then
-		tutorialComplete = true
-		if activePointer then activePointer.Visible = false end
-		if activeHighlight then activeHighlight.Visible = false end
-		HideBanner()
-		if trackingConnection then trackingConnection:Disconnect() end
-
-		camera.CameraType = Enum.CameraType.Custom
-		if player.Character and player.Character:FindFirstChild("Humanoid") then
-			camera.CameraSubject = player.Character:FindFirstChild("Humanoid")
-		end
-
-		TutorialStepComplete:FireServer("__tutorialComplete__")
-
-		local successSound = Instance.new("Sound")
-		successSound.SoundId = "rbxassetid://4612385808"; successSound.Volume = 0.6
-		successSound.Parent = game:GetService("SoundService"); successSound:Play()
-		game:GetService("Debris"):AddItem(successSound, 4)
-	end
-
-	task.delay(0.1, function() isAdvancing = false end)
+	task.delay(1.1, function() blackoutGui:Destroy() end)
 end
 
----------------------------------------------------------------
--- STATE RECONCILIATION & DATA SYNC
----------------------------------------------------------------
-UpdateHUDBridge:Connect(function(stats)
-	if stats.currency ~= nil then liveStats.currency = stats.currency end
-	if stats.totalEarned ~= nil then liveStats.totalEarned = stats.totalEarned end
-	if stats.farmEvaluation ~= nil then liveStats.farmEvaluation = stats.farmEvaluation end
-	if stats.soulAuras ~= nil then liveStats.soulAuras = stats.soulAuras end
-	if stats.goldenAuras ~= nil then liveStats.goldenAuras = stats.goldenAuras end
-	if stats.prestigeCount ~= nil then liveStats.prestigeCount = stats.prestigeCount end
-	if stats.currentArea ~= nil then liveStats.currentArea = stats.currentArea end
-
-	if stats.pendingAuras ~= nil then liveStats.pendingAuras = stats.pendingAuras end
-	if stats.habitatCapacity ~= nil then liveStats.habitatCapacity = stats.habitatCapacity end
-	if stats.rate ~= nil then liveStats.rate = stats.rate end
-
-	if stats.totalCubesProduced ~= nil then liveStats.totalCubesProduced = math.max(liveStats.totalCubesProduced, stats.totalCubesProduced) end
-	if stats.totalPlatformsShipped ~= nil then liveStats.totalPlatformsShipped = math.max(liveStats.totalPlatformsShipped, stats.totalPlatformsShipped) end
-	if stats.totalLegendaryCubes ~= nil then liveStats.totalLegendaryCubes = math.max(liveStats.totalLegendaryCubes, stats.totalLegendaryCubes) end
-	if stats.piggyBank ~= nil then liveStats.piggyBank = stats.piggyBank end
-
-	if stats.tutorialComplete ~= nil then tutorialComplete = stats.tutorialComplete end
-
-	if stats.tutorialProgress and not tutorialComplete then
-		local highestCompletedIndex = 0
-
-		for index, stepData in ipairs(TutorialConfig.Steps) do
-			if stats.tutorialProgress[stepData.id] then highestCompletedIndex = index end
-		end
-
-		if highestCompletedIndex >= currentStepIndex then
-			currentStepIndex = highestCompletedIndex + 1
-
-			baselineCubes = liveStats.totalCubesProduced
-			baselineShipped = liveStats.totalPlatformsShipped
-			baselineGoldenAuras = player:GetAttribute("LiveGoldenAuras") or liveStats.goldenAuras
-			for k, v in pairs(liveStats.boostsBought) do baselineBoostsBought[k] = v end
-			for k, v in pairs(liveStats.boostsUsed) do baselineBoostsUsed[k] = v end
-
-			if not TutorialConfig.GetStepByIndex(currentStepIndex) then
-				tutorialComplete = true
-				if trackingConnection then trackingConnection:Disconnect() end
-				if questBanner then HideBanner() end
-				if activePointer then activePointer.Visible = false end
-				if activeHighlight then activeHighlight.Visible = false end
-			end
-		end
+-- Listen for Area changes (if they happen while in the menu)
+areaConn = AreaUpdated.OnClientEvent:Connect(function(info)
+	if hasPlayed then return end
+	local area = info.currentArea or DEFAULT_AREA
+	if area ~= currentArea then
+		currentArea = area
+		SnapCameraToArea(area)
+		StartIdleDrift(area)
 	end
 end)
 
 ---------------------------------------------------------------
--- BOOT & MENU GATE
+-- 3. BUILD THE MENU UI
 ---------------------------------------------------------------
-task.spawn(function()
-	local menuGate = ReplicatedStorage:WaitForChild("MenuDismissed", 10)
-	if menuGate and not menuGate:GetAttribute("Fired") then menuGate.Event:Wait() end
+local menuScreen = Instance.new("ScreenGui")
+menuScreen.Name = "MainMenu"
+menuScreen.DisplayOrder = 100
+menuScreen.IgnoreGuiInset = true
+menuScreen.ResetOnSpawn = false
+menuScreen.Parent = playerGui
 
+local vignette = Instance.new("Frame")
+vignette.Name = "Vignette"
+vignette.Size = UDim2.new(1, 0, 1, 0)
+vignette.BackgroundColor3 = Color3.new(0, 0, 0)
+vignette.BackgroundTransparency = M.VignetteDim or 0.5
+vignette.BorderSizePixel = 0
+vignette.ZIndex = 1
+vignette.Parent = menuScreen
+
+local vigGrad = Instance.new("UIGradient")
+vigGrad.Transparency = NumberSequence.new({
+	NumberSequenceKeypoint.new(0, 0),
+	NumberSequenceKeypoint.new(0.4, 0.6),
+	NumberSequenceKeypoint.new(1, 0),
+})
+vigGrad.Parent = vignette
+
+local container = Instance.new("Frame")
+container.Name = "MenuContainer"
+container.Size = UDim2.new(0.9, 0, 0.6, 0)
+container.Position = UDim2.new(0.05, 0, 0.2, 0) 
+container.BackgroundTransparency = 1
+container.ZIndex = 2
+container.Parent = menuScreen
+
+local containerConstraint = Instance.new("UISizeConstraint")
+containerConstraint.MaxSize = Vector2.new(600, 450)
+containerConstraint.Parent = container
+
+local titleLabel = Instance.new("TextLabel")
+titleLabel.Name = "Title"
+titleLabel.Size = UDim2.new(1, 0, 0.3, 0) 
+titleLabel.Position = UDim2.new(0, 0, 0, 0)
+titleLabel.AnchorPoint = Vector2.new(0, 0)
+titleLabel.BackgroundTransparency = 1
+titleLabel.Text = "AURA INC"
+titleLabel.TextColor3 = T.headerText
+titleLabel.TextScaled = true
+titleLabel.Font = TITLE_FONT
+titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+titleLabel.ZIndex = 10
+titleLabel.Parent = container
+
+local titleShadow = titleLabel:Clone()
+titleShadow.Name = "TitleShadow"
+titleShadow.TextColor3 = T.accentPurple
+titleShadow.TextTransparency = 0.5
+titleShadow.Position = UDim2.new(0, 0, 0, 4) 
+titleShadow.ZIndex = 9
+titleShadow.Parent = container
+
+local titleStroke = Instance.new("UIStroke")
+titleStroke.Color = T.accentPurple
+titleStroke.Thickness = 2
+titleStroke.Transparency = 0.3
+titleStroke.Parent = titleLabel
+
+local subtitleLabel = Instance.new("TextLabel")
+subtitleLabel.Name = "Subtitle"
+subtitleLabel.Size = UDim2.new(0.8, 0, 0.15, 0) 
+subtitleLabel.Position = UDim2.new(0, 0, 0.3, 0) 
+subtitleLabel.AnchorPoint = Vector2.new(0, 0)
+subtitleLabel.BackgroundTransparency = 1
+subtitleLabel.Text = "Idle Aura Factory"
+subtitleLabel.TextColor3 = T.subText
+subtitleLabel.TextScaled = true
+subtitleLabel.Font = BODY_FONT
+subtitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+subtitleLabel.ZIndex = 10
+subtitleLabel.Parent = container
+
+-- ✨ THE "PRE-LOADING" STATUS TEXT
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Name = "Status"
+statusLabel.Size = UDim2.new(0.8, 0, 0.1, 0) 
+statusLabel.Position = UDim2.new(0, 0, 0.5, 0) 
+statusLabel.AnchorPoint = Vector2.new(0, 0)
+statusLabel.BackgroundTransparency = 1
+statusLabel.Text = "Generating Physics Pools..."
+statusLabel.TextColor3 = T.accentGold
+statusLabel.TextScaled = true
+statusLabel.Font = BODY_FONT
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+statusLabel.ZIndex = 10
+statusLabel.Parent = container
+
+-- PLAY BUTTON
+local playBtn = Instance.new("TextButton")
+playBtn.Name = "PlayButton"
+playBtn.Size = UDim2.new(0.45, 0, 0.25, 0) 
+playBtn.Position = UDim2.new(0, 0, 0.65, 0) 
+playBtn.AnchorPoint = Vector2.new(0, 0)
+playBtn.BackgroundColor3 = T.buttonPrimary
+playBtn.BorderSizePixel = 0
+playBtn.Text = "PLAY"
+playBtn.TextColor3 = T.headerText
+playBtn.TextScaled = true
+playBtn.Font = TITLE_FONT
+playBtn.ZIndex = 10
+playBtn.AutoButtonColor = false
+playBtn.Visible = false -- ✨ HIDDEN UNTIL LOADING FINISHES
+playBtn.Parent = container
+
+local btnConstraint = Instance.new("UIAspectRatioConstraint")
+btnConstraint.AspectRatio = 2.5 
+btnConstraint.Parent = playBtn
+
+Instance.new("UICorner", playBtn).CornerRadius = UDim.new(0, 12)
+
+local playStroke = Instance.new("UIStroke")
+playStroke.Color = T.accentPurple
+playStroke.Thickness = T.StrokeThickness or 2
+playStroke.Transparency = 0.2
+playStroke.Parent = playBtn
+
+local playGrad = Instance.new("UIGradient")
+playGrad.Color = ColorSequence.new({
+	ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 255, 255)),
+	ColorSequenceKeypoint.new(1, Color3.fromRGB(180, 180, 220)),
+})
+playGrad.Rotation = 90
+playGrad.Parent = playBtn
+
+-- Container Float Tween
+TweenService:Create(container, TweenInfo.new(2.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {
+	Position = container.Position - UDim2.new(0, 0, 0, 12)
+}):Play()
+
+-- Button Interactions
+local btnScale = Instance.new("UIScale", playBtn)
+local isHovering = false
+
+task.spawn(function()
+	while playBtn and playBtn.Parent do
+		if not isHovering and playBtn.Visible then
+			TweenService:Create(btnScale, TweenInfo.new(1, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {Scale = 1.03}):Play()
+		end
+		task.wait(1)
+		if not playBtn or not playBtn.Parent then break end
+
+		if not isHovering and playBtn.Visible then
+			TweenService:Create(btnScale, TweenInfo.new(1, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {Scale = 1.0}):Play()
+		end
+		task.wait(1)
+	end
+end)
+
+playBtn.MouseEnter:Connect(function()
+	isHovering = true
+	TweenService:Create(btnScale, TweenInfo.new(0.15, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {Scale = 1.1}):Play()
+	TweenService:Create(playBtn, TweenInfo.new(0.15), {BackgroundColor3 = T.accentPurple}):Play()
+end)
+
+playBtn.MouseLeave:Connect(function()
+	isHovering = false
+	TweenService:Create(btnScale, TweenInfo.new(0.2, Enum.EasingStyle.Sine, Enum.EasingDirection.In), {Scale = 1.0}):Play()
+	TweenService:Create(playBtn, TweenInfo.new(0.2), {BackgroundColor3 = T.buttonPrimary}):Play()
+end)
+
+playBtn.MouseButton1Down:Connect(function()
+	TweenService:Create(btnScale, TweenInfo.new(0.1, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {Scale = 0.9}):Play()
+	if shared.PlayUISound then shared.PlayUISound("6895079853") end
+end)
+
+playBtn.MouseButton1Up:Connect(function()
+	TweenService:Create(btnScale, TweenInfo.new(0.3, Enum.EasingStyle.Bounce), {Scale = 1.1}):Play()
+end)
+
+task.spawn(function()
+	task.wait(0.5) 
+	if UITheme and UITheme.ApplyShine then UITheme.ApplyShine(playBtn) end
+	if UITheme and UITheme.ApplyFlair then UITheme.ApplyFlair(titleLabel, "Ghost") end
+end)
+
+local creditLabel = Instance.new("TextLabel")
+creditLabel.Name = "Credits"
+creditLabel.Size = UDim2.new(0.6, 0, 0.1, 0)
+creditLabel.Position = UDim2.new(0, 0, 0.9, 0)
+creditLabel.AnchorPoint = Vector2.new(0, 0)
+creditLabel.BackgroundTransparency = 1
+creditLabel.Text = "Made by MoldySugar2205"
+creditLabel.TextColor3 = T.subText
+creditLabel.TextTransparency = 0.3
+creditLabel.TextScaled = true
+creditLabel.Font = BODY_FONT
+creditLabel.TextXAlignment = Enum.TextXAlignment.Left
+creditLabel.ZIndex = 10
+creditLabel.Parent = container
+
+---------------------------------------------------------------
+-- LOADING SCREEN OVERLAY
+---------------------------------------------------------------
+local blackFade = Instance.new("Frame")
+blackFade.Name = "BlackFade"
+blackFade.Size = UDim2.new(1, 0, 1, 0)
+blackFade.BackgroundColor3 = Color3.new(0, 0, 0)
+blackFade.BackgroundTransparency = 1
+blackFade.BorderSizePixel = 0
+blackFade.ZIndex = 50
+blackFade.Parent = menuScreen
+
+local loadingText = Instance.new("TextLabel")
+loadingText.Name = "LoadingText"
+loadingText.Size = UDim2.new(1, 0, 0, 50)
+loadingText.Position = UDim2.new(0, 0, 0.5, -25)
+loadingText.BackgroundTransparency = 1
+loadingText.Text = "INITIALIZING SYSTEMS..."
+loadingText.TextColor3 = T.accentBlue or Color3.fromRGB(100, 200, 255)
+loadingText.TextScaled = true
+loadingText.Font = TITLE_FONT
+loadingText.TextTransparency = 1
+loadingText.ZIndex = 51
+loadingText.Parent = blackFade
+
+---------------------------------------------------------------
+-- PLAY BUTTON CLICK
+---------------------------------------------------------------
+playBtn.MouseButton1Down:Connect(function()
+	if hasPlayed then return end
+	hasPlayed = true
+
+	playBtn.Active = false
+	playBtn.Text = ""
+
+	if areaConn then areaConn:Disconnect(); areaConn = nil end
+
+	TweenService:Create(blackFade, TweenInfo.new(FADE_IN_TIME, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		BackgroundTransparency = 0
+	}):Play()
+	TweenService:Create(loadingText, TweenInfo.new(FADE_IN_TIME), {
+		TextTransparency = 0
+	}):Play()
+	task.wait(FADE_IN_TIME)
+
+	if idleConn then idleConn:Disconnect(); idleConn = nil end
+
+	camera.CameraType = savedCamType
 	local character = player.Character or player.CharacterAdded:Wait()
 	local humanoid = character:WaitForChild("Humanoid", 5)
-	camera.CameraType = Enum.CameraType.Custom
-	if humanoid then camera.CameraSubject = humanoid end
+	if humanoid then
+		camera.CameraSubject = humanoid
+	end
 
-	tutorialActive = true
-	InitTutorialUI()
-	StartTrackingLoop()
+	UITheme.SetMenuVisible(false)
+	mainHUD.Enabled = true
+
+	vignette:Destroy()
+	container:Destroy()
+
+	if not game:IsLoaded() then game.Loaded:Wait() end
+	loadingText.Text = "LOADING AURAS..."
+	task.wait(2) 
+
+	TweenService:Create(blackFade, TweenInfo.new(FADE_OUT_TIME, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		BackgroundTransparency = 1
+	}):Play()
+	TweenService:Create(loadingText, TweenInfo.new(FADE_OUT_TIME), {
+		TextTransparency = 1
+	}):Play()
+	task.wait(FADE_OUT_TIME)
+
+	MenuDismissed:SetAttribute("Fired", true)
+	MenuDismissed:Fire()
+
+	menuScreen:Destroy()
 end)
+
+local function RefreshLook()
+	UITheme.ApplyFlair(titleLabel, "Shine")	
+	UITheme.ApplyFlair(subtitleLabel, "Shine")
+	UITheme.ApplyFlair(creditLabel, "Shine")
+	UITheme.ApplyFlair(playBtn, "Shine")
+end
+
+RefreshLook()
+
+---------------------------------------------------------------
+-- ✨ TRUE BACKGROUND LOADING (POOL CREATION) ✨
+---------------------------------------------------------------
+task.spawn(function()
+	if not game:IsLoaded() then game.Loaded:Wait() end
+
+	local playerArea = player:GetAttribute("CurrentArea") or DEFAULT_AREA
+	statusLabel.Text = "Optimizing Performance (Area " .. playerArea .. ")..."
+
+	-- Yield a split second so the text updates visibly
+	task.wait(0.2)
+
+	-- We instruct the PoolManager to physically create all the Auras and cache them
+	-- Note: Because this creates ~300 parts, it WILL cause a tiny spike, 
+	-- but the player won't feel it because they are just staring at the Menu!
+	PoolManager.InitializeArea(playerArea)
+
+	statusLabel.Text = "Ready!"
+	task.wait(0.3)
+
+	-- The pools are built, the game is 100% lag-free. Show the PLAY button!
+	statusLabel.Visible = false
+	playBtn.Visible = true
+
+	-- Pop the play button in with a nice tween
+	playBtn.Size = UDim2.new(0,0,0,0)
+	TweenService:Create(playBtn, TweenInfo.new(0.5, Enum.EasingStyle.Bounce), {
+		Size = UDim2.new(0.45, 0, 0.25, 0)
+	}):Play()
+end)
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local CollectionService = game:GetService("CollectionService")
+
+local UITheme = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("UITheme"))
+local T = UITheme.Get("Custom")
+local SoundConfig = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("SoundConfig"))
+local AchievementConfig = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("AchievementConfig"))
+local TierConfig = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("TierConfig"))
+local Formatter = require(ReplicatedStorage.Modules.NumberFormatter)
+local BridgeNet2 = require(ReplicatedStorage.Modules:WaitForChild("BridgeNet2"))
+local UpdateHUDBridge = BridgeNet2.ClientBridge("UpdateHUD")
+
+local RemoteEvents = ReplicatedStorage:WaitForChild("RemoteEvents")
+local ClaimChallenge = RemoteEvents:WaitForChild("ClaimChallenge")
+local ClaimAuraIndex = RemoteEvents:WaitForChild("ClaimAuraIndex")
+local ClaimBadge = RemoteEvents:WaitForChild("ClaimBadge")
+local AuraDiscovered = RemoteEvents:WaitForChild("AuraDiscovered", 5)
+
+local SettingsChanged = ReplicatedStorage:FindFirstChild("SettingsChanged") or Instance.new("BindableEvent")
+SettingsChanged.Name = "SettingsChanged"; SettingsChanged.Parent = ReplicatedStorage
+
+local player = Players.LocalPlayer
+local mainHUD = player:WaitForChild("PlayerGui"):WaitForChild("MainHUD")
+local Faded2 = mainHUD:WaitForChild("Faded2") 
+
+local panelOpen, activeTab, activeTabText = false, "Challenges", "Boosts"
+local latestStats = {}
+local sfxEnabled, musicEnabled, jumpEnabled = true, true, true 
+local liveSoulAuras, liveRunEarnings, liveRate, livePrestiges = 0, 0, 0, 0
+local toggleRefs, statValueRefs = {}, {}
+
+local function PlayUI(id) if shared.PlayUISound then shared.PlayUISound(id) end end
+
+local AreaAuraNames = { [1] = {"Gear", "Screw", "Tin Can", "Old Tire", "Intact Radio"}, [2] = {"Rusted Nail", "Scrap Pipe", "Bent Gear", "Engine Scrap", "Corroded Core"} }
+for i=3,20 do AreaAuraNames[i] = {"Common", "Uncommon", "Rare", "Epic", "Legendary"} end
+
+local function PlayClaimVFX(rowFrame)
+	PlayUI(SoundConfig.MaxOut or "rbxassetid://4612385808")
+	local flash = Instance.new("Frame", rowFrame); flash.Size = UDim2.new(1,0,1,0); flash.BackgroundColor3 = Color3.fromRGB(255, 255, 255); flash.ZIndex = 50; flash.BorderSizePixel = 0
+	Instance.new("UICorner", flash).CornerRadius = UDim.new(0, 8)
+	TweenService:Create(flash, TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {BackgroundTransparency = 1}):Play()
+	task.delay(0.4, function() flash:Destroy() end)
+	for i = 1, 8 do
+		local particle = Instance.new("Frame", rowFrame); particle.Size = UDim2.new(0, 10, 0, 10); particle.BackgroundColor3 = T.accentGold; particle.AnchorPoint = Vector2.new(0.5, 0.5); particle.Position = UDim2.new(0.5, 0, 0.5, 0); particle.ZIndex = 51; Instance.new("UICorner", particle).CornerRadius = UDim.new(1, 0)
+		local angle = math.rad(math.random(0, 360)); local dist = math.random(30, 80); local endPos = UDim2.new(0.5, math.cos(angle)*dist, 0.5, math.sin(angle)*dist)
+		TweenService:Create(particle, TweenInfo.new(0.5, Enum.EasingStyle.Cubic, Enum.EasingDirection.Out), {Position = endPos, Size = UDim2.new(0,0,0,0), BackgroundTransparency = 1}):Play()
+		task.delay(0.5, function() particle:Destroy() end)
+	end
+end
+
+local AchieveBtn = Instance.new("ImageButton", Faded2); AchieveBtn.Name = "AchievementButton"; AchieveBtn.Size = UDim2.new(0.85, 0, 0.85, 0); AchieveBtn.BackgroundColor3 = T.buttonSecondary; AchieveBtn.BorderSizePixel = 0; AchieveBtn.LayoutOrder = 1; Instance.new("UICorner", AchieveBtn).CornerRadius = UDim.new(0.5, 0); Instance.new("UIAspectRatioConstraint", AchieveBtn).AspectRatio = 1.0; local btnStroke = Instance.new("UIStroke", AchieveBtn); btnStroke.Color = T.accentGold; btnStroke.Thickness = 1; local btnIcon = Instance.new("ImageLabel", AchieveBtn); btnIcon.Size = UDim2.new(0.7, 0, 0.7, 0); btnIcon.Position = UDim2.new(0.15, 0, 0.15, 0); btnIcon.BackgroundTransparency = 1; btnIcon.ScaleType = Enum.ScaleType.Fit; btnIcon.Image = "rbxassetid://14923131909"
+CollectionService:AddTag(AchieveBtn, "Tutorial_AchieveMenuBtn")
+
+local Panel = Instance.new("Frame", mainHUD); Panel.Name = "AchievementPanel"; Panel.Size = UDim2.new(0.85, 0, 0.75, 0); Panel.Position = UDim2.new(0.5, 0, 0.5, 0); Panel.AnchorPoint = Vector2.new(0.5, 0.5); Panel.BackgroundColor3 = T.panelBG; Panel.BorderSizePixel = 0; Panel.Visible = false; Panel.ZIndex = 40; Panel.ClipsDescendants = true; Instance.new("UICorner", Panel).CornerRadius = UDim.new(0, 12); Instance.new("UISizeConstraint", Panel).MaxSize = Vector2.new(500, 550); local panelStroke = Instance.new("UIStroke", Panel); panelStroke.Color = T.panelStroke; panelStroke.Thickness = 2
+CollectionService:AddTag(Panel, "Tutorial_AchievePanel")
+
+local Header = Instance.new("Frame", Panel); Header.Size = UDim2.new(1, 0, 0, 44); Header.BackgroundColor3 = T.headerBG; Header.BorderSizePixel = 0; Header.ZIndex = 41
+local TitleLabel = Instance.new("TextLabel", Header); TitleLabel.Size = UDim2.new(1, -50, 1, 0); TitleLabel.Position = UDim2.new(0, 14, 0, 0); TitleLabel.BackgroundTransparency = 1; TitleLabel.Text = "MENU"; TitleLabel.TextColor3 = T.headerText; TitleLabel.TextScaled = true; TitleLabel.Font = T.font; TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+local CloseBtn = Instance.new("TextButton", Header); CloseBtn.Size = UDim2.new(0, 28, 0, 28); CloseBtn.Position = UDim2.new(1, -36, 0.5, -14); CloseBtn.BackgroundColor3 = T.buttonRed; CloseBtn.Text = "X"; CloseBtn.TextColor3 = T.headerText; CloseBtn.TextScaled = true; CloseBtn.Font = T.font; Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 5); CloseBtn.ZIndex = 9999
+CollectionService:AddTag(CloseBtn, "Tutorial_AchieveCloseBtn")
+
+local TabContainer = Instance.new("Frame", Panel); TabContainer.Size = UDim2.new(1, 0, 0, 75); TabContainer.Position = UDim2.new(0, 0, 0, 44); TabContainer.BackgroundTransparency = 1; TabContainer.ZIndex = 41
+local HoverLabel = Instance.new("TextLabel", TabContainer); HoverLabel.Size = UDim2.new(1, 0, 0, 20); HoverLabel.Position = UDim2.new(0, 0, 1, -15); HoverLabel.BackgroundTransparency = 1; HoverLabel.Text = "Boosts"; HoverLabel.TextColor3 = T.bodyText; HoverLabel.TextScaled = true; HoverLabel.Font = T.font
+local TabButtonFrame = Instance.new("Frame", TabContainer); TabButtonFrame.Size = UDim2.new(1, 0, 1, -20); TabButtonFrame.BackgroundTransparency = 1; local TabListLayout = Instance.new("UIListLayout", TabButtonFrame); TabListLayout.FillDirection = Enum.FillDirection.Horizontal; TabListLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center; TabListLayout.VerticalAlignment = Enum.VerticalAlignment.Center; TabListLayout.Padding = UDim.new(0, 12)
+
+local tabBtns, scrolls = {}, {}
+local function MakeTab(name, hoverText, iconId)
+	local btn = Instance.new("ImageButton", TabButtonFrame); btn.Size = UDim2.new(0, 45, 0, 45); btn.BackgroundColor3 = T.buttonSecondary; btn.AutoButtonColor = false; Instance.new("UICorner", btn).CornerRadius = UDim.new(0.5, 0); local tStroke = Instance.new("UIStroke", btn); tStroke.Color = T.panelStroke; tStroke.Thickness = 2; local icon = Instance.new("ImageLabel", btn); icon.Size = UDim2.new(0.6, 0, 0.6, 0); icon.Position = UDim2.new(0.2, 0, 0.2, 0); icon.BackgroundTransparency = 1; icon.ScaleType = Enum.ScaleType.Fit; icon.Image = iconId; tabBtns[name] = {btn = btn, stroke = tStroke}; CollectionService:AddTag(btn, "Tutorial_AchieveTab_" .. name)
+	local sf = Instance.new("ScrollingFrame", Panel); sf.Size = UDim2.new(1, -20, 1, -135); sf.Position = UDim2.new(0, 10, 0, 125); sf.BackgroundTransparency = 1; sf.BorderSizePixel = 0; sf.ScrollBarThickness = 4; sf.Visible = false; local layout = Instance.new("UIListLayout", sf); layout.Padding = UDim.new(0, 8); layout.HorizontalAlignment = Enum.HorizontalAlignment.Center; layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function() sf.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + 10) end); scrolls[name] = sf
+	btn.MouseEnter:Connect(function() HoverLabel.Text = hoverText end); btn.MouseLeave:Connect(function() HoverLabel.Text = activeTabText end)
+	btn.MouseButton1Down:Connect(function()
+		if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_ClickAchieveTab_" .. name) then return end
+		PlayUI(SoundConfig.UIClick or ""); activeTab = name; activeTabText = hoverText; HoverLabel.Text = activeTabText
+		for k, t in pairs(tabBtns) do t.btn.BackgroundColor3 = (k == name) and T.accentGold or T.buttonSecondary; t.stroke.Color = (k == name) and T.bodyText or T.panelStroke end
+		for k, s in pairs(scrolls) do s.Visible = (k == name) end
+		TitleLabel.Text = (name == "Settings") and "SETTINGS" or "PROGRESSION"
+		if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
+	end)
+end
+
+MakeTab("Challenges", "Boosts", "rbxassetid://14916846070"); MakeTab("Index", "Auras", "rbxassetid://14916846070"); MakeTab("Badges", "Badges", "rbxassetid://14916846070"); MakeTab("Leaderboard", "Top 10", "rbxassetid://14916846070"); MakeTab("Settings", "Settings", "rbxassetid://14923131909") 
+
+local setScroll = scrolls["Settings"]; local pad = Instance.new("UIPadding", setScroll); pad.PaddingTop = UDim.new(0, 5)
+local function MakeToggleRow(labelText, settingKey)
+	local row = Instance.new("Frame", setScroll); row.Size = UDim2.new(1, -10, 0, 42); row.BackgroundColor3 = T.cardBG; row.BorderSizePixel = 0; row.ZIndex = 41; Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
+	local lbl = Instance.new("TextLabel", row); lbl.Size = UDim2.new(0.6, 0, 1, 0); lbl.Position = UDim2.new(0, 15, 0, 0); lbl.BackgroundTransparency = 1; lbl.Text = labelText; lbl.TextColor3 = T.subText; lbl.TextScaled = true; lbl.Font = T.fontBody; lbl.TextXAlignment = Enum.TextXAlignment.Left
+	local toggle = Instance.new("TextButton", row); toggle.Size = UDim2.new(0, 60, 0, 30); toggle.Position = UDim2.new(1, -70, 0.5, -15); toggle.BorderSizePixel = 0; toggle.TextScaled = true; toggle.Font = T.font; Instance.new("UICorner", toggle).CornerRadius = UDim.new(0, 6); CollectionService:AddTag(toggle, "Tutorial_SettingToggle_" .. settingKey)
+	local function Refresh(isOn) toggle.Text = isOn and "ON" or "OFF"; toggle.TextColor3 = T.bodyText; toggle.BackgroundColor3 = isOn and T.buttonGreen or T.buttonRed end
+	local isOn = true; if settingKey == "sfx" then isOn = sfxEnabled elseif settingKey == "music" then isOn = musicEnabled elseif settingKey == "jump" then isOn = jumpEnabled end
+	Refresh(isOn); toggleRefs[settingKey] = Refresh
+	toggle.MouseButton1Down:Connect(function()
+		if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_ToggleSetting_" .. settingKey) then return end
+		PlayUI(SoundConfig.UIClick or ""); if settingKey == "sfx" then sfxEnabled = not sfxEnabled; isOn = sfxEnabled elseif settingKey == "music" then musicEnabled = not musicEnabled; isOn = musicEnabled elseif settingKey == "jump" then jumpEnabled = not jumpEnabled; isOn = jumpEnabled end
+		Refresh(isOn); SettingsChanged:Fire(settingKey, isOn)
+		if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
+	end)
+end
+MakeToggleRow("Sound Effects", "sfx"); MakeToggleRow("Music", "music"); MakeToggleRow("Jumping", "jump") 
+
+local div1 = Instance.new("Frame", setScroll); div1.Size = UDim2.new(1, -20, 0, 2); div1.BackgroundColor3 = T.panelStroke; div1.BorderSizePixel = 0
+local statsTitle = Instance.new("TextLabel", setScroll); statsTitle.Size = UDim2.new(1, -20, 0, 20); statsTitle.BackgroundTransparency = 1; statsTitle.Text = "FARM STATS"; statsTitle.TextColor3 = T.subText; statsTitle.TextScaled = true; statsTitle.Font = T.font; statsTitle.TextXAlignment = Enum.TextXAlignment.Left
+local function MakeStatRow(labelText, refKey)
+	local row = Instance.new("Frame", setScroll); row.Size = UDim2.new(1, -20, 0, 26); row.BackgroundTransparency = 1; local lbl = Instance.new("TextLabel", row); lbl.Size = UDim2.new(0.55, 0, 1, 0); lbl.BackgroundTransparency = 1; lbl.Text = labelText; lbl.TextColor3 = T.subText; lbl.TextScaled = true; lbl.Font = T.fontBody; lbl.TextXAlignment = Enum.TextXAlignment.Left; local val = Instance.new("TextLabel", row); val.Size = UDim2.new(0.45, 0, 1, 0); val.Position = UDim2.new(0.55, 0, 0, 0); val.BackgroundTransparency = 1; val.Text = "0"; val.TextColor3 = T.accentBlue; val.TextScaled = true; val.Font = T.font; val.TextXAlignment = Enum.TextXAlignment.Right; statValueRefs[refKey] = val
+end
+MakeStatRow("Soul Auras", "soul"); MakeStatRow("This Run", "run"); MakeStatRow("Rate", "rate"); MakeStatRow("Prestiges", "prestige")
+local function RefreshStats() if statValueRefs.soul then statValueRefs.soul.Text = Formatter.Format(liveSoulAuras) end; if statValueRefs.run then statValueRefs.run.Text = "$" .. Formatter.Format(liveRunEarnings) end; if statValueRefs.rate then statValueRefs.rate.Text = "$" .. Formatter.Format(liveRate) .. "/s" end; if statValueRefs.prestige then statValueRefs.prestige.Text = Formatter.Format(livePrestiges) end end
+
+local function CreateInteractiveRow(parent, id, claimActionId, onClaimCallback)
+	local row = parent:FindFirstChild(id)
+	if not row then
+		row = Instance.new("TextButton", parent); row.Name = id; row.Text = ""; row.AutoButtonColor = false; row.Size = UDim2.new(1, -8, 0, 64); row.BackgroundColor3 = T.cardBG; Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8); local stroke = Instance.new("UIStroke", row); stroke.Name = "Stroke"; stroke.Thickness = 1; local icon = Instance.new("ImageLabel", row); icon.Name = "Icon"; icon.Size = UDim2.new(0, 40, 0, 40); icon.Position = UDim2.new(0, 12, 0.5, -20); icon.ScaleType = Enum.ScaleType.Fit; Instance.new("UICorner", icon).CornerRadius = UDim.new(1, 0); local tLbl = Instance.new("TextLabel", row); tLbl.Name = "Title"; tLbl.Size = UDim2.new(0.6, 0, 0, 20); tLbl.Position = UDim2.new(0, 64, 0, 10); tLbl.BackgroundTransparency = 1; tLbl.TextColor3 = T.bodyText; tLbl.TextScaled = true; tLbl.Font = T.font; tLbl.TextXAlignment = Enum.TextXAlignment.Left; local dLbl = Instance.new("TextLabel", row); dLbl.Name = "Desc"; dLbl.Size = UDim2.new(0.6, 0, 0, 16); dLbl.Position = UDim2.new(0, 64, 0, 32); dLbl.BackgroundTransparency = 1; dLbl.TextColor3 = T.subText; dLbl.TextScaled = true; dLbl.Font = T.fontBody; dLbl.TextXAlignment = Enum.TextXAlignment.Left; local sLbl = Instance.new("TextLabel", row); sLbl.Name = "Status"; sLbl.Size = UDim2.new(0, 80, 0, 24); sLbl.Position = UDim2.new(1, -90, 0.5, -12); sLbl.BackgroundTransparency = 1; sLbl.TextScaled = true; sLbl.Font = T.font; sLbl.TextXAlignment = Enum.TextXAlignment.Right
+		UITheme.Apply(row, "Card"); CollectionService:AddTag(row, "Tutorial_AchieveRow_" .. id)
+		local scale = Instance.new("UIScale", row)
+		row.MouseEnter:Connect(function() TweenService:Create(scale, TweenInfo.new(0.15), {Scale = 1.02}):Play() end)
+		row.MouseLeave:Connect(function() TweenService:Create(scale, TweenInfo.new(0.15), {Scale = 1}):Play(); row.Desc.Text = row:GetAttribute("BaseDesc") or "" end)
+		row.MouseButton1Down:Connect(function()
+			TweenService:Create(scale, TweenInfo.new(0.1), {Scale = 0.95}):Play()
+			if row:GetAttribute("RowState") == "CLAIMABLE" then
+				if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform(claimActionId) then return end
+				PlayClaimVFX(row); onClaimCallback(); if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
+			else
+				PlayUI(SoundConfig.UIClick or ""); local showingReq = not row:GetAttribute("ShowingReq"); row:SetAttribute("ShowingReq", showingReq)
+				if showingReq and row:GetAttribute("ReqDesc") ~= "" then row.Desc.Text = row:GetAttribute("ReqDesc"); row.Desc.TextColor3 = T.accentGold else row.Desc.Text = row:GetAttribute("BaseDesc"); row.Desc.TextColor3 = T.subText end
+			end
+		end)
+		row.MouseButton1Up:Connect(function() TweenService:Create(scale, TweenInfo.new(0.2, Enum.EasingStyle.Bounce), {Scale = 1.02}):Play() end)
+	end
+	return row
+end
+
+local function RefreshData()
+	local claimedChallenges, claimedAuras, claimedBadges, discoveredTiers = latestStats.claimedChallenges or {}, latestStats.claimedAuras or {}, latestStats.claimedBadges or {}, latestStats.discoveredTiers or {}
+
+	for i, chal in ipairs(AchievementConfig.Challenges) do
+		local current = latestStats[chal.statKey] or 0
+		local isDone = current >= chal.goal; local isClaimed = claimedChallenges[chal.id] == true
+		local rowId = "Chal_" .. chal.id
+		local row = CreateInteractiveRow(scrolls["Challenges"], rowId, "Action_ClaimChallenge_" .. chal.id, function() ClaimChallenge:FireServer(chal.id) end)
+		row.Title.Text = chal.title; row.Icon.Image = chal.iconId; row:SetAttribute("BaseDesc", chal.rewardText); row:SetAttribute("ReqDesc", "Requires: " .. chal.desc)
+		if isClaimed then row:SetAttribute("RowState", "CLAIMED"); row.Status.Text = "UNLOCKED"; row.Status.TextColor3 = T.subText; row.BackgroundColor3 = T.cardBG; row.Stroke.Color = T.accentBlue; row.Desc.Text = chal.rewardText; row.Desc.TextColor3 = T.subText
+		elseif isDone then row:SetAttribute("RowState", "CLAIMABLE"); row.Status.Text = "CLAIM!"; row.Status.TextColor3 = Color3.fromRGB(255, 255, 255); row.BackgroundColor3 = Color3.fromRGB(80, 160, 60); row.Stroke.Color = Color3.fromRGB(120, 255, 100); row.Desc.Text = "Click to Unlock!"; row.Desc.TextColor3 = Color3.fromRGB(200, 255, 200)
+		else row:SetAttribute("RowState", "LOCKED"); row.Status.Text = current .. " / " .. chal.goal; row.Status.TextColor3 = T.subText; row.BackgroundColor3 = T.cardBG; row.Stroke.Color = T.subText; row.Desc.Text = (not row:GetAttribute("ShowingReq")) and chal.rewardText or ("Requires: " .. chal.desc); row.Desc.TextColor3 = T.subText end
+	end
+
+	local indexCount = 1
+	for aIdx = 1, 20 do
+		local areaNames = AreaAuraNames[aIdx]
+		if not areaNames then continue end
+		for tIdx = 1, 5 do
+			local tier = TierConfig.Tiers[tIdx]
+			if not tier then continue end
+			local auraKey = aIdx .. "_" .. tier.name; local discovered = discoveredTiers[auraKey] == true; local isClaimed = claimedAuras[auraKey] == true
+			local rewardGA = AchievementConfig.AuraTierRewards[tier.name] or 5
+			local row = CreateInteractiveRow(scrolls["Index"], "Index_" .. indexCount, "Action_ClaimAura_" .. aIdx .. "_" .. tier.name, function() ClaimAuraIndex:FireServer(aIdx, tier.name) end)
+			row.Icon.Image = "rbxassetid://0"
+			if isClaimed then row:SetAttribute("RowState", "CLAIMED"); row.Title.Text = areaNames[tIdx] .. " Aura"; row.Title.TextColor3 = tier.color; row.Status.Text = "FOUND"; row.Status.TextColor3 = T.subText; row.BackgroundColor3 = T.cardBG; row.Stroke.Color = tier.color; row:SetAttribute("BaseDesc", "Area " .. aIdx); row:SetAttribute("ReqDesc", ""); row.Desc.Text = "Area " .. aIdx; row.Desc.TextColor3 = T.subText
+			elseif discovered then row:SetAttribute("RowState", "CLAIMABLE"); row.Title.Text = areaNames[tIdx] .. " Aura"; row.Title.TextColor3 = Color3.fromRGB(255, 255, 255); row.Status.Text = "CLAIM +" .. rewardGA .. " GA!"; row.Status.TextColor3 = Color3.fromRGB(255, 215, 0); row.BackgroundColor3 = Color3.fromRGB(150, 110, 20); row.Stroke.Color = Color3.fromRGB(255, 215, 0); row:SetAttribute("BaseDesc", "Click to claim reward!"); row:SetAttribute("ReqDesc", ""); row.Desc.Text = "Click to claim reward!"; row.Desc.TextColor3 = Color3.fromRGB(255, 240, 150)
+			else row:SetAttribute("RowState", "LOCKED"); row.Title.Text = "???"; row.Title.TextColor3 = Color3.fromRGB(100, 100, 100); row.Status.Text = "???"; row.Status.TextColor3 = T.buttonRed; row.BackgroundColor3 = T.cardBG; row.Stroke.Color = Color3.fromRGB(50, 50, 50); row:SetAttribute("BaseDesc", "Undiscovered"); row:SetAttribute("ReqDesc", "Area " .. aIdx); row.Desc.Text = "Undiscovered"; row.Desc.TextColor3 = T.subText end
+			indexCount += 1
+		end
+	end
+
+	for i, badge in ipairs(AchievementConfig.Badges) do
+		local current = latestStats[badge.statKey] or 0; local isDone = current >= badge.goal; local isClaimed = claimedBadges[i] == true
+		local row = CreateInteractiveRow(scrolls["Badges"], "Badge_" .. i, "Action_ClaimBadge_" .. i, function() ClaimBadge:FireServer(i) end)
+		row.Title.Text = badge.title; row.Icon.Image = badge.iconId; row:SetAttribute("BaseDesc", badge.desc); row:SetAttribute("ReqDesc", "Goal: " .. badge.goal)
+		if isClaimed then row:SetAttribute("RowState", "CLAIMED"); row.Status.Text = "OWNED"; row.Status.TextColor3 = T.subText; row.BackgroundColor3 = T.cardBG; row.Stroke.Color = T.accentGold; row.Desc.Text = badge.desc; row.Desc.TextColor3 = T.subText
+		elseif isDone then row:SetAttribute("RowState", "CLAIMABLE"); row.Status.Text = "CLAIM BADGE!"; row.Status.TextColor3 = Color3.fromRGB(255, 255, 255); row.BackgroundColor3 = Color3.fromRGB(120, 60, 180); row.Stroke.Color = Color3.fromRGB(200, 100, 255); row.Desc.Text = "Click to receive Badge!"; row.Desc.TextColor3 = Color3.fromRGB(230, 200, 255)
+		else row:SetAttribute("RowState", "LOCKED"); row.Status.Text = current .. " / " .. badge.goal; row.Status.TextColor3 = T.subText; row.BackgroundColor3 = T.cardBG; row.Stroke.Color = T.subText; row.Desc.Text = badge.desc; row.Desc.TextColor3 = T.subText end
+	end
+end
+
+UpdateHUDBridge:Connect(function(stats)
+	for key, value in pairs(stats) do latestStats[key] = value end
+	if stats.soulAuras ~= nil then liveSoulAuras = stats.soulAuras end; if stats.totalEarned ~= nil then liveRunEarnings = stats.totalEarned end; if stats.rate ~= nil and stats.passiveInterval ~= nil and stats.passiveInterval > 0 then liveRate = stats.rate / stats.passiveInterval end; if stats.prestigeCount ~= nil then livePrestiges = stats.prestigeCount end
+	if stats.settings then
+		if stats.settings.sfxEnabled ~= nil then sfxEnabled = stats.settings.sfxEnabled; if toggleRefs.sfx then toggleRefs.sfx(sfxEnabled) end end
+		if stats.settings.musicEnabled ~= nil then musicEnabled = stats.settings.musicEnabled; if toggleRefs.music then toggleRefs.music(musicEnabled) end end
+		if stats.settings.jumpEnabled ~= nil then jumpEnabled = stats.settings.jumpEnabled; if toggleRefs.jump then toggleRefs.jump(jumpEnabled) end end
+	end
+	if panelOpen then RefreshData(); RefreshStats() end
+end)
+
+local function OpenToTab(tabName, hoverText)
+	PlayUI(SoundConfig.UIOpen or ""); panelOpen = true; Panel.Visible = true; Panel.Size = UDim2.new(0.85, 0, 0, 0); activeTab = tabName; activeTabText = hoverText; HoverLabel.Text = activeTabText
+	for k, t in pairs(tabBtns) do t.btn.BackgroundColor3 = (k == activeTab) and T.accentGold or T.buttonSecondary; t.stroke.Color = (k == activeTab) and T.bodyText or T.panelStroke end
+	for k, s in pairs(scrolls) do s.Visible = (k == activeTab) end
+	RefreshData(); RefreshStats(); TitleLabel.Text = (tabName == "Settings") and "SETTINGS" or "MENU"
+	TweenService:Create(Panel, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Size = UDim2.new(0.85, 0, 0.75, 0)}):Play()
+	UITheme.SetMenuVisible(true)
+end
+
+AchieveBtn.MouseButton1Down:Connect(function()
+	if not panelOpen and type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_OpenAchievements") then return end
+	if panelOpen and type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_CloseAchievements") then return end
+	if panelOpen then CloseBtn.MouseButton1Down:Fire() else OpenToTab("Challenges", "Boosts") end
+	if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
+end)
+CloseBtn.MouseButton1Down:Connect(function()
+	if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_CloseAchievements") then return end
+	PlayUI(SoundConfig.UIClose or ""); panelOpen = false; TweenService:Create(Panel, TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {Size = UDim2.new(0.85, 0, 0, 0)}):Play(); UITheme.SetMenuVisible(false); task.delay(0.25, function() Panel.Visible = false end)
+	if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
+end)
+
+local function AddButtonJuice(btn)
+	local scale = btn:FindFirstChildOfClass("UIScale") or Instance.new("UIScale", btn)
+	btn.MouseEnter:Connect(function() TweenService:Create(scale, TweenInfo.new(0.15), {Scale = 1.08}):Play() end)
+	btn.MouseLeave:Connect(function() TweenService:Create(scale, TweenInfo.new(0.15), {Scale = 1}):Play() end)
+	btn.MouseButton1Down:Connect(function() TweenService:Create(scale, TweenInfo.new(0.1), {Scale = 0.9}):Play() end)
+	btn.MouseButton1Up:Connect(function() TweenService:Create(scale, TweenInfo.new(0.2, Enum.EasingStyle.Bounce), {Scale = 1.08}):Play() end)
+end
+AddButtonJuice(AchieveBtn); AddButtonJuice(CloseBtn)
+for _, t in pairs(tabBtns) do AddButtonJuice(t.btn) end
+
+task.spawn(function() task.wait(1); UITheme.Apply(Panel, "Panel"); UITheme.Apply(Header, "TitleBar"); UITheme.ApplyShine(Panel) end)
+
+---------------------------------------------------------------
+-- ✨ THE FIX: JUMP ENFORCER LOGIC
+---------------------------------------------------------------
+local defaultJumpHeight = 7.2
+local defaultJumpPower = 50
+
+local function UpdateJumpState(character, canJump)
+	if not character then return end
+	local humanoid = character:WaitForChild("Humanoid", 3)
+	if humanoid then
+		if humanoid.JumpHeight > 0 then defaultJumpHeight = humanoid.JumpHeight end
+		if humanoid.JumpPower > 0 then defaultJumpPower = humanoid.JumpPower end
+
+		if canJump then
+			humanoid.UseJumpPower = not humanoid.UseJumpPower 
+			humanoid.JumpHeight = defaultJumpHeight
+			humanoid.JumpPower = defaultJumpPower
+			humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+		else
+			humanoid.JumpHeight = 0
+			humanoid.JumpPower = 0
+			humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, false)
+		end
+	end
+end
+
+SettingsChanged.Event:Connect(function(key, value)
+	if key == "jump" then UpdateJumpState(player.Character, value) end
+end)
+
+player.CharacterAdded:Connect(function(char)
+	task.wait(0.1) UpdateJumpState(char, jumpEnabled)
+end)
+
+if player.Character then UpdateJumpState(player.Character, jumpEnabled) end
+
+-- ✨ TUTORIAL OVERRIDE
+local forceClose = ReplicatedStorage:FindFirstChild("ForceCloseUI") or Instance.new("BindableEvent")
+forceClose.Name = "ForceCloseUI"; forceClose.Parent = ReplicatedStorage
+forceClose.Event:Connect(function() if panelOpen then CloseBtn.MouseButton1Down:Fire() end end)
+
 
 -- TutorialConfig
 -- Location: ReplicatedStorage > Modules > TutorialConfig
@@ -1469,7 +1451,7 @@ TutorialConfig.Steps = {
 		menuOpenBtnTag = "Tutorial_AchieveMenuBtn",
 
 		bannerTitle  = "Global Rankings",
-		bannerBody   = "Click the Top 10 tab to view the Global Leaderboard. Can you become the richest player in the world?",
+		bannerBody   = "Click the Top 10 tab to view the Global Leaderboard.",
 
 		icon         = "rbxassetid://14916846070",
 		color        = Color3.fromRGB(255, 150, 50),
@@ -1519,8 +1501,8 @@ TutorialConfig.Steps = {
 		action       = "Action_OpenTravel",
 		targetTag    = "Tutorial_TravelButton",
 
-		bannerTitle  = "The Universe Awaits!",
-		bannerBody   = "You have mastered the mechanics! Close the menu and open Area Travel to explore Area 3.",
+		bannerTitle  = "Check the Next Area",
+		bannerBody   = "Good job learning the mechanics to make a TON of money! Open the Area Panel",
 
 		icon         = "rbxassetid://14916846070",
 		color        = Color3.fromRGB(100, 255, 150),
@@ -1537,7 +1519,7 @@ TutorialConfig.Steps = {
 		fallbackStepId = "a1_final_travel", 
 
 		bannerTitle  = "Browse Areas",
-		bannerBody   = "Click the Right Arrow to view Area 3.",
+		bannerBody   = "Click the Arrows to view more areas",
 
 		icon         = "rbxassetid://14916846070",
 		color        = Color3.fromRGB(150, 200, 255),
@@ -1553,8 +1535,8 @@ TutorialConfig.Steps = {
 		menuOpenBtnTag = "Tutorial_TravelButton",
 		fallbackStepId = "a1_final_travel",
 
-		bannerTitle  = "Travel to Area 3",
-		bannerBody   = "Click TRAVEL to jump to the new Area and continue your journey!",
+		bannerTitle  = "Get yo money up",
+		bannerBody   = "Once you have enough farm evaluation head to the next area to Unlock More Important Things!",
 
 		icon         = "rbxassetid://14916846070",
 		color        = Color3.fromRGB(107, 255, 161),
@@ -1573,604 +1555,3 @@ function TutorialConfig.GetStepById(id)
 end
 
 return TutorialConfig
-
--- UIController
--- Location: StarterPlayer > StarterPlayerScripts > UIController
-
-local Players           = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local TweenService      = game:GetService("TweenService")
-local Debris            = game:GetService("Debris")
-local UserInputService  = game:GetService("UserInputService") 
-local CollectionService = game:GetService("CollectionService")
-
-local AdminConfig       = require(ReplicatedStorage.Modules.AdminConfig)
-local Formatter         = require(ReplicatedStorage.Modules.NumberFormatter)
-local UITheme           = require(ReplicatedStorage.Modules.UITheme)
-
-local BridgeNet2             = require(ReplicatedStorage.Modules:WaitForChild("BridgeNet2"))
-local UpdateHUDBridge        = BridgeNet2.ClientBridge("UpdateHUD")
-local ShipAurasBridge        = BridgeNet2.ClientBridge("ShipAuras")
-local UpdateHatcheryBridge   = BridgeNet2.ClientBridge("UpdateHatchery")
-
-local player    = Players.LocalPlayer
-local playerGui = player:WaitForChild("PlayerGui")
-
-local HabitatFull = ReplicatedStorage.RemoteEvents:WaitForChild("HabitatFull")
-local mainHUD   = playerGui:WaitForChild("MainHUD")
-
-local isAutoMode          = AdminConfig.AutoDispatch
-local HabitatHolder       = workspace:WaitForChild("HabitatHolder")
-local GoldenAurasLabel    = mainHUD:WaitForChild("GoldenAurasLabel")
-
-local displayedCurrency   = 0
-local liveGoldenAuras     = 0
-local ratePerSecond       = 0
-local pendingAuras        = 0
-local habitatCapacity     = AdminConfig.BaseHabitatCapacity
-local passiveInterval     = AdminConfig.PassiveInterval
-local currentCooldownTime = 15
-local isShipOnCooldown    = false
-local sharedCooldownEnd   = 0
-local manualCooldownLoopID = 0
-local autoLoopID          = 0
-local currentHatcheryLevel = AdminConfig.HatcheryMax or 150 
-
-local function FormatCurrency(n)
-	local num = tonumber(n) or 0
-	if num < 1000 then return string.format("%.2f", num)
-	else return Formatter.Format(num) end
-end
-
-local function FormatNumber(n) return Formatter.Format(math.floor(tonumber(n) or 0)) end
-
-local hud        = playerGui:WaitForChild("MainHUD")
-local curr       = hud:WaitForChild("CurrencyLabel")
-local rate       = hud:WaitForChild("RateLabel")
-local sendButton = hud:WaitForChild("SendButton")
-local modeToggle = hud:WaitForChild("ModeToggle")
-
-CollectionService:AddTag(sendButton, "Tutorial_SendShipBtn")
-CollectionService:AddTag(modeToggle, "Tutorial_ToggleShipBtn")
-
--- ─────────────────────────────────────────────────────────────────────────────
--- ✨ AUTO-MODE UI ENHANCEMENTS (Timer & Habitat Status)
--- ─────────────────────────────────────────────────────────────────────────────
-local autoTimerLabel = Instance.new("TextLabel")
-autoTimerLabel.Name = "AutoTimerLabel"
-autoTimerLabel.Size = UDim2.new(0, 45, 1, 0)
-autoTimerLabel.Position = UDim2.new(1, 26, 0, 0) 
-autoTimerLabel.BackgroundTransparency = 1
-autoTimerLabel.Text = ""
-autoTimerLabel.TextColor3 = Color3.fromRGB(0, 255, 128)
-autoTimerLabel.TextScaled = true
-autoTimerLabel.Font = Enum.Font.GothamBold
-autoTimerLabel.TextXAlignment = Enum.TextXAlignment.Left
-autoTimerLabel.Visible = false
-autoTimerLabel.Parent = modeToggle
-
--- Bigger & Styled Auto Habitat Label
-local autoHabitatLabel = Instance.new("TextLabel")
-autoHabitatLabel.Name = "AutoHabitatLabel"
-autoHabitatLabel.Size = sendButton.Size
-autoHabitatLabel.Position = sendButton.Position
-autoHabitatLabel.AnchorPoint = sendButton.AnchorPoint
-autoHabitatLabel.BackgroundTransparency = 1
-autoHabitatLabel.Font = Enum.Font.FredokaOne 
-autoHabitatLabel.TextColor3 = Color3.fromRGB(160, 200, 255)
-autoHabitatLabel.TextScaled = true
-autoHabitatLabel.TextXAlignment = Enum.TextXAlignment.Center 
-autoHabitatLabel.Visible = false
-autoHabitatLabel.Parent = sendButton.Parent
-
-local autoHabStroke = Instance.new("UIStroke", autoHabitatLabel)
-autoHabStroke.Thickness = 3
-autoHabStroke.Transparency = 0.1
-autoHabStroke.Color = Color3.new(0, 0, 0)
-
-local autoHabConstraint = Instance.new("UITextSizeConstraint", autoHabitatLabel)
-autoHabConstraint.MaxTextSize = 26 
-
--- ✨ MANUAL MODE BLUE TIMER (Left of the Send Button)
-local manualTimerLabel = Instance.new("TextLabel")
-manualTimerLabel.Name = "ManualTimerLabel"
-manualTimerLabel.Size = UDim2.new(0, 60, 0.7, 0)
-manualTimerLabel.AnchorPoint = Vector2.new(1, 0.5)
-manualTimerLabel.Position = UDim2.new(0, -10, 0.5, 0) 
-manualTimerLabel.BackgroundTransparency = 1
-manualTimerLabel.Text = ""
-manualTimerLabel.TextColor3 = Color3.fromRGB(0, 180, 255)
-manualTimerLabel.TextScaled = true
-manualTimerLabel.Font = Enum.Font.GothamBold
-manualTimerLabel.TextXAlignment = Enum.TextXAlignment.Right
-manualTimerLabel.Visible = false
-manualTimerLabel.ZIndex = 50
-manualTimerLabel.Parent = sendButton
-
-local manualTimerStroke = Instance.new("UIStroke", manualTimerLabel)
-manualTimerStroke.Color = Color3.new(0, 0, 0)
-manualTimerStroke.Thickness = 2
-
--- ─────────────────────────────────────────────────────────────────────────────
--- ✨ INSTANT UI RESPONSIVENESS (Purchases & Juice Masks) ✨
--- ─────────────────────────────────────────────────────────────────────────────
-local function UpdateWalletVisual()
-	local pendingCash = player:GetAttribute("LocalPendingPayout") or 0
-	curr.Text = "Currency: $" .. FormatCurrency(math.max(0, displayedCurrency - pendingCash))
-end
-
-local function UpdateAuraVisual()
-	local pendingAurasVis = player:GetAttribute("LocalPendingAuras") or 0
-	GoldenAurasLabel.Text = "GAURAS: " .. FormatNumber(math.max(0, liveGoldenAuras - pendingAurasVis))
-end
-
-player:GetAttributeChangedSignal("LocalSpend"):Connect(function()
-	local spend = player:GetAttribute("LocalSpend") or 0
-	if spend > 0 then
-		displayedCurrency = math.max(0, displayedCurrency - spend)
-		UpdateWalletVisual()
-		player:SetAttribute("LocalSpend", 0)
-	end
-end)
-
-player:GetAttributeChangedSignal("LocalAuraSpend"):Connect(function()
-	local spend = player:GetAttribute("LocalAuraSpend") or 0
-	if spend > 0 then
-		liveGoldenAuras = math.max(0, liveGoldenAuras - spend)
-		UpdateAuraVisual()
-		player:SetAttribute("LocalAuraSpend", 0)
-	end
-end)
-
-player:GetAttributeChangedSignal("LocalPendingPayout"):Connect(UpdateWalletVisual)
-player:GetAttributeChangedSignal("LocalPendingAuras"):Connect(UpdateAuraVisual)
-
-local function FormatRate(perSecond)
-	if perSecond <= 0 then return "$0.00/sec" end
-	return "$" .. FormatCurrency(perSecond) .. "/sec"
-end
-
-local function GetRateColor(pending, capacity)
-	local ratio = math.clamp((pending or 0) / (capacity or 50), 0, 1)
-	if ratio >= 1        then return Color3.fromRGB(255, 60,  60)
-	elseif ratio >= 0.75 then return Color3.fromRGB(255, 200,  0)
-	elseif ratio >= 0.5  then return Color3.fromRGB(80,  255, 80)
-	else                      return Color3.fromRGB(80,  180, 80)
-	end
-end
-
-local function UpdateHabitatBar(actualPending, capacity)
-	local offset = player:GetAttribute("HabitatVisualOffset") or 0
-	local visualPending = actualPending + offset
-
-	local ratio    = math.clamp(visualPending / (capacity or 50), 0, 1)
-	local color    = GetRateColor(visualPending, capacity)
-	local model    = HabitatHolder:FindFirstChild("HabitatModel")
-	if model then
-		local gui    = model:FindFirstChild("HabitatGui")
-		local barBg  = gui and gui:FindFirstChild("BarBackground")
-		local barFill = barBg and barBg:FindFirstChild("BarFill")
-		if barFill then
-			TweenService:Create(barFill, TweenInfo.new(0.3), {
-				Size = UDim2.new(ratio, 0, 1, 0),
-				BackgroundColor3 = color,
-			}):Play()
-		end
-	end
-end
-
-player:GetAttributeChangedSignal("HabitatVisualOffset"):Connect(function()
-	UpdateHabitatBar(pendingAuras, habitatCapacity)
-end)
-
--- ─────────────────────────────────────────────────────────────────────────────
--- ✨ WARNING POPUP SYSTEM
--- ─────────────────────────────────────────────────────────────────────────────
-local activeAlerts = {}
-
-local function ShowAlertPopup(alertType, text, iconColor)
-	if tick() - (activeAlerts[alertType] or 0) < 2.5 then return end
-	activeAlerts[alertType] = tick()
-
-	local ratePos = rate.AbsolutePosition
-	local rateSize = rate.AbsoluteSize
-
-	local alertW = 200
-	local alertH = 40
-	local padding = 15
-
-	local endX = ratePos.X - padding
-	local startX = endX + 40
-	local startY = ratePos.Y + (rateSize.Y / 2)
-
-	local effectGui = Instance.new("ScreenGui")
-	effectGui.Name = "AlertGui_" .. alertType
-	effectGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-	effectGui.Parent = playerGui
-
-	local alertFrame = Instance.new("Frame")
-	alertFrame.Size = UDim2.new(0, alertW, 0, alertH)
-	alertFrame.AnchorPoint = Vector2.new(1, 0.5)
-	alertFrame.Position = UDim2.new(0, startX, 0, startY)
-	alertFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
-	alertFrame.BorderSizePixel = 0
-	alertFrame.BackgroundTransparency = 1 
-	alertFrame.Parent = effectGui
-
-	local corner = Instance.new("UICorner", alertFrame)
-	corner.CornerRadius = UDim.new(0.5, 0)
-
-	local stroke = Instance.new("UIStroke", alertFrame)
-	stroke.Color = iconColor
-	stroke.Thickness = 2
-	stroke.Transparency = 1
-
-	local icon = Instance.new("ImageLabel", alertFrame)
-	icon.Size = UDim2.new(0, 20, 0, 20)
-	icon.Position = UDim2.new(0, 10, 0.5, -10)
-	icon.BackgroundTransparency = 1
-	icon.Image = "rbxassetid://7733658504" 
-	icon.ImageColor3 = iconColor
-	icon.ImageTransparency = 1
-
-	local msg = Instance.new("TextLabel", alertFrame)
-	msg.Size = UDim2.new(1, -40, 1, 0)
-	msg.Position = UDim2.new(0, 35, 0, 0)
-	msg.BackgroundTransparency = 1
-	msg.Text = text
-	msg.TextColor3 = iconColor
-	msg.Font = Enum.Font.GothamBold
-	msg.TextScaled = true
-	msg.TextTransparency = 1
-	msg.TextXAlignment = Enum.TextXAlignment.Left
-
-	local sfxFolder = ReplicatedStorage:FindFirstChild("SFX") or ReplicatedStorage:FindFirstChild("Sounds")
-	if sfxFolder and sfxFolder:FindFirstChild("ErrorBuzz") then
-		local sfx = sfxFolder.ErrorBuzz:Clone()
-		sfx.Parent = game:GetService("SoundService")
-		sfx.Volume = 0.5
-		sfx:Play()
-		Debris:AddItem(sfx, 2)
-	end
-
-	TweenService:Create(alertFrame, TweenInfo.new(0.4, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
-		Position = UDim2.new(0, endX, 0, startY),
-		BackgroundTransparency = 0.1
-	}):Play()
-	TweenService:Create(stroke, TweenInfo.new(0.4), {Transparency = 0}):Play()
-	TweenService:Create(icon, TweenInfo.new(0.4), {ImageTransparency = 0}):Play()
-	TweenService:Create(msg, TweenInfo.new(0.4), {TextTransparency = 0}):Play()
-
-	task.delay(2, function()
-		if not alertFrame.Parent then return end
-		TweenService:Create(alertFrame, TweenInfo.new(0.3, Enum.EasingStyle.Sine, Enum.EasingDirection.In), {
-			Position = UDim2.new(0, startX, 0, startY),
-			BackgroundTransparency = 1
-		}):Play()
-		TweenService:Create(stroke, TweenInfo.new(0.3), {Transparency = 1}):Play()
-		TweenService:Create(icon, TweenInfo.new(0.3), {ImageTransparency = 1}):Play()
-		TweenService:Create(msg, TweenInfo.new(0.3), {TextTransparency = 1}):Play()
-		Debris:AddItem(effectGui, 0.4)
-	end)
-end
-
-HabitatFull.OnClientEvent:Connect(function()
-	ShowAlertPopup("HabitatFull", "HABITAT FULL!", Color3.fromRGB(255, 80, 80))
-end)
-
-UpdateHatcheryBridge:Connect(function(info)
-	currentHatcheryLevel = info.current
-	if info.current <= 0 then
-		ShowAlertPopup("HatcheryEmpty", "HATCHERY EMPTY!", Color3.fromRGB(255, 180, 50))
-	end
-end)
-
-UserInputService.InputBegan:Connect(function(input, gameProcessed)
-	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-
-		local clickedMainButton = false
-		if gameProcessed then
-			local guis = playerGui:GetGuiObjectsAtPosition(input.Position.X, input.Position.Y)
-			for _, gui in ipairs(guis) do
-				if gui.Name == "ClickButton" then
-					clickedMainButton = true
-					break
-				end
-			end
-		end
-
-		if not clickedMainButton then return end
-
-		if currentHatcheryLevel <= 0.5 then
-			ShowAlertPopup("HatcheryEmpty", "HATCHERY EMPTY!", Color3.fromRGB(255, 180, 50))
-		elseif pendingAuras >= habitatCapacity then
-			ShowAlertPopup("HabitatFull", "HABITAT FULL!", Color3.fromRGB(255, 80, 80))
-		end
-	end
-end)
-
-local function SyncManualCooldownVisuals()
-	if isAutoMode or not sendButton.Visible then 
-		manualTimerLabel.Visible = false
-		return 
-	end
-
-	local progressContainer = sendButton:FindFirstChild("CooldownProgress")
-	local fillPart          = progressContainer and progressContainer:FindFirstChild("Fill")
-	local textTarget        = sendButton:FindFirstChildOfClass("TextLabel") or sendButton
-
-	local uiStroke = sendButton:FindFirstChildOfClass("UIStroke") or Instance.new("UIStroke", sendButton)
-	uiStroke.Thickness = 1.5
-
-	if not fillPart then return end
-
-	-- ✨ THE FIX: We turn ClipsDescendants OFF on the button so the timer label outside the button isn't erased
-	sendButton.ClipsDescendants = false
-
-	-- And instead we put the clipping on the container so the black bar stays nicely inside!
-	progressContainer.ClipsDescendants = true
-	local progCorner = progressContainer:FindFirstChildOfClass("UICorner") or Instance.new("UICorner", progressContainer)
-	local btnCorner = sendButton:FindFirstChildOfClass("UICorner")
-	if btnCorner then progCorner.CornerRadius = btnCorner.CornerRadius end
-
-	progressContainer.Size     = UDim2.new(1, 0, 1, 0)
-	progressContainer.Position = UDim2.new(0, 0, 0, 0)
-	progressContainer.AnchorPoint = Vector2.new(0, 0)
-
-	fillPart.BorderSizePixel = 0
-	fillPart.AnchorPoint     = Vector2.new(0, 1)
-	fillPart.Position        = UDim2.new(0, 0, 1, 0)
-
-	manualCooldownLoopID += 1
-	local currentLoop = manualCooldownLoopID
-	local timeLeft    = sharedCooldownEnd - tick()
-
-	sendButton.BackgroundColor3    = Color3.fromRGB(0, 160, 255)
-	uiStroke.Color                 = Color3.fromRGB(0, 220, 255)
-	fillPart.BackgroundColor3      = Color3.fromRGB(0, 0, 0)
-	fillPart.BackgroundTransparency = 0.55
-
-	if timeLeft > 0 then
-		isShipOnCooldown = true
-		if textTarget ~= sendButton then sendButton.Text = "" end
-
-		manualTimerLabel.Visible = true
-
-		local pct = timeLeft / currentCooldownTime
-		fillPart.Size = UDim2.new(1, 0, pct, 0)
-
-		TweenService:Create(fillPart, TweenInfo.new(timeLeft, Enum.EasingStyle.Linear), {
-			Size = UDim2.new(1, 0, 0, 0)
-		}):Play()
-
-		task.spawn(function()
-			while manualCooldownLoopID == currentLoop do
-				local currentLeft = sharedCooldownEnd - tick()
-
-				if currentLeft <= 0 then break end
-
-				manualTimerLabel.Text = string.format("%.1fs", currentLeft)
-				task.wait(0.05) 
-			end
-
-			if manualCooldownLoopID == currentLoop then
-				isShipOnCooldown  = false
-				textTarget.Text   = ""
-				fillPart.Size     = UDim2.new(1, 0, 0, 0)
-				manualTimerLabel.Visible = false
-			end
-		end)
-	else
-		isShipOnCooldown = false
-		textTarget.Text  = ""
-		fillPart.Size    = UDim2.new(1, 0, 0, 0)
-		manualTimerLabel.Visible = false
-	end
-end
-
-local function UpdateSendButton()
-	if AdminConfig.DisableShipping then 
-		sendButton.Visible = false
-		autoHabitatLabel.Visible = false
-		return 
-	end
-
-	if isAutoMode then
-		sendButton.Visible = false
-		autoHabitatLabel.Visible = true
-		autoHabitatLabel.Text = "Waiting: " .. FormatNumber(pendingAuras) .. " / " .. FormatNumber(habitatCapacity)
-
-		if pendingAuras >= habitatCapacity then
-			autoHabitatLabel.TextColor3 = Color3.fromRGB(255, 80, 80)
-		elseif pendingAuras > 0 then
-			autoHabitatLabel.TextColor3 = Color3.fromRGB(100, 255, 128)
-		else
-			autoHabitatLabel.TextColor3 = Color3.fromRGB(160, 160, 180)
-		end
-	else
-		autoHabitatLabel.Visible = false
-		sendButton.Visible = pendingAuras > 0
-		if sendButton.Visible then
-			SyncManualCooldownVisuals()
-		end
-	end
-end
-
-local autoProgressContainer = Instance.new("Frame")
-autoProgressContainer.Name             = "AutoProgressContainer"
-autoProgressContainer.Size             = UDim2.new(0, 12, 1, 0)
-autoProgressContainer.Position         = UDim2.new(1, 8, 0, 0)
-autoProgressContainer.BackgroundColor3 = Color3.fromRGB(24, 60, 24)
-autoProgressContainer.BorderSizePixel  = 0
-autoProgressContainer.Visible          = false
-autoProgressContainer.Parent           = modeToggle
-Instance.new("UICorner", autoProgressContainer).CornerRadius = UDim.new(0.5, 0)
-
-local autoFillClip = Instance.new("Frame")
-autoFillClip.Size                 = UDim2.new(1, 0, 1, 0)
-autoFillClip.BackgroundTransparency = 1
-autoFillClip.ClipsDescendants     = true
-autoFillClip.Parent               = autoProgressContainer
-Instance.new("UICorner", autoFillClip).CornerRadius = UDim.new(0.5, 0)
-
-local autoFill = Instance.new("Frame")
-autoFill.Name             = "Fill"
-autoFill.Size             = UDim2.new(1, 0, 1, 0)
-autoFill.Position         = UDim2.new(0, 0, 1, 0)
-autoFill.AnchorPoint      = Vector2.new(0, 1)
-autoFill.BackgroundColor3 = Color3.fromRGB(0, 255, 128)
-autoFill.BorderSizePixel  = 0
-autoFill.Parent           = autoFillClip
-
-local function UpdateModeToggleVisuals()
-	local textLabel = modeToggle:FindFirstChildOfClass("TextLabel") or modeToggle
-	local uiStroke  = modeToggle:FindFirstChildOfClass("UIStroke")
-
-	autoLoopID += 1
-	local currentLoop = autoLoopID
-
-	if isAutoMode then
-		modeToggle.BackgroundColor3 = Color3.fromRGB(24, 60, 24)
-		textLabel.Text              = "[AUTO ACTIVE]"
-		textLabel.TextColor3        = Color3.fromRGB(0, 255, 128)
-		if uiStroke then uiStroke.Color = Color3.fromRGB(0, 255, 128) end
-
-		autoProgressContainer.Visible = true
-		autoTimerLabel.Visible = true
-
-		task.spawn(function()
-			local activeTween = nil
-
-			while isAutoMode and autoLoopID == currentLoop do
-				local currentLeft = sharedCooldownEnd - tick()
-
-				if currentLeft <= 0 then
-					if pendingAuras > 0 then
-						ShipAurasBridge:Fire({ action = "manual" })
-						if type(shared.TutorialRecordShipSent) == "function" then shared.TutorialRecordShipSent() end
-					end
-
-					sharedCooldownEnd = tick() + currentCooldownTime
-					currentLeft = currentCooldownTime
-
-					if activeTween then activeTween:Cancel() end
-					autoFill.Size = UDim2.new(1, 0, 1, 0)
-					activeTween = TweenService:Create(autoFill, TweenInfo.new(currentLeft, Enum.EasingStyle.Linear), {
-						Size = UDim2.new(1, 0, 0, 0)
-					})
-					activeTween:Play()
-				end
-
-				autoTimerLabel.Text = string.format("%.1fs", math.max(0, currentLeft))
-				task.wait(0.05) 
-			end
-
-			if activeTween then activeTween:Cancel() end
-		end)
-	else
-		modeToggle.BackgroundColor3 = Color3.fromRGB(38, 38, 45)
-		textLabel.Text              = "Mode: Manual"
-		textLabel.TextColor3        = Color3.fromRGB(220, 230, 240)
-		if uiStroke then uiStroke.Color = Color3.fromRGB(100, 180, 220) end
-
-		autoProgressContainer.Visible = false
-		autoTimerLabel.Visible = false
-	end
-end
-
----------------------------------------------------------------
--- ✨ SEND BUTTON CLICK
----------------------------------------------------------------
-sendButton.MouseButton1Down:Connect(function()
-	if AdminConfig.DisableShipping then return end
-	if isAutoMode or isShipOnCooldown or pendingAuras <= 0 then return end
-
-	if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_SendShip") then return end
-
-	ShipAurasBridge:Fire({ action = "manual" })
-	sharedCooldownEnd = tick() + currentCooldownTime
-	SyncManualCooldownVisuals()
-
-	if type(shared.TutorialRecordShipSent) == "function" then shared.TutorialRecordShipSent() end
-	if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
-end)
-
-modeToggle.MouseButton1Down:Connect(function()
-	if AdminConfig.DisableShipping then return end
-
-	if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_ToggleAutoShip") then return end
-
-	isAutoMode = not isAutoMode
-	ShipAurasBridge:Fire({ action = "setMode", value = isAutoMode and "auto" or "manual" })
-
-	UpdateModeToggleVisuals()
-	UpdateSendButton()
-
-	if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
-end)
-
-UpdateModeToggleVisuals()
-sendButton.Visible = false
-
-if AdminConfig.DisableShipping then
-	isAutoMode         = false
-	sendButton.Visible = false
-	modeToggle.Visible = false
-end
-
--- ─────────────────────────────────────────────────────────────────────────────
--- ✨ STRICT SERVER AUTHORITY LISTENER ✨
--- ─────────────────────────────────────────────────────────────────────────────
-UpdateHUDBridge:Connect(function(stats)
-
-	if stats.currency ~= nil then
-		displayedCurrency = stats.currency
-		player:SetAttribute("LiveCurrency", displayedCurrency)
-		UpdateWalletVisual()
-	end
-
-	if stats.goldenAuras ~= nil then
-		liveGoldenAuras = stats.goldenAuras
-		player:SetAttribute("LiveGoldenAuras", liveGoldenAuras)
-		UpdateAuraVisual()
-	end
-
-	if stats.pendingAuras ~= nil then
-		pendingAuras    = stats.pendingAuras
-		habitatCapacity = stats.habitatCapacity or habitatCapacity
-		UpdateHabitatBar(pendingAuras, habitatCapacity)
-
-		UpdateSendButton() 
-	end
-
-	if stats.rate ~= nil then
-		passiveInterval = stats.passiveInterval or passiveInterval
-		local serverRate = stats.rate
-		ratePerSecond = (passiveInterval > 0 and serverRate > 0) and serverRate / passiveInterval or 0
-
-		rate.Text = FormatRate(ratePerSecond)
-		TweenService:Create(rate, TweenInfo.new(0.3), { TextColor3 = GetRateColor(pendingAuras, habitatCapacity) }):Play()
-	end
-
-	if stats.shipCooldown ~= nil then
-		currentCooldownTime = stats.shipCooldown
-	end
-end)
-
--- ✨ FLASH GREEN WHEN SHIP PAYS OUT
-ShipAurasBridge:Connect(function(info)
-	if type(info) == "table" and info.action == "payoutConfirmed" then
-		local amt = info.amount or 0
-		if amt > 0 then
-			if type(shared.TutorialRecordEarned) == "function" then shared.TutorialRecordEarned(amt) end
-			curr.TextColor3 = Color3.fromRGB(80, 255, 80)
-			TweenService:Create(curr, TweenInfo.new(0.5), { TextColor3 = Color3.fromRGB(255, 255, 255) }):Play()
-		end
-	end
-end)
-
-local function RefreshLook()
-	UITheme.ApplyFlair(GoldenAurasLabel, "GoldStroke")
-end
-task.wait(2)
-RefreshLook()
