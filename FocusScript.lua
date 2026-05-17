@@ -510,15 +510,22 @@ local function HookAuraModel(model)
 			end)
 		end
 
-		local conveyer = model:FindFirstChild("ConveyerPath", true)
-		if conveyer then
-			local forwardBeam = conveyer:FindFirstChild("Foward") or conveyer:FindFirstChild("Forward")
-			local backwardBeam = conveyer:FindFirstChild("Backward")
-			if forwardBeam then forwardBeam.Enabled = not habitatFull end
-			if backwardBeam then backwardBeam.Enabled = habitatFull end
+		-- ✨ FIX: Loop through ALL ConveyerPaths instead of just finding the first one
+		for _, conveyer in ipairs(model:GetDescendants()) do
+			if conveyer.Name == "ConveyerPath" and conveyer:IsA("BasePart") then
+				local forwardBeam = conveyer:FindFirstChild("Foward") or conveyer:FindFirstChild("Forward")
+				local backwardBeam = conveyer:FindFirstChild("Backward")
 
-			if habitatFull then conveyer.AssemblyLinearVelocity = Vector3.new(30, 0, 0)
-			else conveyer.AssemblyLinearVelocity = Vector3.new(-3, 0, 0) end
+				if forwardBeam then forwardBeam.Enabled = not habitatFull end
+				if backwardBeam then backwardBeam.Enabled = habitatFull end
+
+				-- ✨ DYNAMIC VELOCITY: Uses the part's local X-axis instead of the world's X-axis
+				if habitatFull then 
+					conveyer.AssemblyLinearVelocity = conveyer.CFrame.RightVector * 10
+				else 
+					conveyer.AssemblyLinearVelocity = conveyer.CFrame.RightVector * -5 
+				end
+			end
 		end
 
 		local storageBelt = model:FindFirstChild("StorageBelt", true)
@@ -541,7 +548,6 @@ local function HookHabitatModel(model)
 						if data.instance == auraObj and not data.isStored then
 							data.isStored = true
 
-							-- ✨ THE FIX: We must disable the parent BillboardGui, not the TextLabel itself!
 							if data.rateLabel and data.rateLabel.Parent and data.rateLabel.Parent:IsA("BillboardGui") then 
 								data.rateLabel.Parent.Enabled = false 
 							end
@@ -628,25 +634,31 @@ HabitatFull.OnClientEvent:Connect(function()
 end)
 
 HabitatFullEvent.Event:Connect(function(isFull)
-	local auraModel = AuraHolder:FindFirstChildWhichIsA("Model")
-	local conveyer = auraModel and auraModel:FindFirstChild("ConveyerPath", true)
+	habitatFull = isFull
+	if not isFull then 
+		UpdateButtonVisual() 
+	end
 
-	if isFull then 
-		if conveyer then 
-			conveyer.AssemblyLinearVelocity = Vector3.new(10, 0, 0) 
-			local forwardBeam = conveyer:FindFirstChild("Foward") or conveyer:FindFirstChild("Forward")
-			local backwardBeam = conveyer:FindFirstChild("Backward")
-			if forwardBeam then forwardBeam.Enabled = false end
-			if backwardBeam then backwardBeam.Enabled = true end
-		end
-	else 
-		habitatFull = false; UpdateButtonVisual() 
-		if conveyer then 
-			conveyer.AssemblyLinearVelocity = Vector3.new(-5, 0, 0) 
-			local forwardBeam = conveyer:FindFirstChild("Foward") or conveyer:FindFirstChild("Forward")
-			local backwardBeam = conveyer:FindFirstChild("Backward")
-			if forwardBeam then forwardBeam.Enabled = true end
-			if backwardBeam then backwardBeam.Enabled = false end
+	-- ✨ FIX: Loop through ALL aura models, and ALL of their ConveyerPaths
+	for _, auraModel in ipairs(AuraHolder:GetChildren()) do
+		if auraModel:IsA("Model") then
+			for _, conveyer in ipairs(auraModel:GetDescendants()) do
+				if conveyer.Name == "ConveyerPath" and conveyer:IsA("BasePart") then
+					local forwardBeam = conveyer:FindFirstChild("Foward") or conveyer:FindFirstChild("Forward")
+					local backwardBeam = conveyer:FindFirstChild("Backward")
+
+					-- ✨ DYNAMIC VELOCITY: Uses the part's local X-axis instead of the world's X-axis
+					if isFull then 
+						conveyer.AssemblyLinearVelocity = conveyer.CFrame.RightVector * 10 
+						if forwardBeam then forwardBeam.Enabled = false end
+						if backwardBeam then backwardBeam.Enabled = true end
+					else 
+						conveyer.AssemblyLinearVelocity = conveyer.CFrame.RightVector * -5 
+						if forwardBeam then forwardBeam.Enabled = true end
+						if backwardBeam then backwardBeam.Enabled = false end
+					end
+				end
+			end
 		end
 	end
 end)
@@ -844,7 +856,6 @@ CubeMutatedBatchBridge:Connect(function(batchData)
 			ScaleAura(newAura, info.tierName, true, oldTierName)
 			ApplyHeavyPhysics(newAura)
 
-			-- ✨ THE FIX: We must safely re-parent the BillboardGui, NOT the TextLabel!
 			if cubeData.rateLabel and cubeData.rateLabel.Parent and cubeData.rateLabel.Parent:IsA("BillboardGui") then
 				local bb = cubeData.rateLabel.Parent
 				bb.Adornee = GetRootPart(newAura)
