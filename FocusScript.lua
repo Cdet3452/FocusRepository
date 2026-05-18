@@ -1,920 +1,421 @@
--- ClickHandler
--- Location: StarterPlayer > StarterPlayerScripts > ClickHandler
+-- AchievementController
+-- Location: StarterPlayer > StarterPlayerScripts > AchievementController
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TweenService = game:GetService("TweenService")
-local UserInputService = game:GetService("UserInputService")
-local Debris = game:GetService("Debris")
 local CollectionService = game:GetService("CollectionService")
 
-local AdminConfig = require(ReplicatedStorage.Modules.AdminConfig)
-local UITheme = require(ReplicatedStorage.Modules.UITheme)
-local AreaRegistry = require(ReplicatedStorage.Modules.AreaRegistry) 
-local NumberFormatter = require(ReplicatedStorage.Modules.NumberFormatter)
+local UITheme = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("UITheme"))
+local T = UITheme.Get("Custom")
+local SoundConfig = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("SoundConfig"))
+local AchievementConfig = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("AchievementConfig"))
+local TierConfig = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("TierConfig"))
+local Formatter = require(ReplicatedStorage.Modules.NumberFormatter)
+local BridgeNet2 = require(ReplicatedStorage.Modules:WaitForChild("BridgeNet2"))
+local UpdateHUDBridge = BridgeNet2.ClientBridge("UpdateHUD")
 
-local PoolManager = require(ReplicatedStorage.Modules:WaitForChild("PoolManager"))
+local RemoteEvents = ReplicatedStorage:WaitForChild("RemoteEvents")
+local ClaimChallenge = RemoteEvents:WaitForChild("ClaimChallenge")
+local ClaimAuraIndex = RemoteEvents:WaitForChild("ClaimAuraIndex")
+local ClaimBadge = RemoteEvents:WaitForChild("ClaimBadge")
+local AuraDiscovered = RemoteEvents:WaitForChild("AuraDiscovered", 5)
 
-local BridgeNet2             = require(ReplicatedStorage.Modules:WaitForChild("BridgeNet2"))
-local UpdateHUDBridge        = BridgeNet2.ClientBridge("UpdateHUD")
-local ProduceAuraBridge      = BridgeNet2.ClientBridge("ProduceAura")
-local AuraSpawnedBridge      = BridgeNet2.ClientBridge("AuraSpawned")
-local UpdateHatcheryBridge   = BridgeNet2.ClientBridge("UpdateHatchery")
-local CubeMutatedBatchBridge = BridgeNet2.ClientBridge("CubeMutatedBatch")
-local CubeSmushedBridge      = BridgeNet2.ClientBridge("CubeSmushed")
-local CubeStoredBridge       = BridgeNet2.ClientBridge("CubeStored") 
-
-local ForceStopHold = ReplicatedStorage.RemoteEvents:WaitForChild("ForceStopHold")
-local HabitatFull = ReplicatedStorage.RemoteEvents:WaitForChild("HabitatFull")
-local UpdateMultiplier = ReplicatedStorage:WaitForChild("UpdateMultiplier")
-local HabitatFullEvent = ReplicatedStorage:WaitForChild("HabitatFullEvent")
+local SettingsChanged = ReplicatedStorage:FindFirstChild("SettingsChanged") or Instance.new("BindableEvent")
+SettingsChanged.Name = "SettingsChanged"; SettingsChanged.Parent = ReplicatedStorage
 
 local player = Players.LocalPlayer
-local playerGui = player:WaitForChild("PlayerGui")
-local holding = false
+local mainHUD = player:WaitForChild("PlayerGui"):WaitForChild("MainHUD")
+local Faded2 = mainHUD:WaitForChild("Faded2") 
 
--- ✨ Dynamic Sync State
-local currentFireRate = AdminConfig.FireRate 
-local globalBoostMultiplier = 1
-local currentPassiveInterval = AdminConfig.PassiveInterval
+local panelOpen, activeTab, activeTabText = false, "Challenges", "Boosts"
+local latestStats = {}
+local sfxEnabled, musicEnabled, jumpEnabled = true, true, true 
+local liveSoulAuras, liveRunEarnings, liveRate, livePrestiges = 0, 0, 0, 0
+local toggleRefs, statValueRefs = {}, {}
 
-local holdStart = nil
-local hatcheryEmpty = false
-local habitatFull = false
+local function PlayUI(id) if shared.PlayUISound then shared.PlayUISound(id) end end
 
-local ClickButton = playerGui:WaitForChild("MainHUD"):WaitForChild("ClickButton")
-local HatcheryBar = playerGui:WaitForChild("MainHUD"):WaitForChild("HatcheryBar")
-local HatcheryFill = HatcheryBar:WaitForChild("Fill")
-local HatcheryLabel = HatcheryBar:WaitForChild("Label")
+local AreaAuraNames = { [1] = {"Gear", "Screw", "Tin Can", "Old Tire", "Intact Radio"}, [2] = {"Rusted Nail", "Scrap Pipe", "Bent Gear", "Engine Scrap", "Corroded Core"} }
+for i=3,20 do AreaAuraNames[i] = {"Common", "Uncommon", "Rare", "Epic", "Legendary"} end
 
-local ModeToggle = playerGui:WaitForChild("MainHUD"):WaitForChild("ModeToggle")
-local SendButton = playerGui:WaitForChild("MainHUD"):WaitForChild("SendButton")
-
-CollectionService:AddTag(ClickButton, "Tutorial_ClickButton")
-CollectionService:AddTag(ModeToggle, "Tutorial_ToggleShipBtn")
-CollectionService:AddTag(SendButton, "Tutorial_SendShipBtn")
-
-local clickScale = ClickButton:FindFirstChildOfClass("UIScale") or Instance.new("UIScale", ClickButton)
-
-local ringFrame = ClickButton:FindFirstChild("ActionRing")
-if not ringFrame then
-	ringFrame = Instance.new("Frame")
-	ringFrame.Name = "ActionRing"
-	ringFrame.Size = UDim2.new(1, 0, 1, 0)
-	ringFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
-	ringFrame.AnchorPoint = Vector2.new(0.5, 0.5)
-	ringFrame.BackgroundTransparency = 1
-	ringFrame.ZIndex = ClickButton.ZIndex - 1
-
-	local btnCorner = ClickButton:FindFirstChildOfClass("UICorner")
-	if btnCorner then btnCorner:Clone().Parent = ringFrame end
-	ringFrame.Parent = ClickButton
-end
-
-local clickStroke = ringFrame:FindFirstChildOfClass("UIStroke") or Instance.new("UIStroke", ringFrame)
-clickStroke.Color = Color3.fromRGB(255, 215, 0)
-clickStroke.Thickness = 0
-clickStroke.Transparency = 1
-
-local basePos = ClickButton.Position
-local tiltSide = 1
-
-local Camera = workspace.CurrentCamera
-local defaultFOV = 70 
-local lastMilestone = 1
-
-local MilestoneData = AdminConfig.MilestoneData
-
-local playerMultSpeed = 1.0 
-local playerMaxTier = 5     
-local lastTierIndex = 1
-
-local latestPendingAuras = 0
-local latestHabitatCapacity = 50
-
-local function FormatNumber(n)
-	return NumberFormatter.Format(n)
-end	
-
----------------------------------------------------------------
--- AURA MODEL FOLDERS & INSTANTIATION
----------------------------------------------------------------
-local VFXFolder = ReplicatedStorage:FindFirstChild("VFX")
-local cubeDataMap = {}
-
-local TierScale = {
-	Common    = 1.0,
-	Uncommon  = 1.15,
-	Rare      = 1.3,
-	Epic      = 1.5,
-	Legendary = 1.75,
-}
-
-local function GetRootPart(instance)
-	if instance:IsA("Model") then return instance.PrimaryPart or instance:FindFirstChildWhichIsA("BasePart") end
-	return instance
-end
-
-local function ApplyHeavyPhysics(instance)
-	local heavyProps = PhysicalProperties.new(100, 0.3, 0, 1, 100) 
-	if instance:IsA("BasePart") then instance.CustomPhysicalProperties = heavyProps
-	elseif instance:IsA("Model") then
-		for _, part in ipairs(instance:GetDescendants()) do
-			if part:IsA("BasePart") then part.CustomPhysicalProperties = heavyProps end
-		end
+local function PlayClaimVFX(rowFrame)
+	PlayUI(SoundConfig.MaxOut or "rbxassetid://4612385808")
+	local flash = Instance.new("Frame", rowFrame); flash.Size = UDim2.new(1,0,1,0); flash.BackgroundColor3 = Color3.fromRGB(255, 255, 255); flash.ZIndex = 50; flash.BorderSizePixel = 0
+	Instance.new("UICorner", flash).CornerRadius = UDim.new(0, 8)
+	TweenService:Create(flash, TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {BackgroundTransparency = 1}):Play()
+	task.delay(0.4, function() flash:Destroy() end)
+	for i = 1, 8 do
+		local particle = Instance.new("Frame", rowFrame); particle.Size = UDim2.new(0, 10, 0, 10); particle.BackgroundColor3 = T.accentGold; particle.AnchorPoint = Vector2.new(0.5, 0.5); particle.Position = UDim2.new(0.5, 0, 0.5, 0); particle.ZIndex = 51; Instance.new("UICorner", particle).CornerRadius = UDim.new(1, 0)
+		local angle = math.rad(math.random(0, 360)); local dist = math.random(30, 80); local endPos = UDim2.new(0.5, math.cos(angle)*dist, 0.5, math.sin(angle)*dist)
+		TweenService:Create(particle, TweenInfo.new(0.5, Enum.EasingStyle.Cubic, Enum.EasingDirection.Out), {Position = endPos, Size = UDim2.new(0,0,0,0), BackgroundTransparency = 1}):Play()
+		task.delay(0.5, function() particle:Destroy() end)
 	end
 end
 
-local function SpawnAuraInstance(tierName, color, glow, position, currentArea)
-	currentArea = currentArea or 1
-	local auraModel = PoolManager.GetAura(currentArea, tierName)
+local AchieveBtn = Instance.new("ImageButton", Faded2); AchieveBtn.Name = "AchievementButton"; AchieveBtn.Size = UDim2.new(0.85, 0, 0.85, 0); AchieveBtn.BackgroundColor3 = T.buttonSecondary; AchieveBtn.BorderSizePixel = 0; AchieveBtn.LayoutOrder = 1; Instance.new("UICorner", AchieveBtn).CornerRadius = UDim.new(0.5, 0); Instance.new("UIAspectRatioConstraint", AchieveBtn).AspectRatio = 1.0; local btnStroke = Instance.new("UIStroke", AchieveBtn); btnStroke.Color = T.accentGold; btnStroke.Thickness = 1; local btnIcon = Instance.new("ImageLabel", AchieveBtn); btnIcon.Size = UDim2.new(0.7, 0, 0.7, 0); btnIcon.Position = UDim2.new(0.15, 0, 0.15, 0); btnIcon.BackgroundTransparency = 1; btnIcon.ScaleType = Enum.ScaleType.Fit; btnIcon.Image = "rbxassetid://14923131909"
+CollectionService:AddTag(AchieveBtn, "Tutorial_AchieveMenuBtn")
 
-	if auraModel:IsA("Model") then
-		auraModel:PivotTo(CFrame.new(position))
-		if auraModel.PrimaryPart then
-			auraModel.PrimaryPart.Anchored = false
-			auraModel.PrimaryPart.CanCollide = true
-			auraModel.PrimaryPart.CollisionGroup = "Auras"
-		end
-	elseif auraModel:IsA("BasePart") then
-		auraModel.Position = position
-		auraModel.Anchored = false
-		auraModel.CanCollide = true
-		auraModel.CollisionGroup = "Auras"
-		auraModel.Color = color
-		if glow then
-			local light = auraModel:FindFirstChildOfClass("PointLight")
-			if not light then light = Instance.new("PointLight"); light.Parent = auraModel end
-			light.Brightness = 3; light.Range = 8; light.Color = color
-		end
+local Panel = Instance.new("Frame", mainHUD); Panel.Name = "AchievementPanel"; Panel.Size = UDim2.new(0.85, 0, 0.75, 0); Panel.Position = UDim2.new(0.5, 0, 0.5, 0); Panel.AnchorPoint = Vector2.new(0.5, 0.5); Panel.BackgroundColor3 = T.panelBG; Panel.BorderSizePixel = 0; Panel.Visible = false; Panel.ZIndex = 40; Panel.ClipsDescendants = true; Instance.new("UICorner", Panel).CornerRadius = UDim.new(0, 12); Instance.new("UISizeConstraint", Panel).MaxSize = Vector2.new(500, 550); local panelStroke = Instance.new("UIStroke", Panel); panelStroke.Color = T.panelStroke; panelStroke.Thickness = 2
+CollectionService:AddTag(Panel, "Tutorial_AchievePanel")
+
+local Header = Instance.new("Frame", Panel); Header.Size = UDim2.new(1, 0, 0, 44); Header.BackgroundColor3 = T.headerBG; Header.BorderSizePixel = 0; Header.ZIndex = 41
+local TitleLabel = Instance.new("TextLabel", Header); TitleLabel.Size = UDim2.new(1, -50, 1, 0); TitleLabel.Position = UDim2.new(0, 14, 0, 0); TitleLabel.BackgroundTransparency = 1; TitleLabel.Text = "MENU"; TitleLabel.TextColor3 = T.headerText; TitleLabel.TextScaled = true; TitleLabel.Font = T.font; TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+local CloseBtn = Instance.new("TextButton", Header); CloseBtn.Size = UDim2.new(0, 28, 0, 28); CloseBtn.Position = UDim2.new(1, -36, 0.5, -14); CloseBtn.BackgroundColor3 = T.buttonRed; CloseBtn.Text = "X"; CloseBtn.TextColor3 = T.headerText; CloseBtn.TextScaled = true; CloseBtn.Font = T.font; Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 5); CloseBtn.ZIndex = 9999
+CollectionService:AddTag(CloseBtn, "Tutorial_AchieveCloseBtn")
+
+local TabContainer = Instance.new("Frame", Panel); TabContainer.Size = UDim2.new(1, 0, 0, 75); TabContainer.Position = UDim2.new(0, 0, 0, 44); TabContainer.BackgroundTransparency = 1; TabContainer.ZIndex = 41
+local HoverLabel = Instance.new("TextLabel", TabContainer); HoverLabel.Size = UDim2.new(1, 0, 0, 20); HoverLabel.Position = UDim2.new(0, 0, 1, -15); HoverLabel.BackgroundTransparency = 1; HoverLabel.Text = "Boosts"; HoverLabel.TextColor3 = T.bodyText; HoverLabel.TextScaled = true; HoverLabel.Font = T.font
+local TabButtonFrame = Instance.new("Frame", TabContainer); TabButtonFrame.Size = UDim2.new(1, 0, 1, -20); TabButtonFrame.BackgroundTransparency = 1; local TabListLayout = Instance.new("UIListLayout", TabButtonFrame); TabListLayout.FillDirection = Enum.FillDirection.Horizontal; TabListLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center; TabListLayout.VerticalAlignment = Enum.VerticalAlignment.Center; TabListLayout.Padding = UDim.new(0, 12)
+
+local tabBtns, scrolls = {}, {}
+local function MakeTab(name, hoverText, iconId)
+	local btn = Instance.new("ImageButton", TabButtonFrame); btn.Size = UDim2.new(0, 45, 0, 45); btn.BackgroundColor3 = T.buttonSecondary; btn.AutoButtonColor = false; Instance.new("UICorner", btn).CornerRadius = UDim.new(0.5, 0); local tStroke = Instance.new("UIStroke", btn); tStroke.Color = T.panelStroke; tStroke.Thickness = 2; local icon = Instance.new("ImageLabel", btn); icon.Size = UDim2.new(0.6, 0, 0.6, 0); icon.Position = UDim2.new(0.2, 0, 0.2, 0); icon.BackgroundTransparency = 1; icon.ScaleType = Enum.ScaleType.Fit; icon.Image = iconId; tabBtns[name] = {btn = btn, stroke = tStroke}; CollectionService:AddTag(btn, "Tutorial_AchieveTab_" .. name)
+
+	if name ~= "Leaderboard" then
+		local sf = Instance.new("ScrollingFrame", Panel); sf.Size = UDim2.new(1, -20, 1, -135); sf.Position = UDim2.new(0, 10, 0, 125); sf.BackgroundTransparency = 1; sf.BorderSizePixel = 0; sf.ScrollBarThickness = 4; sf.Visible = false; local layout = Instance.new("UIListLayout", sf); layout.Padding = UDim.new(0, 8); layout.HorizontalAlignment = Enum.HorizontalAlignment.Center; layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function() sf.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + 10) end); scrolls[name] = sf
 	end
 
-	for _, desc in ipairs(auraModel:GetDescendants()) do
-		if desc:IsA("ParticleEmitter") or desc:IsA("Trail") then
-			desc.Enabled = true
-		end
-	end
-
-	auraModel.Parent = workspace
-	ApplyHeavyPhysics(auraModel)
-	return auraModel, true
-end
-
-local function ScaleAura(instance, tierName, animated, fromTierName)
-	local targetScale = TierScale[tierName] or 1.0
-	local fromScale = fromTierName and (TierScale[fromTierName] or 1.0) or nil
-
-	if instance:IsA("Model") then
-		if animated then
-			local scaleProxy = Instance.new("NumberValue")
-			scaleProxy.Value = fromScale or 1.0
-			local scaleTween = TweenService:Create(scaleProxy, TweenInfo.new(0.6, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Value = targetScale })
-			local conn
-			conn = scaleProxy.Changed:Connect(function(val)
-				if instance and instance.Parent then pcall(function() instance:ScaleTo(val) end) else conn:Disconnect() end
-			end)
-			scaleTween:Play()
-			scaleTween.Completed:Connect(function() scaleProxy:Destroy(); if conn then conn:Disconnect() end end)
-		else
-			pcall(function() instance:ScaleTo(targetScale) end)
-		end
-	elseif instance:IsA("BasePart") then
-		local baseSize = 1.5
-		local targetSize = Vector3.new(1, 1, 1) * (baseSize * targetScale)
-		if animated then
-			if fromScale then instance.Size = Vector3.new(1, 1, 1) * (baseSize * fromScale) end
-			TweenService:Create(instance, TweenInfo.new(0.6, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Size = targetSize }):Play()
-		else
-			instance.Size = targetSize
-		end
-	end
-end
-
----------------------------------------------------------------
--- VFX SYSTEM
----------------------------------------------------------------
-local function PlayVFX(effectName, position, duration)
-	if not VFXFolder then return end
-	local template = VFXFolder:FindFirstChild(effectName)
-	if not template then return end
-	local vfx = template:Clone()
-
-	if vfx:IsA("Model") then vfx:PivotTo(CFrame.new(position))
-	elseif vfx:IsA("BasePart") then vfx.Position = position end
-
-	for _, obj in ipairs(vfx:GetDescendants()) do
-		if obj:IsA("BasePart") then
-			obj.Anchored = true; obj.Transparency = 1; obj.CanCollide = false; obj.CastShadow = false
-		end
-	end
-	if vfx:IsA("BasePart") then
-		vfx.Anchored = true; vfx.Transparency = 1; vfx.CanCollide = false; vfx.CastShadow = false
-	end
-	vfx.Parent = workspace
-
-	for _, emitter in ipairs(vfx:GetDescendants()) do
-		if emitter:IsA("ParticleEmitter") then
-			emitter.Enabled = true; emitter:Emit(emitter:GetAttribute("BurstCount") or 15)
-		end
-	end
-	task.delay((duration or 1.0) * 0.5, function()
-		if vfx and vfx.Parent then
-			for _, emitter in ipairs(vfx:GetDescendants()) do
-				if emitter:IsA("ParticleEmitter") then emitter.Enabled = false end
-			end
-		end
-	end)
-	Debris:AddItem(vfx, duration or 1.5)
-end
-
----------------------------------------------------------------
--- GAMEPLAY VISUAL LOGIC
----------------------------------------------------------------
-local function GetCurrentMultiplier()
-	if not holding or not holdStart then return 1.0, 1 end
-	local holdTime = tick() - holdStart
-	local effectiveTime = holdTime * playerMultSpeed 
-
-	local currentTier = 1; local nextTier = 1
-	for i = 1, playerMaxTier do
-		if effectiveTime >= MilestoneData[i].time then
-			currentTier = i; nextTier = math.min(i + 1, playerMaxTier)
-		end
-	end
-
-	if currentTier == playerMaxTier then return MilestoneData[currentTier].mult, currentTier end
-
-	local timePassedInTier = effectiveTime - MilestoneData[currentTier].time
-	local timeNeededForNext = MilestoneData[nextTier].time - MilestoneData[currentTier].time
-	local progressRatio = timePassedInTier / timeNeededForNext
-
-	local currentMult = MilestoneData[currentTier].mult
-	local nextMult = MilestoneData[nextTier].mult
-	local smoothMult = currentMult + ((nextMult - currentMult) * progressRatio)
-
-	return smoothMult, currentTier
-end
-
-local function PlayMilestoneSound(soundValue)
-	if not soundValue or soundValue == "" then return end
-	local sfxToPlay = nil
-	if string.find(soundValue, "rbxassetid://") then
-		sfxToPlay = Instance.new("Sound"); sfxToPlay.SoundId = soundValue; sfxToPlay.Volume = 0.6
-	else
-		local sfxFolder = ReplicatedStorage:FindFirstChild("SFX") or ReplicatedStorage:FindFirstChild("Sounds")
-		if sfxFolder then
-			local foundSound = sfxFolder:FindFirstChild(soundValue)
-			if foundSound then sfxToPlay = foundSound:Clone(); sfxToPlay.Volume = 0.6 end
-		end
-	end
-	if sfxToPlay then
-		sfxToPlay.Parent = game:GetService("SoundService"); sfxToPlay:Play()
-		Debris:AddItem(sfxToPlay, sfxToPlay.TimeLength > 0 and sfxToPlay.TimeLength or 3)
-	end
-end
-
-local function SpawnMilestonePopup(multFloor)
-	local data = MilestoneData[multFloor]
-	if not data then return end 
-
-	PlayMilestoneSound(data.sound)
-
-	local pop = Instance.new("TextLabel")
-	pop.Text = data.name .. " (" .. string.format("%.1f", data.mult) .. "x)"
-	pop.Font = Enum.Font.FredokaOne; pop.TextScaled = true; pop.TextColor3 = data.color
-	pop.BackgroundTransparency = 1; pop.AnchorPoint = Vector2.new(0.5, 0.5)
-
-	pop.Position = UDim2.new(
-		ClickButton.Position.X.Scale, ClickButton.Position.X.Offset, 
-		ClickButton.Position.Y.Scale - 0.15, ClickButton.Position.Y.Offset
-	)
-	pop.Parent = ClickButton.Parent
-
-	local stroke = Instance.new("UIStroke", pop); stroke.Thickness = 3; stroke.Color = Color3.fromRGB(0, 0, 0)
-	pop.Size = UDim2.new(0.1, 0, 0.02, 0) 
-
-	TweenService:Create(pop, TweenInfo.new(0.4, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
-		Size = UDim2.new(0.35, 0, 0.08, 0),
-		Position = UDim2.new(pop.Position.X.Scale, pop.Position.X.Offset, ClickButton.Position.Y.Scale - 0.25, ClickButton.Position.Y.Offset)
-	}):Play()
-
-	task.delay(0.6, function()
-		TweenService:Create(pop, TweenInfo.new(0.3), {TextTransparency = 1}):Play()
-		TweenService:Create(stroke, TweenInfo.new(0.3), {Transparency = 1}):Play()
-		task.delay(0.3, function() pop:Destroy() end)
-	end)
-end
-
-local function UpdateButtonVisual()
-	local col; local mult = 1; local currentTierIndex = 1
-	if habitatFull then col = Color3.fromRGB(180, 60, 60)
-	elseif not holding then col = Color3.fromRGB(255, 0, 0)
-	else
-		mult, currentTierIndex = GetCurrentMultiplier()
-		col = MilestoneData[currentTierIndex].color
-		UpdateMultiplier:Fire(mult)
-	end
-
-	local targetFOV = defaultFOV + (mult * 1.2)
-	if not holding then targetFOV = defaultFOV end
-	TweenService:Create(Camera, TweenInfo.new(0.3, Enum.EasingStyle.Sine), {FieldOfView = targetFOV}):Play()
-
-	if holding then
-		if currentTierIndex > lastTierIndex then
-			if currentTierIndex > 1 then SpawnMilestonePopup(currentTierIndex) end
-			lastTierIndex = currentTierIndex
-		end
-	else lastTierIndex = 1 end
-
-	TweenService:Create(ClickButton, TweenInfo.new(0.2), { BackgroundColor3 = col }):Play()
-
-	if holding and not habitatFull then
-		tiltSide = tiltSide * -1 
-		if mult >= 5.0 then 
-			TweenService:Create(ClickButton, TweenInfo.new(0.05, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, 0, true), { Rotation = 8 * tiltSide }):Play()
-			clickStroke.Thickness = 12; clickStroke.Transparency = 0
-			TweenService:Create(clickStroke, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Thickness = 0, Transparency = 1}):Play()
-		else
-			TweenService:Create(ClickButton, TweenInfo.new(0.08, Enum.EasingStyle.Sine, Enum.EasingDirection.Out, 0, true), { Rotation = 3 * tiltSide }):Play()
-		end
-	elseif not holding then
-		TweenService:Create(ClickButton, TweenInfo.new(0.15, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Rotation = 0}):Play()
-		TweenService:Create(clickScale, TweenInfo.new(0.15), {Scale = 1}):Play()
-	end
-end
-
-local function UpdateHatcheryBar(current, max)
-	local ratio = math.clamp(current / max, 0, 1)
-	TweenService:Create(HatcheryFill, TweenInfo.new(0.1), { Size = UDim2.new(ratio, 0, 1, 0) }):Play()
-
-	local color = Color3.fromRGB(255, 60, 60)
-	if ratio > 0.5 then color = Color3.fromRGB(80, 220, 80)
-	elseif ratio > 0.25 then color = Color3.fromRGB(255, 200, 0) end
-
-	TweenService:Create(HatcheryFill, TweenInfo.new(0.1), { BackgroundColor3 = color }):Play()
-	HatcheryLabel.Text = "Hatchery: " .. math.floor(current) .. " / " .. max
-	hatcheryEmpty = (current <= 0)
-end
-
-local function FlashEmpty()
-	TweenService:Create(HatcheryFill, TweenInfo.new(0.1), { BackgroundColor3 = Color3.fromRGB(255, 255, 255) }):Play()
-	task.delay(0.1, function() TweenService:Create(HatcheryFill, TweenInfo.new(0.1), { BackgroundColor3 = Color3.fromRGB(255, 60, 60) }):Play() end)
-end
-
-local function ShowTierPopup(position, tierName, tierColor)
-	local anchor = Instance.new("Part"); anchor.Size = Vector3.new(0.1, 0.1, 0.1); anchor.Anchored = true; anchor.Transparency = 1; anchor.CanCollide = false
-	anchor.Position = position + Vector3.new(0, 3, 0); anchor.Parent = workspace
-
-	local bb = Instance.new("BillboardGui"); bb.Size = UDim2.new(0, 120, 0, 40); bb.StudsOffset = Vector3.new(0, 2, 0)
-	bb.AlwaysOnTop = false; bb.Adornee = anchor; bb.Parent = anchor
-
-	local label = Instance.new("TextLabel"); label.Size = UDim2.new(1, 0, 1, 0); label.BackgroundTransparency = 1
-	label.Text = tierName:upper(); label.TextColor3 = tierColor; label.TextScaled = true
-	label.Font = Enum.Font.GothamBold; label.TextStrokeTransparency = 0.3; label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0); label.Parent = bb
-
-	TweenService:Create(bb, TweenInfo.new(1.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { StudsOffset = Vector3.new(0, 6, 0) }):Play()
-	TweenService:Create(label, TweenInfo.new(1.5, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { TextTransparency = 1, TextStrokeTransparency = 1 }):Play()
-	Debris:AddItem(anchor, 2)
-end
-
-local function ShowCubeValue(position, value, color)
-	local anchor = Instance.new("Part"); anchor.Size = Vector3.new(0.1, 0.1, 0.1); anchor.Anchored = true; anchor.Transparency = 1; anchor.CanCollide = false
-	anchor.Position = position + Vector3.new(math.random(-1, 1), 2, math.random(-1, 1)); anchor.Parent = workspace
-
-	local bb = Instance.new("BillboardGui"); bb.Size = UDim2.new(0, 80, 0, 25); bb.StudsOffset = Vector3.new(0, 0, 0)
-	bb.AlwaysOnTop = false; bb.Adornee = anchor; bb.Parent = anchor
-
-	local label = Instance.new("TextLabel"); label.Size = UDim2.new(1, 0, 1, 0); label.BackgroundTransparency = 1
-	label.Text = "Value: $" .. FormatNumber(value); label.TextColor3 = Color3.fromRGB(255, 255, 255); label.TextScaled = true
-	label.Font = Enum.Font.Gotham; label.TextStrokeTransparency = 0.4; label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0); label.Parent = bb
-
-	TweenService:Create(bb, TweenInfo.new(1.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { StudsOffset = Vector3.new(0, 4, 0) }):Play()
-	TweenService:Create(label, TweenInfo.new(1.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { TextTransparency = 1, TextStrokeTransparency = 1 }):Play()
-	Debris:AddItem(anchor, 1.5)
-end
-
-local function AttachPermanentRateLabel(auraInstance, baseValue, auraColor)
-	local rootPart = GetRootPart(auraInstance)
-	if not rootPart then return end
-
-	local bb = Instance.new("BillboardGui"); bb.Name = "PermanentRateLabel"; bb.Size = UDim2.new(0, 90, 0, 25); bb.StudsOffset = Vector3.new(0, 0.5, 0); bb.AlwaysOnTop = false; bb.Adornee = rootPart
-
-	local label = Instance.new("TextLabel"); label.Size = UDim2.new(1, 0, 1, 0); label.BackgroundTransparency = 1
-	local ratePerSec = baseValue / currentPassiveInterval
-	label.Text = "+$" .. FormatNumber(ratePerSec) .. "/sec"
-
-	label.TextColor3 = auraColor or Color3.fromRGB(100, 255, 100); label.Font = Enum.Font.GothamBold; label.TextScaled = true
-	label.TextTransparency = 0.2; label.TextStrokeTransparency = 0.6; label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0); label.Parent = bb
-
-	bb.Parent = rootPart
-	return label -- We return the TextLabel
-end
-
----------------------------------------------------------------
--- ✨ DYNAMIC LABEL REFRESH
----------------------------------------------------------------
-local function RefreshAllRateLabels()
-	for id, data in pairs(cubeDataMap) do
-		if data.rateLabel and data.baseValue and not data.isStored then
-			local ratePerSec = (data.baseValue * globalBoostMultiplier) / currentPassiveInterval
-			data.rateLabel.Text = "+$" .. FormatNumber(ratePerSec) .. "/sec"
-
-			if data.rateLabel.Parent then
-				local scale = data.rateLabel.Parent:FindFirstChildOfClass("UIScale") or Instance.new("UIScale", data.rateLabel.Parent)
-				TweenService:Create(scale, TweenInfo.new(0.2, Enum.EasingStyle.Bounce), {Scale = 1.2}):Play()
-				task.delay(0.2, function() TweenService:Create(scale, TweenInfo.new(0.2), {Scale = 1}):Play() end)
-			end
-		end
-	end
-end
-
----------------------------------------------------------------
--- DYNAMIC TRIGGER HOOKS
----------------------------------------------------------------
-local AuraHolder = workspace:WaitForChild("AuraHolder")
-local HabitatHolder = workspace:WaitForChild("HabitatHolder")
-
-local function UpdateHabitatBar(actualPending, max)
-	local offset = player:GetAttribute("HabitatVisualOffset") or 0
-	local current = actualPending + offset
-
-	local habitatModel = HabitatHolder:FindFirstChildWhichIsA("Model")
-	if not habitatModel then return end
-
-	local habitatGui = habitatModel:FindFirstChild("HabitatGui", true)
-	if not habitatGui then return end
-
-	local bg = habitatGui:FindFirstChild("BarBackground")
-	if not bg then return end
-
-	local fill = bg:FindFirstChild("BarFill")
-	local textLabel = bg:FindFirstChild("CountLabel") or bg:FindFirstChild("AmountLabel")
-
-	if fill and max > 0 then
-		local ratio = math.clamp(current / max, 0, 1)
-
-		TweenService:Create(fill, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-			Size = UDim2.new(ratio, 0, 1, 0)
-		}):Play()
-
-		local targetColor = Color3.fromRGB(80, 220, 80)
-		if ratio >= 1 then targetColor = Color3.fromRGB(255, 60, 60)
-		elseif ratio >= 0.8 then targetColor = Color3.fromRGB(255, 200, 0) end
-
-		TweenService:Create(fill, TweenInfo.new(0.2), {BackgroundColor3 = targetColor}):Play()
-
-		if textLabel then
-			if current >= max then
-				textLabel.Text = "FULL!"
-				textLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
-			else
-				textLabel.Text = math.floor(current) .. " / " .. max
-				textLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-			end
-		end
-	end
-end
-
-player:GetAttributeChangedSignal("HabitatVisualOffset"):Connect(function()
-	UpdateHabitatBar(latestPendingAuras, latestHabitatCapacity)
-end)
-
-local function GetAuraCubeFromHit(hit)
-	if hit:GetAttribute("AuraCube") then return hit end
-	local p = hit.Parent; if p and p:GetAttribute("AuraCube") then return p end
-	local m = hit:FindFirstAncestorWhichIsA("Model"); if m and m:GetAttribute("AuraCube") then return m end
-	return nil
-end
-
-local function HookAuraModel(model)
-	task.delay(0.1, function()
-		local smush = model:FindFirstChild("SmushTrigger", true)
-		if smush then
-			smush.Touched:Connect(function(hit)
-				local auraObj = GetAuraCubeFromHit(hit)
-				if auraObj then
-					for id, data in pairs(cubeDataMap) do
-						if data.instance == auraObj then
-							if data.isStored then return end
-							CubeSmushedBridge:Fire(id)
-							local root = GetRootPart(auraObj)
-							local pos = (root and root.Position) or hit.Position
-							PlayVFX("Spawn", pos, 0.5) 
-
-							PoolManager.ReturnAura(data.instance) 
-							cubeDataMap[id] = nil
-							break
-						end
-					end
-				end
-			end)
-		end
-
-		-- ✨ FIX: Loop through ALL ConveyerPaths instead of just finding the first one
-		for _, conveyer in ipairs(model:GetDescendants()) do
-			if conveyer.Name == "ConveyerPath" and conveyer:IsA("BasePart") then
-				local forwardBeam = conveyer:FindFirstChild("Foward") or conveyer:FindFirstChild("Forward")
-				local backwardBeam = conveyer:FindFirstChild("Backward")
-
-				if forwardBeam then forwardBeam.Enabled = not habitatFull end
-				if backwardBeam then backwardBeam.Enabled = habitatFull end
-
-				-- ✨ DYNAMIC VELOCITY: Uses the part's local X-axis instead of the world's X-axis
-				if habitatFull then 
-					conveyer.AssemblyLinearVelocity = conveyer.CFrame.RightVector * 10
-				else 
-					conveyer.AssemblyLinearVelocity = conveyer.CFrame.RightVector * -5 
-				end
-			end
-		end
-
-		local storageBelt = model:FindFirstChild("StorageBelt", true)
-		if not storageBelt then
-			local habModel = HabitatHolder:FindFirstChildWhichIsA("Model")
-			if habModel then storageBelt = habModel:FindFirstChild("StorageBelt", true) end
-		end
-		if storageBelt then storageBelt.AssemblyLinearVelocity = Vector3.new(-5, 0, 0) end
-	end)
-end
-
-local function HookHabitatModel(model)
-	task.delay(0.1, function()
-		local storage = model:FindFirstChild("StorageTrigger", true)
-		if storage then
-			storage.Touched:Connect(function(hit)
-				local auraObj = GetAuraCubeFromHit(hit)
-				if auraObj then
-					for id, data in pairs(cubeDataMap) do
-						if data.instance == auraObj and not data.isStored then
-							data.isStored = true
-
-							if data.rateLabel and data.rateLabel.Parent and data.rateLabel.Parent:IsA("BillboardGui") then 
-								data.rateLabel.Parent.Enabled = false 
-							end
-
-							local root = GetRootPart(auraObj)
-							if root then
-								local dropOffset = Vector3.new(-10, 4, math.random(-4, 4))
-								auraObj:PivotTo(CFrame.new(storage.Position + dropOffset))
-								root.AssemblyLinearVelocity = Vector3.new(0, -10, 0)
-								root.AssemblyAngularVelocity = Vector3.new(math.random(-5, 5), math.random(-5, 5), math.random(-5, 5))
-							end
-
-							CubeStoredBridge:Fire(id)
-							break
-						end
-					end
-				end
-			end)
-		end
-	end)
-end
-
-AuraHolder.ChildAdded:Connect(function(child) if child:IsA("Model") then HookAuraModel(child) end end)
-HabitatHolder.ChildAdded:Connect(function(child) if child:IsA("Model") then HookHabitatModel(child) end end)
-
-for _, child in ipairs(AuraHolder:GetChildren()) do if child:IsA("Model") then HookAuraModel(child) end end
-for _, child in ipairs(HabitatHolder:GetChildren()) do if child:IsA("Model") then HookHabitatModel(child) end end
-
----------------------------------------------------------------
--- INPUT CONTROLS & TUTORIAL GATING
----------------------------------------------------------------
-local trackedInputs = {}
-
-local function EvaluateHolding()
-	local hasInput = false
-	for _, _ in pairs(trackedInputs) do hasInput = true; break end
-
-	if hasInput and not holding then
-		if type(shared.TutorialCanPerform) == "function" then
-			if not shared.TutorialCanPerform("Action_ClickRedButton") then table.clear(trackedInputs); return end
-		end
-
-		if hatcheryEmpty then FlashEmpty() return end
-		if habitatFull then return end
-
-		holding = true; holdStart = tick()
-		TweenService:Create(clickScale, TweenInfo.new(0.1, Enum.EasingStyle.Sine), {Scale = 0.9}):Play()
-		ProduceAuraBridge:Fire("start")
-
+	btn.MouseEnter:Connect(function() HoverLabel.Text = hoverText end); btn.MouseLeave:Connect(function() HoverLabel.Text = activeTabText end)
+	btn.MouseButton1Down:Connect(function()
+		if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_ClickAchieveTab_" .. name) then return end
+		PlayUI(SoundConfig.UIClick or ""); activeTab = name; activeTabText = hoverText; HoverLabel.Text = activeTabText
+		for k, t in pairs(tabBtns) do t.btn.BackgroundColor3 = (k == name) and T.accentGold or T.buttonSecondary; t.stroke.Color = (k == name) and T.bodyText or T.panelStroke end
+		for k, s in pairs(scrolls) do s.Visible = (k == name) end
+		TitleLabel.Text = (name == "Settings") and "SETTINGS" or "PROGRESSION"
 		if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
-	elseif not hasInput and holding then
-		holding = false; holdStart = nil
-		ProduceAuraBridge:Fire("stop")
-		UpdateButtonVisual(); UpdateMultiplier:Fire(1.0)
-	end
-end
-
-ClickButton.InputBegan:Connect(function(input)
-	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-		trackedInputs[input] = true; EvaluateHolding()
-	end
-end)
-
-UserInputService.InputBegan:Connect(function(input, gameProcessed)
-	if input.KeyCode == Enum.KeyCode.Space and not UserInputService:GetFocusedTextBox() then
-		trackedInputs[input] = true; EvaluateHolding()
-	end
-end)
-
-UserInputService.InputEnded:Connect(function(input)
-	if trackedInputs[input] then trackedInputs[input] = nil; EvaluateHolding() end
-end)
-
-UserInputService.WindowFocusReleased:Connect(function()
-	table.clear(trackedInputs); EvaluateHolding()
-end)
-
-ForceStopHold.OnClientEvent:Connect(function()
-	table.clear(trackedInputs); EvaluateHolding()
-end)
-
-HabitatFull.OnClientEvent:Connect(function()
-	habitatFull = true; HabitatFullEvent:Fire(true); table.clear(trackedInputs); EvaluateHolding()
-end)
-
-HabitatFullEvent.Event:Connect(function(isFull)
-	habitatFull = isFull
-	if not isFull then 
-		UpdateButtonVisual() 
-	end
-
-	-- ✨ FIX: Loop through ALL aura models, and ALL of their ConveyerPaths
-	for _, auraModel in ipairs(AuraHolder:GetChildren()) do
-		if auraModel:IsA("Model") then
-			for _, conveyer in ipairs(auraModel:GetDescendants()) do
-				if conveyer.Name == "ConveyerPath" and conveyer:IsA("BasePart") then
-					local forwardBeam = conveyer:FindFirstChild("Foward") or conveyer:FindFirstChild("Forward")
-					local backwardBeam = conveyer:FindFirstChild("Backward")
-
-					-- ✨ DYNAMIC VELOCITY: Uses the part's local X-axis instead of the world's X-axis
-					if isFull then 
-						conveyer.AssemblyLinearVelocity = conveyer.CFrame.RightVector * 10 
-						if forwardBeam then forwardBeam.Enabled = false end
-						if backwardBeam then backwardBeam.Enabled = true end
-					else 
-						conveyer.AssemblyLinearVelocity = conveyer.CFrame.RightVector * -5 
-						if forwardBeam then forwardBeam.Enabled = true end
-						if backwardBeam then backwardBeam.Enabled = false end
-					end
-				end
-			end
-		end
-	end
-end)
-
-UpdateHatcheryBridge:Connect(function(info)
-	local finalMax = info.max
-	local localHatchLvl = player:GetAttribute("LocalHatcheryLevel")
-
-	if localHatchLvl then
-		local UpgradeConfig = require(ReplicatedStorage.Modules.UpgradeConfig)
-		local cfg = UpgradeConfig.GetUpgradeConfig("hatcheryCapacity")
-		if cfg and cfg.apply then
-			local predictedMax = cfg.apply({ upgrades = { hatcheryCapacity = localHatchLvl } })
-			finalMax = math.max(info.max, predictedMax)
-		end
-	end
-	UpdateHatcheryBar(info.current, finalMax)
-end)
-
-local localUpgradesState = {}
-
-local function RecalculateMaxTier()
-	local speedData = localUpgradesState["multiplierSpeed"]
-	local speedLevel = (typeof(speedData) == "table" and speedData.level) or (typeof(speedData) == "number" and speedData) or 0
-	playerMultSpeed = 1.0 + (speedLevel * 0.05) 
-
-	local tierUnlocks = {
-		{ upgradeId = "unlockOmniMult",      tier = 10 },
-		{ upgradeId = "unlockUniversalMult", tier = 9 },
-		{ upgradeId = "unlockGodlyMult",     tier = 8 },
-		{ upgradeId = "unlockCosmicMult",    tier = 7 },
-		{ upgradeId = "unlockMythicMult",    tier = 6 },
-	}
-
-	local calculatedMaxTier = 5 
-	for _, data in ipairs(tierUnlocks) do
-		local upgData = localUpgradesState[data.upgradeId]
-		local level = (typeof(upgData) == "table" and upgData.level) or (typeof(upgData) == "number" and upgData) or 0
-		if level > 0 then calculatedMaxTier = data.tier; break end
-	end
-	playerMaxTier = calculatedMaxTier
-end
-
-ReplicatedStorage.RemoteEvents.UpgradeUpdated.OnClientEvent:Connect(function(info)
-	if not info then return end
-	if info.type == "fullState" and info.upgrades then
-		localUpgradesState = info.upgrades; RecalculateMaxTier()
-	elseif info.type == "purchased" then
-		if not localUpgradesState[info.upgradeId] then localUpgradesState[info.upgradeId] = {} end
-		if type(localUpgradesState[info.upgradeId]) == "number" then localUpgradesState[info.upgradeId] = { level = info.level }
-		else localUpgradesState[info.upgradeId].level = info.level end
-		RecalculateMaxTier()
-	end
-end)
-
-local EpicUpgradeUpdated = ReplicatedStorage.RemoteEvents:FindFirstChild("EpicUpgradeUpdated")
-if EpicUpgradeUpdated then
-	EpicUpgradeUpdated.OnClientEvent:Connect(function(info)
-		if not info then return end
-		if info.type == "fullState" and info.upgrades then
-			for k,v in pairs(info.upgrades) do localUpgradesState[k] = v end; RecalculateMaxTier()
-		elseif info.type == "purchased" then
-			if not localUpgradesState[info.upgradeId] then localUpgradesState[info.upgradeId] = {} end
-			if type(localUpgradesState[info.upgradeId]) == "number" then localUpgradesState[info.upgradeId] = { level = info.level }
-			else localUpgradesState[info.upgradeId].level = info.level end
-			RecalculateMaxTier()
-		end
 	end)
+end
+
+MakeTab("Challenges", "Boosts", "rbxassetid://14916846070"); MakeTab("Index", "Auras", "rbxassetid://14916846070"); MakeTab("Badges", "Badges", "rbxassetid://14916846070"); MakeTab("Leaderboard", "Leaderboard", "rbxassetid://14916846070"); MakeTab("Settings", "Settings", "rbxassetid://14923131909") 
+
+local lbWrapper = Instance.new("Frame", Panel)
+lbWrapper.Name = "LeaderboardWrapper"
+lbWrapper.Size = UDim2.new(1, -20, 1, -135)
+lbWrapper.Position = UDim2.new(0, 10, 0, 125)
+lbWrapper.BackgroundTransparency = 1
+lbWrapper.Visible = false
+scrolls["Leaderboard"] = lbWrapper 
+
+local lbSubTabContainer = Instance.new("Frame", lbWrapper)
+lbSubTabContainer.Name = "SubTabContainer"
+lbSubTabContainer.Size = UDim2.new(0, 55, 1, 0)
+lbSubTabContainer.BackgroundTransparency = 1
+
+local lbSubTabLayout = Instance.new("UIListLayout", lbSubTabContainer)
+lbSubTabLayout.FillDirection = Enum.FillDirection.Vertical
+lbSubTabLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+lbSubTabLayout.VerticalAlignment = Enum.VerticalAlignment.Top
+lbSubTabLayout.Padding = UDim.new(0, 15)
+
+local lbScroll = Instance.new("ScrollingFrame", lbWrapper)
+lbScroll.Size = UDim2.new(1, -65, 1, 0)
+lbScroll.Position = UDim2.new(0, 65, 0, 0)
+lbScroll.BackgroundTransparency = 1
+lbScroll.BorderSizePixel = 0
+lbScroll.ScrollBarThickness = 4
+
+local lbContentLayout = Instance.new("UIListLayout", lbScroll)
+lbContentLayout.Padding = UDim.new(0, 8)
+lbContentLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+
+lbContentLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+	lbScroll.CanvasSize = UDim2.new(0, 0, 0, lbContentLayout.AbsoluteContentSize.Y + 10)
+end)
+
+local activeLbTab = "Auras Generated"
+local lbSubBtns = {}
+
+local function BuildLeaderboardRows(tabName)
+	for _, child in ipairs(lbScroll:GetChildren()) do if child:IsA("Frame") then child:Destroy() end end
+
+	local data = {}
+	if tabName == "Top 10" then
+		data = { {rank=1, name="MoldySugar2205", val="999.9M Soul Auras"}, {rank=2, name="MoldySugar2205", val="50.2M Soul Auras"}, {rank=3, name="MoldySugar2205", val="10.5M Soul Auras"}, {rank=4, name="MoldySugar2205", val="5.1M Soul Auras"}, {rank=5, name="MoldySugar2205", val="2.0M Soul Auras"} }
+	elseif tabName == "Auras Generated" then
+		data = { {rank=1, name="MoldySugar2205", val="5.2B Auras"}, {rank=2, name="MoldySugar2205", val="1.1B Auras"}, {rank=3, name="MoldySugar2205", val="800M Auras"}, {rank=4, name="MoldySugar2205", val="500M Auras"}, {rank=5, name="MoldySugar2205", val="150M Auras"} }
+	elseif tabName == "Most Money Made" then
+		data = { {rank=1, name="MoldySugar2205", val="$999.9B"}, {rank=2, name="MoldySugar2205", val="$500.5B"}, {rank=3, name="MoldySugar2205", val="$150.0B"}, {rank=4, name="MoldySugar2205", val="$50.0B"}, {rank=5, name="MoldySugar2205", val="$10.0B"} }
+	end
+
+	for i, p in ipairs(data) do
+		local row = Instance.new("Frame", lbScroll)
+		row.Size = UDim2.new(1, 0, 0, 45)
+		row.BackgroundColor3 = T.cardBG
+		Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
+
+		local rankLbl = Instance.new("TextLabel", row)
+		rankLbl.Size = UDim2.new(0, 40, 1, 0)
+		rankLbl.Position = UDim2.new(0, 10, 0, 0)
+		rankLbl.BackgroundTransparency = 1
+		rankLbl.Text = "#" .. p.rank
+		rankLbl.TextColor3 = (p.rank==1) and Color3.fromRGB(255,215,0) or ((p.rank==2) and Color3.fromRGB(192,192,192) or ((p.rank==3) and Color3.fromRGB(205,127,50) or T.subText))
+		rankLbl.Font = Enum.Font.GothamBold
+		rankLbl.TextScaled = true
+		rankLbl.TextWrapped = true
+		Instance.new("UITextSizeConstraint", rankLbl).MaxTextSize = 22
+
+		local nameLbl = Instance.new("TextLabel", row)
+		nameLbl.Size = UDim2.new(0.45, -50, 1, 0)
+		nameLbl.Position = UDim2.new(0, 60, 0, 0)
+		nameLbl.BackgroundTransparency = 1
+		nameLbl.Text = p.name
+		nameLbl.TextColor3 = T.bodyText
+		nameLbl.Font = Enum.Font.GothamMedium
+		nameLbl.TextScaled = true
+		nameLbl.TextWrapped = true
+		nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+		Instance.new("UITextSizeConstraint", nameLbl).MaxTextSize = 18
+
+		local valLbl = Instance.new("TextLabel", row)
+		valLbl.Size = UDim2.new(0.55, -20, 1, 0)
+		valLbl.Position = UDim2.new(0.45, 10, 0, 0)
+		valLbl.BackgroundTransparency = 1
+		valLbl.Text = p.val
+		valLbl.TextColor3 = T.accentGold
+		valLbl.Font = Enum.Font.GothamBold
+		valLbl.TextScaled = true
+		valLbl.TextWrapped = true
+		valLbl.TextXAlignment = Enum.TextXAlignment.Right
+		Instance.new("UITextSizeConstraint", valLbl).MaxTextSize = 18
+
+		UITheme.Apply(row, "Card")
+	end
+end
+
+local function MakeLbSubTab(tabName, iconId)
+	local btn = Instance.new("ImageButton", lbSubTabContainer)
+	btn.Size = UDim2.new(0, 45, 0, 45)
+	btn.BackgroundColor3 = (tabName == activeLbTab) and T.accentGold or T.buttonSecondary
+	btn.AutoButtonColor = false
+	Instance.new("UICorner", btn).CornerRadius = UDim.new(0.5, 0)
+
+	local tStroke = Instance.new("UIStroke", btn)
+	tStroke.Color = (tabName == activeLbTab) and T.bodyText or T.panelStroke
+	tStroke.Thickness = 2
+
+	local icon = Instance.new("ImageLabel", btn)
+	icon.Size = UDim2.new(0.6, 0, 0.6, 0)
+	icon.Position = UDim2.new(0.2, 0, 0.2, 0)
+	icon.BackgroundTransparency = 1
+	icon.ScaleType = Enum.ScaleType.Fit
+	icon.Image = iconId
+
+	CollectionService:AddTag(btn, "Tutorial_LbTab_" .. string.gsub(tabName, " ", ""))
+	lbSubBtns[tabName] = {btn = btn, stroke = tStroke}
+
+	btn.MouseEnter:Connect(function() HoverLabel.Text = tabName end)
+	btn.MouseLeave:Connect(function() HoverLabel.Text = activeTabText end)
+
+	btn.MouseButton1Down:Connect(function()
+		if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_ClickLbTab_" .. string.gsub(tabName, " ", "")) then return end
+		PlayUI(SoundConfig.UIClick or "")
+		activeLbTab = tabName
+		HoverLabel.Text = tabName
+		for k, t in pairs(lbSubBtns) do
+			t.btn.BackgroundColor3 = (k == tabName) and T.accentGold or T.buttonSecondary
+			t.stroke.Color = (k == tabName) and T.bodyText or T.panelStroke
+		end
+		BuildLeaderboardRows(activeLbTab)
+		if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
+	end)
+
+	local scale = Instance.new("UIScale", btn)
+	btn.MouseEnter:Connect(function() TweenService:Create(scale, TweenInfo.new(0.15), {Scale = 1.05}):Play() end)
+	btn.MouseLeave:Connect(function() TweenService:Create(scale, TweenInfo.new(0.15), {Scale = 1}):Play() end)
+	btn.MouseButton1Down:Connect(function() TweenService:Create(scale, TweenInfo.new(0.1), {Scale = 0.95}):Play() end)
+	btn.MouseButton1Up:Connect(function() TweenService:Create(scale, TweenInfo.new(0.2, Enum.EasingStyle.Bounce), {Scale = 1.05}):Play() end)
+end
+
+MakeLbSubTab("Top 10", "rbxassetid://14916846070") 
+MakeLbSubTab("Auras Generated", "rbxassetid://4483362458") 
+MakeLbSubTab("Most Money Made", "rbxassetid://14924185885") 
+
+BuildLeaderboardRows(activeLbTab)
+
+local setScroll = scrolls["Settings"]; local pad = Instance.new("UIPadding", setScroll); pad.PaddingTop = UDim.new(0, 5)
+local function MakeToggleRow(labelText, settingKey)
+	local row = Instance.new("Frame", setScroll); row.Size = UDim2.new(1, -10, 0, 42); row.BackgroundColor3 = T.cardBG; row.BorderSizePixel = 0; row.ZIndex = 41; Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
+	local lbl = Instance.new("TextLabel", row); lbl.Size = UDim2.new(0.6, 0, 1, 0); lbl.Position = UDim2.new(0, 15, 0, 0); lbl.BackgroundTransparency = 1; lbl.Text = labelText; lbl.TextColor3 = T.subText; lbl.TextScaled = true; lbl.Font = T.fontBody; lbl.TextXAlignment = Enum.TextXAlignment.Left
+	local toggle = Instance.new("TextButton", row); toggle.Size = UDim2.new(0, 60, 0, 30); toggle.Position = UDim2.new(1, -70, 0.5, -15); toggle.BorderSizePixel = 0; toggle.TextScaled = true; toggle.Font = T.font; Instance.new("UICorner", toggle).CornerRadius = UDim.new(0, 6); CollectionService:AddTag(toggle, "Tutorial_SettingToggle_" .. settingKey)
+	local function Refresh(isOn) toggle.Text = isOn and "ON" or "OFF"; toggle.TextColor3 = T.bodyText; toggle.BackgroundColor3 = isOn and T.buttonGreen or T.buttonRed end
+	local isOn = true; if settingKey == "sfx" then isOn = sfxEnabled elseif settingKey == "music" then isOn = musicEnabled elseif settingKey == "jump" then isOn = jumpEnabled end
+	Refresh(isOn); toggleRefs[settingKey] = Refresh
+	toggle.MouseButton1Down:Connect(function()
+		if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_ToggleSetting_" .. settingKey) then return end
+		PlayUI(SoundConfig.UIClick or ""); if settingKey == "sfx" then sfxEnabled = not sfxEnabled; isOn = sfxEnabled elseif settingKey == "music" then musicEnabled = not musicEnabled; isOn = musicEnabled elseif settingKey == "jump" then jumpEnabled = not jumpEnabled; isOn = jumpEnabled end
+		Refresh(isOn); SettingsChanged:Fire(settingKey, isOn)
+		if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
+	end)
+end
+MakeToggleRow("Sound Effects", "sfx"); MakeToggleRow("Music", "music"); MakeToggleRow("Jumping", "jump") 
+
+local div1 = Instance.new("Frame", setScroll); div1.Size = UDim2.new(1, -20, 0, 2); div1.BackgroundColor3 = T.panelStroke; div1.BorderSizePixel = 0
+local statsTitle = Instance.new("TextLabel", setScroll); statsTitle.Size = UDim2.new(1, -20, 0, 20); statsTitle.BackgroundTransparency = 1; statsTitle.Text = "FARM STATS"; statsTitle.TextColor3 = T.subText; statsTitle.TextScaled = true; statsTitle.Font = T.font; statsTitle.TextXAlignment = Enum.TextXAlignment.Left
+local function MakeStatRow(labelText, refKey)
+	local row = Instance.new("Frame", setScroll); row.Size = UDim2.new(1, -20, 0, 26); row.BackgroundTransparency = 1; local lbl = Instance.new("TextLabel", row); lbl.Size = UDim2.new(0.55, 0, 1, 0); lbl.BackgroundTransparency = 1; lbl.Text = labelText; lbl.TextColor3 = T.subText; lbl.TextScaled = true; lbl.Font = T.fontBody; lbl.TextXAlignment = Enum.TextXAlignment.Left; local val = Instance.new("TextLabel", row); val.Size = UDim2.new(0.45, 0, 1, 0); val.Position = UDim2.new(0.55, 0, 0, 0); val.BackgroundTransparency = 1; val.Text = "0"; val.TextColor3 = T.accentBlue; val.TextScaled = true; val.Font = T.font; val.TextXAlignment = Enum.TextXAlignment.Right; statValueRefs[refKey] = val
+end
+MakeStatRow("Soul Auras", "soul"); MakeStatRow("This Run", "run"); MakeStatRow("Rate", "rate"); MakeStatRow("Prestiges", "prestige")
+local function RefreshStats() if statValueRefs.soul then statValueRefs.soul.Text = Formatter.Format(liveSoulAuras) end; if statValueRefs.run then statValueRefs.run.Text = "$" .. Formatter.Format(liveRunEarnings) end; if statValueRefs.rate then statValueRefs.rate.Text = "$" .. Formatter.Format(liveRate) .. "/s" end; if statValueRefs.prestige then statValueRefs.prestige.Text = Formatter.Format(livePrestiges) end end
+
+-- ✨ MOBILE RESPONSIVE SCALING ADDED TO ROWS ✨
+local function CreateInteractiveRow(parent, id, claimActionId, onClaimCallback)
+	local row = parent:FindFirstChild(id)
+	if not row then
+		row = Instance.new("TextButton", parent); row.Name = id; row.Text = ""; row.AutoButtonColor = false; row.Size = UDim2.new(1, -8, 0, 64); row.BackgroundColor3 = T.cardBG; Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8); local stroke = Instance.new("UIStroke", row); stroke.Name = "Stroke"; stroke.Thickness = 1; local icon = Instance.new("ImageLabel", row); icon.Name = "Icon"; icon.Size = UDim2.new(0, 40, 0, 40); icon.Position = UDim2.new(0, 12, 0.5, -20); icon.ScaleType = Enum.ScaleType.Fit; Instance.new("UICorner", icon).CornerRadius = UDim.new(1, 0)
+
+		-- Use relative scales for Title, Description, and Status Labels so they shrink gracefully
+		local tLbl = Instance.new("TextLabel", row); tLbl.Name = "Title"; tLbl.Size = UDim2.new(0.5, 0, 0, 20); tLbl.Position = UDim2.new(0, 64, 0, 10); tLbl.BackgroundTransparency = 1; tLbl.TextColor3 = T.bodyText; tLbl.TextScaled = true; tLbl.Font = T.font; tLbl.TextXAlignment = Enum.TextXAlignment.Left
+		local dLbl = Instance.new("TextLabel", row); dLbl.Name = "Desc"; dLbl.Size = UDim2.new(0.5, 0, 0, 24); dLbl.Position = UDim2.new(0, 64, 0, 32); dLbl.BackgroundTransparency = 1; dLbl.TextColor3 = T.subText; dLbl.TextScaled = true; dLbl.TextWrapped = true; dLbl.Font = T.fontBody; dLbl.TextXAlignment = Enum.TextXAlignment.Left
+		local sLbl = Instance.new("TextLabel", row); sLbl.Name = "Status"; sLbl.Size = UDim2.new(0.3, 0, 0, 24); sLbl.Position = UDim2.new(1, -10, 0.5, -12); sLbl.AnchorPoint = Vector2.new(1, 0); sLbl.BackgroundTransparency = 1; sLbl.TextScaled = true; sLbl.Font = T.font; sLbl.TextXAlignment = Enum.TextXAlignment.Right
+
+		UITheme.Apply(row, "Card"); CollectionService:AddTag(row, "Tutorial_AchieveRow_" .. id)
+		local scale = Instance.new("UIScale", row)
+		row.MouseEnter:Connect(function() TweenService:Create(scale, TweenInfo.new(0.15), {Scale = 1.02}):Play() end)
+		row.MouseLeave:Connect(function() TweenService:Create(scale, TweenInfo.new(0.15), {Scale = 1}):Play(); row.Desc.Text = row:GetAttribute("BaseDesc") or "" end)
+		row.MouseButton1Down:Connect(function()
+			TweenService:Create(scale, TweenInfo.new(0.1), {Scale = 0.95}):Play()
+			if row:GetAttribute("RowState") == "CLAIMABLE" then
+				if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform(claimActionId) then return end
+				PlayClaimVFX(row); onClaimCallback(); if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
+			else
+				PlayUI(SoundConfig.UIClick or ""); local showingReq = not row:GetAttribute("ShowingReq"); row:SetAttribute("ShowingReq", showingReq)
+				if showingReq and row:GetAttribute("ReqDesc") ~= "" then row.Desc.Text = row:GetAttribute("ReqDesc"); row.Desc.TextColor3 = T.accentGold else row.Desc.Text = row:GetAttribute("BaseDesc"); row.Desc.TextColor3 = T.subText end
+			end
+		end)
+		row.MouseButton1Up:Connect(function() TweenService:Create(scale, TweenInfo.new(0.2, Enum.EasingStyle.Bounce), {Scale = 1.02}):Play() end)
+	end
+	return row
+end
+
+local function RefreshData()
+	local claimedChallenges, claimedAuras, claimedBadges, discoveredTiers = latestStats.claimedChallenges or {}, latestStats.claimedAuras or {}, latestStats.claimedBadges or {}, latestStats.discoveredTiers or {}
+
+	for i, chal in ipairs(AchievementConfig.Challenges) do
+		local current = latestStats[chal.statKey] or 0
+		local isDone = current >= chal.goal; local isClaimed = claimedChallenges[chal.id] == true
+		local rowId = "Chal_" .. chal.id
+		local row = CreateInteractiveRow(scrolls["Challenges"], rowId, "Action_ClaimChallenge_" .. chal.id, function() ClaimChallenge:FireServer(chal.id) end)
+		row.Title.Text = chal.title; row.Icon.Image = chal.iconId; row:SetAttribute("BaseDesc", chal.rewardText); row:SetAttribute("ReqDesc", "Requires: " .. chal.desc)
+		if isClaimed then row:SetAttribute("RowState", "CLAIMED"); row.Status.Text = "UNLOCKED"; row.Status.TextColor3 = T.subText; row.BackgroundColor3 = T.cardBG; row.Stroke.Color = T.accentBlue; row.Desc.Text = chal.rewardText; row.Desc.TextColor3 = T.subText
+		elseif isDone then row:SetAttribute("RowState", "CLAIMABLE"); row.Status.Text = "CLAIM!"; row.Status.TextColor3 = Color3.fromRGB(255, 255, 255); row.BackgroundColor3 = Color3.fromRGB(80, 160, 60); row.Stroke.Color = Color3.fromRGB(120, 255, 100); row.Desc.Text = "Click to Unlock!"; row.Desc.TextColor3 = Color3.fromRGB(200, 255, 200)
+		else row:SetAttribute("RowState", "LOCKED"); row.Status.Text = current .. " / " .. chal.goal; row.Status.TextColor3 = T.subText; row.BackgroundColor3 = T.cardBG; row.Stroke.Color = T.subText; row.Desc.Text = (not row:GetAttribute("ShowingReq")) and chal.rewardText or ("Requires: " .. chal.desc); row.Desc.TextColor3 = T.subText end
+	end
+
+	local indexCount = 1
+	for aIdx = 1, 20 do
+		local areaNames = AreaAuraNames[aIdx]
+		if not areaNames then continue end
+		for tIdx = 1, 5 do
+			local tier = TierConfig.Tiers[tIdx]
+			if not tier then continue end
+			local auraKey = aIdx .. "_" .. tier.name; local discovered = discoveredTiers[auraKey] == true; local isClaimed = claimedAuras[auraKey] == true
+			local rewardGA = AchievementConfig.AuraTierRewards[tier.name] or 5
+			local row = CreateInteractiveRow(scrolls["Index"], "Index_" .. indexCount, "Action_ClaimAura_" .. aIdx .. "_" .. tier.name, function() ClaimAuraIndex:FireServer(aIdx, tier.name) end)
+			row.Icon.Image = "rbxassetid://0"
+			if isClaimed then row:SetAttribute("RowState", "CLAIMED"); row.Title.Text = areaNames[tIdx] .. " Aura"; row.Title.TextColor3 = tier.color; row.Status.Text = "FOUND"; row.Status.TextColor3 = T.subText; row.BackgroundColor3 = T.cardBG; row.Stroke.Color = tier.color; row:SetAttribute("BaseDesc", "Area " .. aIdx); row:SetAttribute("ReqDesc", ""); row.Desc.Text = "Area " .. aIdx; row.Desc.TextColor3 = T.subText
+			elseif discovered then row:SetAttribute("RowState", "CLAIMABLE"); row.Title.Text = areaNames[tIdx] .. " Aura"; row.Title.TextColor3 = Color3.fromRGB(255, 255, 255); row.Status.Text = "CLAIM +" .. rewardGA .. " GA!"; row.Status.TextColor3 = Color3.fromRGB(255, 215, 0); row.BackgroundColor3 = Color3.fromRGB(150, 110, 20); row.Stroke.Color = Color3.fromRGB(255, 215, 0); row:SetAttribute("BaseDesc", "Click to claim reward!"); row:SetAttribute("ReqDesc", ""); row.Desc.Text = "Click to claim reward!"; row.Desc.TextColor3 = Color3.fromRGB(255, 240, 150)
+			else row:SetAttribute("RowState", "LOCKED"); row.Title.Text = "???"; row.Title.TextColor3 = Color3.fromRGB(100, 100, 100); row.Status.Text = "???"; row.Status.TextColor3 = T.buttonRed; row.BackgroundColor3 = T.cardBG; row.Stroke.Color = Color3.fromRGB(50, 50, 50); row:SetAttribute("BaseDesc", "Undiscovered"); row:SetAttribute("ReqDesc", "Area " .. aIdx); row.Desc.Text = "Undiscovered"; row.Desc.TextColor3 = T.subText end
+			indexCount += 1
+		end
+	end
+
+	for i, badge in ipairs(AchievementConfig.Badges) do
+		local current = latestStats[badge.statKey] or 0; local isDone = current >= badge.goal; local isClaimed = claimedBadges[i] == true
+		local row = CreateInteractiveRow(scrolls["Badges"], "Badge_" .. i, "Action_ClaimBadge_" .. i, function() ClaimBadge:FireServer(i) end)
+		row.Title.Text = badge.title; row.Icon.Image = badge.iconId; row:SetAttribute("BaseDesc", badge.desc); row:SetAttribute("ReqDesc", "Goal: " .. badge.goal)
+		if isClaimed then row:SetAttribute("RowState", "CLAIMED"); row.Status.Text = "OWNED"; row.Status.TextColor3 = T.subText; row.BackgroundColor3 = T.cardBG; row.Stroke.Color = T.accentGold; row.Desc.Text = badge.desc; row.Desc.TextColor3 = T.subText
+		elseif isDone then row:SetAttribute("RowState", "CLAIMABLE"); row.Status.Text = "CLAIM BADGE!"; row.Status.TextColor3 = Color3.fromRGB(255, 255, 255); row.BackgroundColor3 = Color3.fromRGB(120, 60, 180); row.Stroke.Color = Color3.fromRGB(200, 100, 255); row.Desc.Text = "Click to receive Badge!"; row.Desc.TextColor3 = Color3.fromRGB(230, 200, 255)
+		else row:SetAttribute("RowState", "LOCKED"); row.Status.Text = current .. " / " .. badge.goal; row.Status.TextColor3 = T.subText; row.BackgroundColor3 = T.cardBG; row.Stroke.Color = T.subText; row.Desc.Text = badge.desc; row.Desc.TextColor3 = T.subText end
+	end
 end
 
 UpdateHUDBridge:Connect(function(stats)
-	local needsRefresh = false
-
-	if stats.passiveInterval ~= nil and stats.passiveInterval ~= currentPassiveInterval then 
-		currentPassiveInterval = stats.passiveInterval
-		needsRefresh = true
+	for key, value in pairs(stats) do latestStats[key] = value end
+	if stats.soulAuras ~= nil then liveSoulAuras = stats.soulAuras end; if stats.totalEarned ~= nil then liveRunEarnings = stats.totalEarned end; if stats.rate ~= nil and stats.passiveInterval ~= nil and stats.passiveInterval > 0 then liveRate = stats.rate / stats.passiveInterval end; if stats.prestigeCount ~= nil then livePrestiges = stats.prestigeCount end
+	if stats.settings then
+		if stats.settings.sfxEnabled ~= nil then sfxEnabled = stats.settings.sfxEnabled; if toggleRefs.sfx then toggleRefs.sfx(sfxEnabled) end end
+		if stats.settings.musicEnabled ~= nil then musicEnabled = stats.settings.musicEnabled; if toggleRefs.music then toggleRefs.music(musicEnabled) end end
+		if stats.settings.jumpEnabled ~= nil then jumpEnabled = stats.settings.jumpEnabled; if toggleRefs.jump then toggleRefs.jump(jumpEnabled) end end
 	end
-
-	if stats.boostMultiplier ~= nil and stats.boostMultiplier ~= globalBoostMultiplier then
-		globalBoostMultiplier = stats.boostMultiplier
-		needsRefresh = true
-	end
-
-	if stats.currentFireRate ~= nil then
-		currentFireRate = stats.currentFireRate
-	end
-
-	if stats.upgrades then
-		for k, v in pairs(stats.upgrades) do localUpgradesState[k] = v end
-		RecalculateMaxTier()
-	end
-
-	if stats.pendingAuras ~= nil and stats.habitatCapacity ~= nil then
-		latestPendingAuras = stats.pendingAuras
-		latestHabitatCapacity = stats.habitatCapacity
-
-		if stats.pendingAuras < stats.habitatCapacity and habitatFull then
-			habitatFull = false; HabitatFullEvent:Fire(false); UpdateButtonVisual()
-		end
-		UpdateHabitatBar(stats.pendingAuras, stats.habitatCapacity)
-	end
-
-	if needsRefresh then RefreshAllRateLabels() end
+	if panelOpen then RefreshData(); RefreshStats() end
 end)
 
-task.spawn(function()
-	while true do
-		if holding then
-			if hatcheryEmpty or habitatFull then
-				table.clear(trackedInputs); EvaluateHolding()
-			else
-				ProduceAuraBridge:Fire(); UpdateButtonVisual()
-			end
-		end
-		task.wait(currentFireRate)
+local function OpenToTab(tabName, hoverText)
+	PlayUI(SoundConfig.UIOpen or ""); panelOpen = true; Panel.Visible = true; Panel.Size = UDim2.new(0.85, 0, 0, 0); activeTab = tabName; activeTabText = hoverText; HoverLabel.Text = activeTabText
+	for k, t in pairs(tabBtns) do t.btn.BackgroundColor3 = (k == activeTab) and T.accentGold or T.buttonSecondary; t.stroke.Color = (k == activeTab) and T.bodyText or T.panelStroke end
+	for k, s in pairs(scrolls) do s.Visible = (k == activeTab) end
+	RefreshData(); RefreshStats(); TitleLabel.Text = (tabName == "Settings") and "SETTINGS" or "PROGRESSION"
+	TweenService:Create(Panel, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Size = UDim2.new(0.85, 0, 0.75, 0)}):Play()
+	UITheme.SetMenuVisible(true)
+end
+
+local function ClosePanel()
+	if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_CloseAchievements") then return end
+	PlayUI(SoundConfig.UIClose or ""); panelOpen = false; TweenService:Create(Panel, TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {Size = UDim2.new(0.85, 0, 0, 0)}):Play(); UITheme.SetMenuVisible(false); task.delay(0.25, function() Panel.Visible = false end)
+	if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
+end
+
+AchieveBtn.MouseButton1Down:Connect(function()
+	if not panelOpen then
+		if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_OpenAchievements") then return end
+		OpenToTab("Challenges", "Boosts")
+		if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
+	else
+		ClosePanel()
 	end
 end)
+
+CloseBtn.MouseButton1Down:Connect(ClosePanel)
+
+local function AddButtonJuice(btn)
+	local scale = btn:FindFirstChildOfClass("UIScale") or Instance.new("UIScale", btn)
+	btn.MouseEnter:Connect(function() TweenService:Create(scale, TweenInfo.new(0.15), {Scale = 1.08}):Play() end)
+	btn.MouseLeave:Connect(function() TweenService:Create(scale, TweenInfo.new(0.15), {Scale = 1}):Play() end)
+	btn.MouseButton1Down:Connect(function() TweenService:Create(scale, TweenInfo.new(0.1), {Scale = 0.9}):Play() end)
+	btn.MouseButton1Up:Connect(function() TweenService:Create(scale, TweenInfo.new(0.2, Enum.EasingStyle.Bounce), {Scale = 1.08}):Play() end)
+end
+AddButtonJuice(AchieveBtn); AddButtonJuice(CloseBtn)
+for _, t in pairs(tabBtns) do AddButtonJuice(t.btn) end
+
+task.spawn(function() task.wait(1); UITheme.Apply(Panel, "Panel"); UITheme.Apply(Header, "TitleBar"); UITheme.ApplyShine(Panel) end)
 
 ---------------------------------------------------------------
--- AURA MUTATION RESPONSES (BRIDGENET2)
+-- ✨ THE FIX: JUMP ENFORCER LOGIC
 ---------------------------------------------------------------
-AuraSpawnedBridge:Connect(function(info)
-	local instance, isCustom = SpawnAuraInstance(info.tier, info.color, info.glow, info.spawnPos, info.currentArea)
+local defaultJumpHeight = 7.2
+local defaultJumpPower = 50
 
-	instance:SetAttribute("AuraCube", true)
-	ScaleAura(instance, info.tier, false)
-	ShowCubeValue(info.spawnPos, info.value, info.color)
-	PlayVFX("Spawn", info.spawnPos, 1.0)
+local function UpdateJumpState(character, canJump)
+	if not character then return end
+	local humanoid = character:WaitForChild("Humanoid", 3)
+	if humanoid then
+		if humanoid.JumpHeight > 0 then defaultJumpHeight = humanoid.JumpHeight end
+		if humanoid.JumpPower > 0 then defaultJumpPower = humanoid.JumpPower end
 
-	local permLabel = AttachPermanentRateLabel(instance, info.value, info.color)
-
-	if info.tier == "Legendary" then
-		ShowTierPopup(info.spawnPos, "Legendary", Color3.fromRGB(255, 200, 0))
-		PlayVFX("Legendary", info.spawnPos, 2.0)
+		if canJump then
+			humanoid.UseJumpPower = not humanoid.UseJumpPower 
+			humanoid.JumpHeight = defaultJumpHeight
+			humanoid.JumpPower = defaultJumpPower
+			humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+		else
+			humanoid.JumpHeight = 0
+			humanoid.JumpPower = 0
+			humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, false)
+		end
 	end
+end
 
-	if info.cubeId then
-		cubeDataMap[info.cubeId] = { 
-			instance = instance, 
-			tierName = info.tier, 
-			isCustom = isCustom,
-			rateLabel = permLabel,
-			baseValue = info.value 
-		}
-		instance.AncestryChanged:Connect(function(_, parent)
-			if not parent then cubeDataMap[info.cubeId] = nil end
-		end)
-	end
+SettingsChanged.Event:Connect(function(key, value)
+	if key == "jump" then UpdateJumpState(player.Character, value) end
 end)
 
-CubeMutatedBatchBridge:Connect(function(batchData)
-	for _, info in ipairs(batchData) do
-		local cubeData = cubeDataMap[info.cubeId]
-		if not cubeData then continue end 
-
-		if info.newValue then
-			cubeData.baseValue = info.newValue
-		end
-
-		local instance = cubeData.instance
-		if not instance or not instance.Parent then continue end 
-
-		local rootPart = GetRootPart(instance)
-		if not rootPart then continue end 
-		local position = rootPart.Position
-
-		if info.mutationType == "tierUpgrade" then
-			PlayVFX("TierUpgrade", position, 1.5)
-			if info.tierName == "Legendary" then PlayVFX("Legendary", position, 2.0) end
-
-			local oldTierName = cubeData.tierName
-			local newAura = PoolManager.GetAura(info.currentArea, info.tierName)
-
-			if newAura:IsA("Model") then
-				newAura:PivotTo(CFrame.new(position))
-				if newAura.PrimaryPart then
-					newAura.PrimaryPart.Anchored = false
-					newAura.PrimaryPart.CanCollide = true
-					newAura.PrimaryPart.CollisionGroup = "Auras"
-				end
-			elseif newAura:IsA("BasePart") then
-				newAura.Position = position
-				newAura.Anchored = false
-				newAura.CanCollide = true
-				newAura.CollisionGroup = "Auras"
-				newAura.Color = info.newColor
-			end
-
-			for _, desc in ipairs(newAura:GetDescendants()) do
-				if desc:IsA("ParticleEmitter") or desc:IsA("Trail") then desc.Enabled = true end
-			end
-
-			newAura.Parent = workspace
-			newAura:SetAttribute("AuraCube", true)
-			ScaleAura(newAura, info.tierName, true, oldTierName)
-			ApplyHeavyPhysics(newAura)
-
-			if cubeData.rateLabel and cubeData.rateLabel.Parent and cubeData.rateLabel.Parent:IsA("BillboardGui") then
-				local bb = cubeData.rateLabel.Parent
-				bb.Adornee = GetRootPart(newAura)
-				bb.Parent = GetRootPart(newAura)
-				cubeData.rateLabel.TextColor3 = info.newColor or Color3.fromRGB(100, 255, 100)
-				if cubeData.isStored then bb.Enabled = false end
-			end
-
-			PoolManager.ReturnAura(instance)
-			cubeData.instance = newAura; cubeData.tierName = info.tierName; cubeData.isCustom = true
-			newAura.AncestryChanged:Connect(function(_, parent) if not parent then cubeDataMap[info.cubeId] = nil end end)
-
-			ShowTierPopup(position, info.tierName, info.newColor)
-		end
-
-		if cubeData.rateLabel and cubeData.rateLabel.Parent and not cubeData.isStored then
-			local ratePerSec = ((cubeData.baseValue or 0) * globalBoostMultiplier) / currentPassiveInterval
-			cubeData.rateLabel.Text = "+$" .. FormatNumber(ratePerSec) .. "/sec"
-		end
-	end
+player.CharacterAdded:Connect(function(char)
+	task.wait(0.1) UpdateJumpState(char, jumpEnabled)
 end)
 
----------------------------------------------------------------
--- ✨ ANTI-STUCK / FALL-OFF FAILSAFE ✨
----------------------------------------------------------------
-task.spawn(function()
-	while true do
-		task.wait(1.5)
-		local now = tick()
+if player.Character then UpdateJumpState(player.Character, jumpEnabled) end
 
-		for id, data in pairs(cubeDataMap) do
-			if not data.isStored and data.instance and data.instance.Parent then
-				local root = GetRootPart(data.instance)
-				if root then
-					local currentPos = root.Position
-					if not data.spawnY then
-						data.spawnY = currentPos.Y; data.lastPos = currentPos; data.lastMovedTime = now
-					end
-					if currentPos.Y < data.spawnY - 12 then
-						CubeSmushedBridge:Fire(id)
-						PlayVFX("Spawn", currentPos, 0.5)
-						PoolManager.ReturnAura(data.instance)
-						cubeDataMap[id] = nil
-						continue
-					end
-
-					local dist = (currentPos - data.lastPos).Magnitude
-					if dist < 0.25 then
-						if now - data.lastMovedTime > 8 then
-							CubeSmushedBridge:Fire(id)
-							PlayVFX("Spawn", currentPos, 0.5)
-							PoolManager.ReturnAura(data.instance)
-							cubeDataMap[id] = nil
-						end
-					else
-						data.lastPos = currentPos; data.lastMovedTime = now
-					end
-				end
-			end
-		end
-	end
-end)
+local forceClose = ReplicatedStorage:FindFirstChild("ForceCloseUI") or Instance.new("BindableEvent")
+forceClose.Name = "ForceCloseUI"; forceClose.Parent = ReplicatedStorage
+forceClose.Event:Connect(function() if panelOpen then CloseBtn.MouseButton1Down:Fire() end end)
