@@ -1,541 +1,944 @@
--- =====================================================================
--- 1. MODULE: AreaRegistry
--- Location: ReplicatedStorage > Modules > AreaRegistry
--- =====================================================================
-local AreaRegistry = {}
+-- ClickHandler
+-- Location: StarterPlayer > StarterPlayerScripts > ClickHandler
 
-AreaRegistry.LightingPresets = {
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local Debris = game:GetService("Debris")
+local CollectionService = game:GetService("CollectionService")
 
-	-- 🏭 PHASE 1: THE GRIME (Areas 1-3)
-	["Area1_DeepScrapyard"] = {
-		ClockTime = 12, Brightness = 0.3, SunRaysIntensity = 0,
-		Ambient = Color3.fromRGB(70, 60, 50), FogColor = Color3.fromRGB(90, 80, 65),
-		FogStart = 20, FogEnd = 60, Density = 0.7, Haze = 10, AtmosphereColor = Color3.fromRGB(90, 80, 65)
-	},
-	["Area2_RustyWastes"] = {
-		ClockTime = 14, Brightness = 0.4, SunRaysIntensity = 0,
-		Ambient = Color3.fromRGB(80, 65, 50), FogColor = Color3.fromRGB(100, 85, 60),
-		FogStart = 20, FogEnd = 80, Density = 0.6, Haze = 8, AtmosphereColor = Color3.fromRGB(100, 91, 70)
-	},
-	["Area3_IndustrialOutskirts"] = {
-		ClockTime = 16, Brightness = 3, SunRaysIntensity = 0.2,
-		Ambient = Color3.fromRGB(124, 115, 105), FogColor = Color3.fromRGB(125, 117, 111),
-		FogStart = 0, FogEnd = 0, Density = 0, Haze = 0, AtmosphereColor = Color3.fromRGB(120, 116, 113)
-	},
+local AdminConfig = require(ReplicatedStorage.Modules.AdminConfig)
+local UITheme = require(ReplicatedStorage.Modules.UITheme)
+local AreaRegistry = require(ReplicatedStorage.Modules.AreaRegistry) 
+local NumberFormatter = require(ReplicatedStorage.Modules.NumberFormatter)
 
-	-- ☣️ PHASE 2: TOXIC ZONES (Areas 4-5)
-	["Area4_ChemicalSpill"] = {
-		ClockTime = 17, Brightness = 0.4, SunRaysIntensity = 0,
-		Ambient = Color3.fromRGB(60, 75, 50), FogColor = Color3.fromRGB(75, 90, 55),
-		FogStart = 0, FogEnd = 0, Density = 0, Haze = 2, AtmosphereColor = Color3.fromRGB(75, 90, 55)
-	},
-	["Area5_BioHazard"] = {
-		ClockTime = 17.5, Brightness = 0.3, SunRaysIntensity = 0,
-		Ambient = Color3.fromRGB(40, 60, 40), FogColor = Color3.fromRGB(45, 80, 45),
-		FogStart = 60, FogEnd = 120, Density = 0.4, Haze = 5, AtmosphereColor = Color3.fromRGB(45, 80, 45)
-	},
+local PoolManager = require(ReplicatedStorage.Modules:WaitForChild("PoolManager"))
 
-	-- 🌆 PHASE 3: TWILIGHT SLUMS (Areas 6-8)
-	["Area6_SunsetStrip"] = {
-		ClockTime = 17.8, Brightness = 0.6, SunRaysIntensity = 0.1, -- Sun peeks through!
-		Ambient = Color3.fromRGB(70, 40, 40), FogColor = Color3.fromRGB(90, 40, 30),
-		FogStart = 20, FogEnd = 150, Density = 0.5, Haze = 4, AtmosphereColor = Color3.fromRGB(120, 50, 40)
-	},
-	["Area7_TwilightSector"] = {
-		ClockTime = 18.2, Brightness = 0.4, SunRaysIntensity = 0,
-		Ambient = Color3.fromRGB(40, 30, 60), FogColor = Color3.fromRGB(35, 25, 55),
-		FogStart = 20, FogEnd = 180, Density = 0.55, Haze = 4, AtmosphereColor = Color3.fromRGB(35, 25, 55)
-	},
-	["Area8_NeonSlums"] = {
-		ClockTime = 0, Brightness = 0.5, SunRaysIntensity = 0,
-		Ambient = Color3.fromRGB(30, 20, 50), FogColor = Color3.fromRGB(20, 10, 40),
-		FogStart = 25, FogEnd = 200, Density = 0.5, Haze = 3, AtmosphereColor = Color3.fromRGB(40, 20, 80)
-	},
+local BridgeNet2             = require(ReplicatedStorage.Modules:WaitForChild("BridgeNet2"))
+local UpdateHUDBridge        = BridgeNet2.ClientBridge("UpdateHUD")
+local ProduceAuraBridge      = BridgeNet2.ClientBridge("ProduceAura")
+local AuraSpawnedBridge      = BridgeNet2.ClientBridge("AuraSpawned")
+local UpdateHatcheryBridge   = BridgeNet2.ClientBridge("UpdateHatchery")
+local CubeMutatedBatchBridge = BridgeNet2.ClientBridge("CubeMutatedBatch")
+local CubeSmushedBridge      = BridgeNet2.ClientBridge("CubeSmushed")
+local CubeStoredBridge       = BridgeNet2.ClientBridge("CubeStored") 
 
-	-- 🌃 PHASE 4: CYBER CITY (Areas 9-10)
-	["Area9_LowerCyber"] = {
-		ClockTime = 0, Brightness = 0.7, SunRaysIntensity = 0,
-		Ambient = Color3.fromRGB(25, 25, 55), FogColor = Color3.fromRGB(15, 15, 45),
-		FogStart = 30, FogEnd = 250, Density = 0.4, Haze = 2, AtmosphereColor = Color3.fromRGB(20, 20, 60)
-	},
-	["Area10_CyberCore"] = {
-		ClockTime = 0, Brightness = 1, SunRaysIntensity = 0,
-		Ambient = Color3.fromRGB(20, 30, 60), FogColor = Color3.fromRGB(10, 20, 50),
-		FogStart = 50, FogEnd = 400, Density = 0.25, Haze = 1, AtmosphereColor = Color3.fromRGB(15, 25, 65)
-	},
+local ForceStopHold = ReplicatedStorage.RemoteEvents:WaitForChild("ForceStopHold")
+local HabitatFull = ReplicatedStorage.RemoteEvents:WaitForChild("HabitatFull")
+local UpdateMultiplier = ReplicatedStorage:WaitForChild("UpdateMultiplier")
+local HabitatFullEvent = ReplicatedStorage:WaitForChild("HabitatFullEvent")
 
-	-- 🌐 PHASE 5: CORPORATE STERILITY (Areas 11-13)
-	["Area11_GlassFacility"] = {
-		ClockTime = 12, Brightness = 2.0, SunRaysIntensity = 0.4, -- Blinding sudden daylight
-		Ambient = Color3.fromRGB(130, 130, 140), FogColor = Color3.fromRGB(200, 220, 240),
-		FogStart = 100, FogEnd = 1500, Density = 0.15, Haze = 0, AtmosphereColor = Color3.fromRGB(200, 220, 240)
-	},
-	["Area12_CrystalLab"] = {
-		ClockTime = 14, Brightness = 2.5, SunRaysIntensity = 0.5,
-		Ambient = Color3.fromRGB(150, 150, 150), FogColor = Color3.fromRGB(220, 240, 255),
-		FogStart = 150, FogEnd = 2500, Density = 0.1, Haze = 0, AtmosphereColor = Color3.fromRGB(220, 240, 255)
-	},
-	["Area13_QuantumGrid"] = {
-		ClockTime = 14, Brightness = 2.2, SunRaysIntensity = 0.3,
-		Ambient = Color3.fromRGB(100, 180, 200), FogColor = Color3.fromRGB(150, 255, 255),
-		FogStart = 200, FogEnd = 3000, Density = 0.05, Haze = 0, AtmosphereColor = Color3.fromRGB(150, 255, 255)
-	},
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local holding = false
 
-	-- 🌌 PHASE 6: REALITY BREAKING (Areas 14-16)
-	["Area14_PlasmaCore"] = {
-		ClockTime = 17.5, Brightness = 1.8, SunRaysIntensity = 0.3,
-		Ambient = Color3.fromRGB(150, 80, 150), FogColor = Color3.fromRGB(200, 100, 200),
-		FogStart = 100, FogEnd = 2000, Density = 0.2, Haze = 2, AtmosphereColor = Color3.fromRGB(200, 100, 200)
-	},
-	["Area15_CosmicRift"] = {
-		ClockTime = 6, Brightness = 1.5, SunRaysIntensity = 0.2,
-		Ambient = Color3.fromRGB(100, 30, 150), FogColor = Color3.fromRGB(70, 0, 100),
-		FogStart = 50, FogEnd = 1000, Density = 0.3, Haze = 4, AtmosphereColor = Color3.fromRGB(150, 0, 255)
-	},
-	["Area16_DarkMatter"] = {
-		ClockTime = 0, Brightness = 0.8, SunRaysIntensity = 0,
-		Ambient = Color3.fromRGB(80, 10, 20), FogColor = Color3.fromRGB(40, 0, 5),
-		FogStart = 30, FogEnd = 600, Density = 0.5, Haze = 6, AtmosphereColor = Color3.fromRGB(120, 0, 10)
-	},
+-- ✨ Dynamic Sync State
+local currentFireRate = AdminConfig.FireRate 
+local globalBoostMultiplier = 1
+local currentPassiveInterval = AdminConfig.PassiveInterval
 
-	-- ⬛ PHASE 7: THE VOID (Areas 17-20)
-	["Area17_EventHorizon"] = {
-		ClockTime = 0, Brightness = 0.4, SunRaysIntensity = 0,
-		Ambient = Color3.fromRGB(30, 10, 40), FogColor = Color3.fromRGB(15, 5, 20),
-		FogStart = 50, FogEnd = 800, Density = 0.3, Haze = 3, AtmosphereColor = Color3.fromRGB(20, 5, 30)
-	},
-	["Area18_DeepSpace"] = {
-		ClockTime = 0, Brightness = 0.2, SunRaysIntensity = 0,
-		Ambient = Color3.fromRGB(15, 15, 25), FogColor = Color3.fromRGB(5, 5, 15),
-		FogStart = 100, FogEnd = 1500, Density = 0.15, Haze = 1, AtmosphereColor = Color3.fromRGB(5, 5, 15)
-	},
-	["Area19_TheAbyss"] = {
-		ClockTime = 0, Brightness = 0.05, SunRaysIntensity = 0,
-		Ambient = Color3.fromRGB(5, 5, 5), FogColor = Color3.fromRGB(2, 2, 2),
-		FogStart = 200, FogEnd = 3000, Density = 0.05, Haze = 0, AtmosphereColor = Color3.fromRGB(2, 2, 2)
-	},
-	["Area20_UniversalVoid"] = {
-		ClockTime = 0, Brightness = 0, SunRaysIntensity = 0,
-		Ambient = Color3.fromRGB(0, 0, 0), FogColor = Color3.fromRGB(0, 0, 0),
-		FogStart = 500, FogEnd = 5000, Density = 0, Haze = 0, AtmosphereColor = Color3.fromRGB(0, 0, 0)
-	}
+local holdStart = nil
+local hatcheryEmpty = false
+local habitatFull = false
+
+local ClickButton = playerGui:WaitForChild("MainHUD"):WaitForChild("ClickButton")
+local HatcheryBar = playerGui:WaitForChild("MainHUD"):WaitForChild("HatcheryBar")
+local HatcheryFill = HatcheryBar:WaitForChild("Fill")
+local HatcheryLabel = HatcheryBar:WaitForChild("Label")
+
+local ModeToggle = playerGui:WaitForChild("MainHUD"):WaitForChild("ModeToggle")
+local SendButton = playerGui:WaitForChild("MainHUD"):WaitForChild("SendButton")
+
+CollectionService:AddTag(ClickButton, "Tutorial_ClickButton")
+CollectionService:AddTag(ModeToggle, "Tutorial_ToggleShipBtn")
+CollectionService:AddTag(SendButton, "Tutorial_SendShipBtn")
+
+local clickScale = ClickButton:FindFirstChildOfClass("UIScale") or Instance.new("UIScale", ClickButton)
+
+local ringFrame = ClickButton:FindFirstChild("ActionRing")
+if not ringFrame then
+	ringFrame = Instance.new("Frame")
+	ringFrame.Name = "ActionRing"
+	ringFrame.Size = UDim2.new(1, 0, 1, 0)
+	ringFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
+	ringFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+	ringFrame.BackgroundTransparency = 1
+	ringFrame.ZIndex = ClickButton.ZIndex - 1
+
+	local btnCorner = ClickButton:FindFirstChildOfClass("UICorner")
+	if btnCorner then btnCorner:Clone().Parent = ringFrame end
+	ringFrame.Parent = ClickButton
+end
+
+local clickStroke = ringFrame:FindFirstChildOfClass("UIStroke") or Instance.new("UIStroke", ringFrame)
+clickStroke.Color = Color3.fromRGB(255, 215, 0)
+clickStroke.Thickness = 0
+clickStroke.Transparency = 1
+
+local basePos = ClickButton.Position
+local tiltSide = 1
+
+local Camera = workspace.CurrentCamera
+local defaultFOV = 70 
+local lastMilestone = 1
+
+local MilestoneData = AdminConfig.MilestoneData
+
+local playerMultSpeed = 1.0 
+local playerMaxTier = 5     
+local lastTierIndex = 1
+
+local latestPendingAuras = 0
+local latestHabitatCapacity = 50
+
+local function FormatNumber(n)
+	return NumberFormatter.Format(n)
+end	
+
+---------------------------------------------------------------
+-- AURA MODEL FOLDERS & INSTANTIATION
+---------------------------------------------------------------
+local VFXFolder = ReplicatedStorage:FindFirstChild("VFX")
+local cubeDataMap = {}
+
+local TierScale = {
+	Common    = 1.0,
+	Uncommon  = 1.15,
+	Rare      = 1.3,
+	Epic      = 1.5,
+	Legendary = 1.75,
 }
 
-AreaRegistry.Areas = {
-	[1] = { 
-		name             = "Green Scrapyard",     
-		threshold        = 0,   
-		valueMultiplier  = 1.0, 
-		yOffset          = -2.7, 
-		yRotation        = 180, 
-		auraPreviewColor = Color3.fromRGB(200, 200, 200), 
-		grassColor       = Color3.fromRGB(92, 197, 53), 
-		pathColor        = Color3.fromRGB(163, 130, 88), 
-		ambientColor     = Color3.fromRGB(90, 90, 100), 
-		fogColor         = Color3.fromRGB(180, 200, 220), 
-		auraHolderColor  = Color3.fromRGB(255, 255, 255), 
-		auraHolderGlow   = Color3.fromRGB(255, 255, 255), 
-		lightingPreset   = "Area1_DeepScrapyard", 
-		icon = "rbxassetid://71630626823279",
-		auraModels       = { Common = "GearAura", Uncommon = "ScrewAura", Rare = "BottleAura", Epic = "TireAura", Legendary = "RadioAura" }
-	},
-	[2] = { 
-		name             = "Industrial Rust",    
-		threshold        = 5e4, 
-		valueMultiplier  = 1.5, 
-		yOffset          = -4.5, 
-		yRotation        = 180, 
-		auraPreviewColor = Color3.fromRGB(180, 100, 50), 
-		grassColor       = Color3.fromRGB(104, 160, 98), 
-		pathColor        = Color3.fromRGB(132, 140, 81), 
-		ambientColor     = Color3.fromRGB(80, 100, 80), 
-		fogColor         = Color3.fromRGB(160, 200, 160), 
-		auraHolderColor  = Color3.fromRGB(187, 255, 183), 
-		auraHolderGlow   = Color3.fromRGB(100, 255, 100), 
-		lightingPreset   = "Area2_RustyWastes", 
-		icon = "rbxassetid://130447112533927",
-		auraModels       = { Common = "GearAura", Uncommon = "ScrapMetalAura", Rare = "BarrelAura", Epic = "OilAura", Legendary = "BrokenweaponAura" }
-	},
-	[3] = { 
-		name             = "Foil Scrapyard",        
-		threshold        = 5e5, 
-		valueMultiplier  = 4.0, 
-		yOffset          = -2.8, 
-		yRotation        = 180, 
-		auraPreviewColor = Color3.fromRGB(220, 230, 255), 
-		grassColor       = Color3.fromRGB(180, 190, 200), 
-		pathColor        = Color3.fromRGB(150, 160, 170), 
-		ambientColor     = Color3.fromRGB(100, 110, 120), 
-		fogColor         = Color3.fromRGB(200, 210, 220), 
-		auraHolderColor  = Color3.fromRGB(220, 230, 255), 
-		auraHolderGlow   = Color3.fromRGB(240, 250, 255), 
-		lightingPreset   = "Area3_IndustrialOutskirts", 
-		icon = "rbxassetid://127570555675325",
-		auraModels       = { Common = "FoilBallAura", Uncommon = "CandyAura", Rare = "CrushedCanAura", Epic = "CapAura", Legendary = "SilverLeafAura", Mythic = "BalloonAura" }
-	},
-	[4] = { 
-		name             = "Cheap Metal",        
-		threshold        = 5e6, 
-		valueMultiplier  = 8.0, 
-		yOffset          = -2.8, 
-		yRotation        = 180, 
-		auraPreviewColor = Color3.fromRGB(150, 150, 160), 
-		grassColor       = Color3.fromRGB(130, 130, 140), 
-		pathColor        = Color3.fromRGB(100, 100, 110), 
-		ambientColor     = Color3.fromRGB(80, 80, 90), 
-		fogColor         = Color3.fromRGB(140, 140, 150), 
-		auraHolderColor  = Color3.fromRGB(170, 170, 180), 
-		auraHolderGlow   = Color3.fromRGB(190, 190, 200), 
-		lightingPreset   = "Area4_ChemicalSpill", 
-		icon = "rbxassetid://114952653386252",
-		auraModels       = { Common = "PlateAura", Uncommon = "PipeAura", Rare = "CoinAura", Epic = "WheelAura", Legendary = "ShoppingAura", Mythic = "StatueAura" }
-	},
-	[5] = { 
-		name             = "Solid Metal",   
-		threshold        = 5e7, 
-		valueMultiplier  = 20.0,
-		yOffset          = -3.0,   
-		yRotation        = 0,   
-		auraPreviewColor = Color3.fromRGB(90, 95, 100), 
-		grassColor       = Color3.fromRGB(80, 85, 90), 
-		pathColor        = Color3.fromRGB(60, 65, 70), 
-		ambientColor     = Color3.fromRGB(50, 55, 60), 
-		fogColor         = Color3.fromRGB(100, 105, 110), 
-		auraHolderColor  = Color3.fromRGB(120, 125, 130), 
-		auraHolderGlow   = Color3.fromRGB(140, 145, 150), 
-		lightingPreset   = "Area5_BioHazard", 
-		icon = "rbxassetid://71630626823279",
-		auraModels       = { Common = "GearAura", Uncommon = "ScrapMetalAura", Rare = "BarrelAura", Epic = "OilAura", Legendary = "BrokenweaponAura" }
-		--auraModels       = { Common = "IronOre", Uncommon = "SteelBeam", Rare = "CastIronWheel", Epic = "ChromeBumper", Legendary = "TungstenRod" }
-	},
-	[6] = {
-		name             = "Refined Alloys",
-		threshold        = 5e9,
-		valueMultiplier  = 75.0,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(200, 120, 50),
-		grassColor       = Color3.fromRGB(160, 90, 40),
-		pathColor        = Color3.fromRGB(120, 70, 30),
-		ambientColor     = Color3.fromRGB(90, 50, 20),
-		fogColor         = Color3.fromRGB(180, 100, 60),
-		auraHolderColor  = Color3.fromRGB(220, 140, 80),
-		auraHolderGlow   = Color3.fromRGB(255, 180, 100),
-		lightingPreset   = "Area6_RefinedAlloys", 
-		auraModels       = { Common = "CopperWire", Uncommon = "BrassGear", Rare = "BronzeStatue", Epic = "TitaniumPlate", Legendary = "CobaltShard" }
-	},
-	[7] = {
-		name             = "Precious Metals",
-		threshold        = 5e12,
-		valueMultiplier  = 350.0,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(255, 215, 0),
-		grassColor       = Color3.fromRGB(200, 170, 0),
-		pathColor        = Color3.fromRGB(150, 120, 0),
-		ambientColor     = Color3.fromRGB(120, 100, 20),
-		fogColor         = Color3.fromRGB(255, 230, 100),
-		auraHolderColor  = Color3.fromRGB(255, 240, 150),
-		auraHolderGlow   = Color3.fromRGB(255, 255, 200),
-		lightingPreset   = "Area7_PreciousMetals", 
-		auraModels       = { Common = "SilverBar", Uncommon = "GoldNugget", Rare = "PlatinumRing", Epic = "PalladiumCoin", Legendary = "RhodiumIngot" }
-	},
-	[8] = {
-		name             = "Industrial Synthetics",
-		threshold        = 5e15,
-		valueMultiplier  = 2500.0,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(230, 230, 230),
-		grassColor       = Color3.fromRGB(40, 40, 40),
-		pathColor        = Color3.fromRGB(20, 20, 20),
-		ambientColor     = Color3.fromRGB(60, 60, 60),
-		fogColor         = Color3.fromRGB(100, 100, 100),
-		auraHolderColor  = Color3.fromRGB(255, 255, 255),
-		auraHolderGlow   = Color3.fromRGB(200, 200, 255),
-		lightingPreset   = "Area8_Synthetics", 
-		auraModels       = { Common = "PVC_Pipe", Uncommon = "KevlarWeave", Rare = "TeflonBlock", Epic = "CarbonFiberRoll", Legendary = "GrapheneSheet" }
-	},
-	[9] = {
-		name             = "Volatile Materials",
-		threshold        = 5e19,
-		valueMultiplier  = 50000.0,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(100, 255, 100),
-		grassColor       = Color3.fromRGB(30, 50, 30),
-		pathColor        = Color3.fromRGB(20, 40, 20),
-		ambientColor     = Color3.fromRGB(40, 70, 40),
-		fogColor         = Color3.fromRGB(80, 200, 80),
-		auraHolderColor  = Color3.fromRGB(150, 255, 150),
-		auraHolderGlow   = Color3.fromRGB(0, 255, 0),
-		lightingPreset   = "Area9_Volatile", 
-		auraModels       = { Common = "GlowingSludge", Uncommon = "RadiumDial", Rare = "UraniumRod", Epic = "PlutoniumCore", Legendary = "AntimatterVial" }
-	},
-	[10] = {
-		name             = "Rough Gemstones",
-		threshold        = 5e25,
-		valueMultiplier  = 1000000.0,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(200, 100, 255),
-		grassColor       = Color3.fromRGB(90, 50, 120),
-		pathColor        = Color3.fromRGB(60, 30, 80),
-		ambientColor     = Color3.fromRGB(100, 60, 130),
-		fogColor         = Color3.fromRGB(180, 120, 255),
-		auraHolderColor  = Color3.fromRGB(230, 150, 255),
-		auraHolderGlow   = Color3.fromRGB(200, 50, 255),
-		lightingPreset   = "Area10_RoughGems", 
-		auraModels       = { Common = "AmethystCluster", Uncommon = "RawSapphire", Rare = "UncutRuby", Epic = "EmeraldChunk", Legendary = "OpalGeode" }
-	},
-	[11] = {
-		name             = "Polished Gems",
-		threshold        = 5e32,
-		valueMultiplier  = 5e7,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(150, 255, 255),
-		grassColor       = Color3.fromRGB(200, 240, 255),
-		pathColor        = Color3.fromRGB(180, 220, 255),
-		ambientColor     = Color3.fromRGB(100, 200, 255),
-		fogColor         = Color3.fromRGB(180, 255, 255),
-		auraHolderColor  = Color3.fromRGB(220, 255, 255),
-		auraHolderGlow   = Color3.fromRGB(255, 255, 255),
-		lightingPreset   = "Area11_PolishedGems", 
-		auraModels       = { Common = "PolishedTopaz", Uncommon = "FacetedSapphire", Rare = "CutRuby", Epic = "PerfectEmerald", Legendary = "FlawlessDiamond" }
-	},
-	[12] = {
-		name             = "High-Tech Computing",
-		threshold        = 5e40,
-		valueMultiplier  = 2.5e9,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(50, 200, 100),
-		grassColor       = Color3.fromRGB(20, 40, 30),
-		pathColor        = Color3.fromRGB(15, 30, 20),
-		ambientColor     = Color3.fromRGB(30, 60, 40),
-		fogColor         = Color3.fromRGB(40, 120, 80),
-		auraHolderColor  = Color3.fromRGB(100, 255, 150),
-		auraHolderGlow   = Color3.fromRGB(50, 255, 100),
-		lightingPreset   = "Area12_HighTech", 
-		auraModels       = { Common = "SiliconWafer", Uncommon = "Microchip", Rare = "RAM_Stick", Epic = "QuantumProcessor", Legendary = "AI_Core" }
-	},
-	[13] = {
-		name             = "Neon & Plasma",
-		threshold        = 5e50,
-		valueMultiplier  = 1.5e11,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(255, 50, 150),
-		grassColor       = Color3.fromRGB(40, 10, 30),
-		pathColor        = Color3.fromRGB(20, 5, 15),
-		ambientColor     = Color3.fromRGB(60, 20, 50),
-		fogColor         = Color3.fromRGB(100, 20, 80),
-		auraHolderColor  = Color3.fromRGB(255, 100, 200),
-		auraHolderGlow   = Color3.fromRGB(255, 0, 150),
-		lightingPreset   = "Area13_Neon", 
-		auraModels       = { Common = "NeonTube", Uncommon = "PlasmaArc", Rare = "LaserDiode", Epic = "HardLight", Legendary = "PhotonCell" }
-	},
-	[14] = {
-		name             = "Quantum Mechanics",
-		threshold        = 5e62,
-		valueMultiplier  = 1e14,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(255, 255, 255),
-		grassColor       = Color3.fromRGB(200, 200, 255),
-		pathColor        = Color3.fromRGB(150, 150, 200),
-		ambientColor     = Color3.fromRGB(100, 100, 150),
-		fogColor         = Color3.fromRGB(200, 200, 255),
-		auraHolderColor  = Color3.fromRGB(255, 255, 255),
-		auraHolderGlow   = Color3.fromRGB(100, 200, 255),
-		lightingPreset   = "Area14_Quantum", 
-		auraModels       = { Common = "Quark", Uncommon = "Tachyon", Rare = "Boson", Epic = "Tesseract", Legendary = "SchrodingerCat" }
-	},
-	[15] = {
-		name             = "Celestial Matter",
-		threshold        = 5e75,
-		valueMultiplier  = 5e16,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(150, 200, 255),
-		grassColor       = Color3.fromRGB(30, 40, 60),
-		pathColor        = Color3.fromRGB(20, 25, 40),
-		ambientColor     = Color3.fromRGB(40, 50, 80),
-		fogColor         = Color3.fromRGB(80, 100, 150),
-		auraHolderColor  = Color3.fromRGB(200, 230, 255),
-		auraHolderGlow   = Color3.fromRGB(100, 150, 255),
-		lightingPreset   = "Area15_Celestial", 
-		auraModels       = { Common = "MoonRock", Uncommon = "MarsDust", Rare = "CometIce", Epic = "AsteroidCore", Legendary = "SolarFlare" }
-	},
-	[16] = {
-		name             = "Cosmic Phenomena",
-		threshold        = 5e90,
-		valueMultiplier  = 2e19,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(200, 50, 255),
-		grassColor       = Color3.fromRGB(20, 10, 40),
-		pathColor        = Color3.fromRGB(10, 5, 20),
-		ambientColor     = Color3.fromRGB(40, 20, 80),
-		fogColor         = Color3.fromRGB(80, 30, 150),
-		auraHolderColor  = Color3.fromRGB(255, 150, 255),
-		auraHolderGlow   = Color3.fromRGB(150, 50, 255),
-		lightingPreset   = "Area16_Cosmic", 
-		auraModels       = { Common = "Stardust", Uncommon = "PulsarPulse", Rare = "QuasarLight", Epic = "SupernovaRemnant", Legendary = "GalaxySpiral" }
-	},
-	[17] = {
-		name             = "Dark Matter",
-		threshold        = 5e108,
-		valueMultiplier  = 1e22,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(20, 0, 40),
-		grassColor       = Color3.fromRGB(10, 0, 15),
-		pathColor        = Color3.fromRGB(5, 0, 10),
-		ambientColor     = Color3.fromRGB(15, 5, 30),
-		fogColor         = Color3.fromRGB(5, 0, 10),
-		auraHolderColor  = Color3.fromRGB(50, 0, 100),
-		auraHolderGlow   = Color3.fromRGB(255, 0, 50),
-		lightingPreset   = "Area17_DarkMatter", 
-		auraModels       = { Common = "ShadowMatter", Uncommon = "VoidResidue", Rare = "EventHorizon", Epic = "Singularity", Legendary = "HawkingRadiation" }
-	},
-	[18] = {
-		name             = "Multiversal Elements",
-		threshold        = 5e128,
-		valueMultiplier  = 5e25,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(0, 255, 255),
-		grassColor       = Color3.fromRGB(30, 30, 30),
-		pathColor        = Color3.fromRGB(15, 15, 15),
-		ambientColor     = Color3.fromRGB(50, 50, 50),
-		fogColor         = Color3.fromRGB(100, 200, 255),
-		auraHolderColor  = Color3.fromRGB(255, 0, 255),
-		auraHolderGlow   = Color3.fromRGB(0, 255, 255),
-		lightingPreset   = "Area18_Multiverse", 
-		auraModels       = { Common = "Paradox", Uncommon = "TimelineThread", Rare = "ParallelShard", Epic = "AlternateReality", Legendary = "MultiverseCore" }
-	},
-	[19] = {
-		name             = "Pure Energy",
-		threshold        = 5e150,
-		valueMultiplier  = 2e29,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(255, 255, 200),
-		grassColor       = Color3.fromRGB(200, 200, 150),
-		pathColor        = Color3.fromRGB(255, 255, 200),
-		ambientColor     = Color3.fromRGB(255, 255, 255),
-		fogColor         = Color3.fromRGB(255, 255, 200),
-		auraHolderColor  = Color3.fromRGB(255, 255, 255),
-		auraHolderGlow   = Color3.fromRGB(255, 255, 150),
-		lightingPreset   = "Area19_PureEnergy", 
-		auraModels       = { Common = "Static", Uncommon = "Kinetic", Rare = "Thermal", Epic = "Ethereal", Legendary = "InfiniteEnergy" }
-	},
-	[20] = {
-		name             = "The Absolute",
-		threshold        = 5e175,
-		valueMultiplier  = 1e34,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(255, 215, 0),
-		grassColor       = Color3.fromRGB(255, 255, 255),
-		pathColor        = Color3.fromRGB(200, 200, 200),
-		ambientColor     = Color3.fromRGB(255, 240, 200),
-		fogColor         = Color3.fromRGB(255, 255, 255),
-		auraHolderColor  = Color3.fromRGB(255, 215, 0),
-		auraHolderGlow   = Color3.fromRGB(255, 255, 255),
-		lightingPreset   = "Area20_TheAbsolute", 
-		auraModels       = { Common = "Concept", Uncommon = "Truth", Rare = "Existence", Epic = "Reality", Legendary = "Omnipotence" }
-	},
-}
-
-function AreaRegistry.Get(idx)            return AreaRegistry.Areas[idx] end
-function AreaRegistry.GetName(idx)        return (AreaRegistry.Areas[idx] and AreaRegistry.Areas[idx].name) or ("Area "..idx) end
-function AreaRegistry.GetThreshold(idx)   return AreaRegistry.Areas[idx] and AreaRegistry.Areas[idx].threshold or nil end
-function AreaRegistry.GetMultiplier(idx)  return (AreaRegistry.Areas[idx] and AreaRegistry.Areas[idx].valueMultiplier) or 1.0 end
-function AreaRegistry.GetYOffset(idx)     return (AreaRegistry.Areas[idx] and AreaRegistry.Areas[idx].yOffset)    or 0 end
-function AreaRegistry.GetYRotation(idx)   return (AreaRegistry.Areas[idx] and AreaRegistry.Areas[idx].yRotation)  or 0 end
-
-function AreaRegistry.GetFlipbook(idx)
-	local area = AreaRegistry.Areas[idx]
-	if not area or not area.flipbookImage then return nil end
-	return {
-		image = area.flipbookImage,
-		frames = area.flipbookFrames or 1,
-		fps = area.flipbookFPS or 12,
-		frameW = area.flipbookFrameW or 128,
-		frameH = area.flipbookFrameH or 128,
-		columns = area.flipbookColumns or area.flipbookFrames or 1,
-	}
+local function GetRootPart(instance)
+	if instance:IsA("Model") then return instance.PrimaryPart or instance:FindFirstChildWhichIsA("BasePart") end
+	return instance
 end
 
-function AreaRegistry.GetLighting(idx)
-	local area = AreaRegistry.Areas[idx]
-	if not area or not area.lightingPreset then return AreaRegistry.LightingPresets["ClearDay"] end
-	return AreaRegistry.LightingPresets[area.lightingPreset] or AreaRegistry.LightingPresets["ClearDay"]
-end
-
-function AreaRegistry.GetMaxArea()
-	local max = 0
-	for k in pairs(AreaRegistry.Areas) do if k > max then max = k end end
-	return max
-end
-
-function AreaRegistry.GetBestNextArea(currentArea, farmEvaluation)
-	local maxArea  = AreaRegistry.GetMaxArea()
-	local bestArea = nil
-	for i = currentArea + 1, maxArea do
-		local area = AreaRegistry.Areas[i]
-		if area and farmEvaluation >= (area.threshold or 0) then
-			bestArea = i
+local function ApplyHeavyPhysics(instance)
+	local heavyProps = PhysicalProperties.new(100, 0.3, 0, 1, 100) 
+	if instance:IsA("BasePart") then instance.CustomPhysicalProperties = heavyProps
+	elseif instance:IsA("Model") then
+		for _, part in ipairs(instance:GetDescendants()) do
+			if part:IsA("BasePart") then part.CustomPhysicalProperties = heavyProps end
 		end
 	end
-	return bestArea
 end
 
-function AreaRegistry.CanAdvance(currentArea, farmEvaluation)
-	local best = AreaRegistry.GetBestNextArea(currentArea, farmEvaluation)
-	if best then return true, best end
-	return false, nil
+local function SpawnAuraInstance(tierName, color, glow, position, currentArea)
+	currentArea = currentArea or 1
+	local auraModel = PoolManager.GetAura(currentArea, tierName)
+
+	if auraModel:IsA("Model") then
+		auraModel:PivotTo(CFrame.new(position))
+		if auraModel.PrimaryPart then
+			auraModel.PrimaryPart.Anchored = false
+			auraModel.PrimaryPart.CanCollide = true
+			auraModel.PrimaryPart.CollisionGroup = "Auras"
+		end
+	elseif auraModel:IsA("BasePart") then
+		auraModel.Position = position
+		auraModel.Anchored = false
+		auraModel.CanCollide = true
+		auraModel.CollisionGroup = "Auras"
+		auraModel.Color = color
+		if glow then
+			local light = auraModel:FindFirstChildOfClass("PointLight")
+			if not light then light = Instance.new("PointLight"); light.Parent = auraModel end
+			light.Brightness = 3; light.Range = 8; light.Color = color
+		end
+	end
+
+	for _, desc in ipairs(auraModel:GetDescendants()) do
+		if desc:IsA("ParticleEmitter") or desc:IsA("Trail") then
+			desc.Enabled = true
+		end
+	end
+
+	auraModel.Parent = workspace
+	ApplyHeavyPhysics(auraModel)
+	return auraModel, true
 end
 
--- =====================================================================
--- [NEW] 3-STEP FALLBACK HELPER: FETCHES 3D MODEL SAFELY
--- =====================================================================
-function AreaRegistry.FetchAuraModel(areaIndex, rarityName)
-	local ReplicatedStorage = game:GetService("ReplicatedStorage")
-	local AreaAssets = ReplicatedStorage:FindFirstChild("AreaAssets")
-	local GlobalAuras = ReplicatedStorage:FindFirstChild("Auras")
+local function ScaleAura(instance, tierName, animated, fromTierName)
+	local targetScale = TierScale[tierName] or 1.0
+	local fromScale = fromTierName and (TierScale[fromTierName] or 1.0) or nil
 
-	local areaConfig = AreaRegistry.Areas[areaIndex]
-	if not areaConfig then return nil end
+	if instance:IsA("Model") then
+		if animated then
+			local scaleProxy = Instance.new("NumberValue")
+			scaleProxy.Value = fromScale or 1.0
+			local scaleTween = TweenService:Create(scaleProxy, TweenInfo.new(0.6, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Value = targetScale })
+			local conn
+			conn = scaleProxy.Changed:Connect(function(val)
+				if instance and instance.Parent then pcall(function() instance:ScaleTo(val) end) else conn:Disconnect() end
+			end)
+			scaleTween:Play()
+			scaleTween.Completed:Connect(function() scaleProxy:Destroy(); if conn then conn:Disconnect() end end)
+		else
+			pcall(function() instance:ScaleTo(targetScale) end)
+		end
+	elseif instance:IsA("BasePart") then
+		local baseSize = 1.5
+		local targetSize = Vector3.new(1, 1, 1) * (baseSize * targetScale)
+		if animated then
+			if fromScale then instance.Size = Vector3.new(1, 1, 1) * (baseSize * fromScale) end
+			TweenService:Create(instance, TweenInfo.new(0.6, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Size = targetSize }):Play()
+		else
+			instance.Size = targetSize
+		end
+	end
+end
 
-	-- Step 1: Look up the mapped name (e.g., "CorrodedCore")
-	local expectedModelName = areaConfig.auraModels and areaConfig.auraModels[rarityName]
+---------------------------------------------------------------
+-- VFX SYSTEM
+---------------------------------------------------------------
+local function PlayVFX(effectName, position, duration)
+	if not VFXFolder then return end
+	local template = VFXFolder:FindFirstChild(effectName)
+	if not template then return end
+	local vfx = template:Clone()
 
-	if expectedModelName and AreaAssets then
-		-- Step 2: Look for it in ReplicatedStorage > AreaAssets > Area[X] > Auras
-		local areaFolder = AreaAssets:FindFirstChild("Area" .. tostring(areaIndex))
-		if areaFolder and areaFolder:FindFirstChild("Auras") then
-			local specificModel = areaFolder.Auras:FindFirstChild(expectedModelName)
-			if specificModel then
-				return specificModel:Clone() -- Found specific!
+	if vfx:IsA("Model") then vfx:PivotTo(CFrame.new(position))
+	elseif vfx:IsA("BasePart") then vfx.Position = position end
+
+	for _, obj in ipairs(vfx:GetDescendants()) do
+		if obj:IsA("BasePart") then
+			obj.Anchored = true; obj.Transparency = 1; obj.CanCollide = false; obj.CastShadow = false
+		end
+	end
+	if vfx:IsA("BasePart") then
+		vfx.Anchored = true; vfx.Transparency = 1; vfx.CanCollide = false; vfx.CastShadow = false
+	end
+	vfx.Parent = workspace
+
+	for _, emitter in ipairs(vfx:GetDescendants()) do
+		if emitter:IsA("ParticleEmitter") then
+			emitter.Enabled = true; emitter:Emit(emitter:GetAttribute("BurstCount") or 15)
+		end
+	end
+	task.delay((duration or 1.0) * 0.5, function()
+		if vfx and vfx.Parent then
+			for _, emitter in ipairs(vfx:GetDescendants()) do
+				if emitter:IsA("ParticleEmitter") then emitter.Enabled = false end
 			end
 		end
-		warn("[AreaRegistry] Missing physical model: " .. expectedModelName .. " in Area" .. tostring(areaIndex) .. ". Falling back to placeholder.")
-	end
+	end)
+	Debris:AddItem(vfx, duration or 1.5)
+end
 
-	-- Step 3: Fallback to the Global Blueprint Folder
-	if GlobalAuras then
-		local placeholderModel = GlobalAuras:FindFirstChild(rarityName)
-		if placeholderModel then
-			return placeholderModel:Clone() -- Found placeholder!
+---------------------------------------------------------------
+-- GAMEPLAY VISUAL LOGIC
+---------------------------------------------------------------
+local function GetCurrentMultiplier()
+	if not holding or not holdStart then return 1.0, 1 end
+	local holdTime = tick() - holdStart
+	local effectiveTime = holdTime * playerMultSpeed 
+
+	local currentTier = 1; local nextTier = 1
+	for i = 1, playerMaxTier do
+		if effectiveTime >= MilestoneData[i].time then
+			currentTier = i; nextTier = math.min(i + 1, playerMaxTier)
 		end
 	end
 
-	warn("CRITICAL [AreaRegistry]: No custom model OR placeholder found for rarity: " .. tostring(rarityName))
+	if currentTier == playerMaxTier then return MilestoneData[currentTier].mult, currentTier end
+
+	local timePassedInTier = effectiveTime - MilestoneData[currentTier].time
+	local timeNeededForNext = MilestoneData[nextTier].time - MilestoneData[currentTier].time
+	local progressRatio = timePassedInTier / timeNeededForNext
+
+	local currentMult = MilestoneData[currentTier].mult
+	local nextMult = MilestoneData[nextTier].mult
+	local smoothMult = currentMult + ((nextMult - currentMult) * progressRatio)
+
+	return smoothMult, currentTier
+end
+
+local function PlayMilestoneSound(soundValue)
+	if not soundValue or soundValue == "" then return end
+	local sfxToPlay = nil
+	if string.find(soundValue, "rbxassetid://") then
+		sfxToPlay = Instance.new("Sound"); sfxToPlay.SoundId = soundValue; sfxToPlay.Volume = 0.6
+	else
+		local sfxFolder = ReplicatedStorage:FindFirstChild("SFX") or ReplicatedStorage:FindFirstChild("Sounds")
+		if sfxFolder then
+			local foundSound = sfxFolder:FindFirstChild(soundValue)
+			if foundSound then sfxToPlay = foundSound:Clone(); sfxToPlay.Volume = 0.6 end
+		end
+	end
+	if sfxToPlay then
+		sfxToPlay.Parent = game:GetService("SoundService"); sfxToPlay:Play()
+		Debris:AddItem(sfxToPlay, sfxToPlay.TimeLength > 0 and sfxToPlay.TimeLength or 3)
+	end
+end
+
+local function SpawnMilestonePopup(multFloor)
+	local data = MilestoneData[multFloor]
+	if not data then return end 
+
+	PlayMilestoneSound(data.sound)
+
+	local pop = Instance.new("TextLabel")
+	pop.Text = data.name .. " (" .. string.format("%.1f", data.mult) .. "x)"
+	pop.Font = Enum.Font.FredokaOne; pop.TextScaled = true; pop.TextColor3 = data.color
+	pop.BackgroundTransparency = 1; pop.AnchorPoint = Vector2.new(0.5, 0.5)
+
+	pop.Position = UDim2.new(
+		ClickButton.Position.X.Scale, ClickButton.Position.X.Offset, 
+		ClickButton.Position.Y.Scale - 0.15, ClickButton.Position.Y.Offset
+	)
+	pop.Parent = ClickButton.Parent
+
+	local stroke = Instance.new("UIStroke", pop); stroke.Thickness = 3; stroke.Color = Color3.fromRGB(0, 0, 0)
+	pop.Size = UDim2.new(0.1, 0, 0.02, 0) 
+
+	TweenService:Create(pop, TweenInfo.new(0.4, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+		Size = UDim2.new(0.35, 0, 0.08, 0),
+		Position = UDim2.new(pop.Position.X.Scale, pop.Position.X.Offset, ClickButton.Position.Y.Scale - 0.25, ClickButton.Position.Y.Offset)
+	}):Play()
+
+	task.delay(0.6, function()
+		TweenService:Create(pop, TweenInfo.new(0.3), {TextTransparency = 1}):Play()
+		TweenService:Create(stroke, TweenInfo.new(0.3), {Transparency = 1}):Play()
+		task.delay(0.3, function() pop:Destroy() end)
+	end)
+end
+
+local function UpdateButtonVisual()
+	local col; local mult = 1; local currentTierIndex = 1
+	if habitatFull then col = Color3.fromRGB(180, 60, 60)
+	elseif not holding then col = Color3.fromRGB(255, 0, 0)
+	else
+		mult, currentTierIndex = GetCurrentMultiplier()
+		col = MilestoneData[currentTierIndex].color
+		UpdateMultiplier:Fire(mult)
+	end
+
+	local targetFOV = defaultFOV + (mult * 1.2)
+	if not holding then targetFOV = defaultFOV end
+	TweenService:Create(Camera, TweenInfo.new(0.3, Enum.EasingStyle.Sine), {FieldOfView = targetFOV}):Play()
+
+	if holding then
+		if currentTierIndex > lastTierIndex then
+			if currentTierIndex > 1 then SpawnMilestonePopup(currentTierIndex) end
+			lastTierIndex = currentTierIndex
+		end
+	else lastTierIndex = 1 end
+
+	TweenService:Create(ClickButton, TweenInfo.new(0.2), { BackgroundColor3 = col }):Play()
+
+	if holding and not habitatFull then
+		tiltSide = tiltSide * -1 
+		if mult >= 5.0 then 
+			TweenService:Create(ClickButton, TweenInfo.new(0.05, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, 0, true), { Rotation = 8 * tiltSide }):Play()
+			clickStroke.Thickness = 12; clickStroke.Transparency = 0
+			TweenService:Create(clickStroke, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Thickness = 0, Transparency = 1}):Play()
+		else
+			TweenService:Create(ClickButton, TweenInfo.new(0.08, Enum.EasingStyle.Sine, Enum.EasingDirection.Out, 0, true), { Rotation = 3 * tiltSide }):Play()
+		end
+	elseif not holding then
+		TweenService:Create(ClickButton, TweenInfo.new(0.15, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Rotation = 0}):Play()
+		TweenService:Create(clickScale, TweenInfo.new(0.15), {Scale = 1}):Play()
+	end
+end
+
+local function UpdateHatcheryBar(current, max)
+	local ratio = math.clamp(current / max, 0, 1)
+	TweenService:Create(HatcheryFill, TweenInfo.new(0.1), { Size = UDim2.new(ratio, 0, 1, 0) }):Play()
+
+	local color = Color3.fromRGB(255, 60, 60)
+	if ratio > 0.5 then color = Color3.fromRGB(80, 220, 80)
+	elseif ratio > 0.25 then color = Color3.fromRGB(255, 200, 0) end
+
+	TweenService:Create(HatcheryFill, TweenInfo.new(0.1), { BackgroundColor3 = color }):Play()
+	HatcheryLabel.Text = "Hatchery: " .. math.floor(current) .. " / " .. max
+	hatcheryEmpty = (current <= 0)
+end
+
+local function FlashEmpty()
+	TweenService:Create(HatcheryFill, TweenInfo.new(0.1), { BackgroundColor3 = Color3.fromRGB(255, 255, 255) }):Play()
+	task.delay(0.1, function() TweenService:Create(HatcheryFill, TweenInfo.new(0.1), { BackgroundColor3 = Color3.fromRGB(255, 60, 60) }):Play() end)
+end
+
+local function ShowTierPopup(position, tierName, tierColor)
+	local anchor = Instance.new("Part"); anchor.Size = Vector3.new(0.1, 0.1, 0.1); anchor.Anchored = true; anchor.Transparency = 1; anchor.CanCollide = false
+	anchor.Position = position + Vector3.new(0, 3, 0); anchor.Parent = workspace
+
+	local bb = Instance.new("BillboardGui"); bb.Size = UDim2.new(0, 120, 0, 40); bb.StudsOffset = Vector3.new(0, 2, 0)
+	bb.AlwaysOnTop = false; bb.Adornee = anchor; bb.Parent = anchor
+
+	local label = Instance.new("TextLabel"); label.Size = UDim2.new(1, 0, 1, 0); label.BackgroundTransparency = 1
+	label.Text = tierName:upper(); label.TextColor3 = tierColor; label.TextScaled = true
+	label.Font = Enum.Font.GothamBold; label.TextStrokeTransparency = 0.3; label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0); label.Parent = bb
+
+	TweenService:Create(bb, TweenInfo.new(1.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { StudsOffset = Vector3.new(0, 6, 0) }):Play()
+	TweenService:Create(label, TweenInfo.new(1.5, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { TextTransparency = 1, TextStrokeTransparency = 1 }):Play()
+	Debris:AddItem(anchor, 2)
+end
+
+local function ShowCubeValue(position, value, color)
+	local anchor = Instance.new("Part"); anchor.Size = Vector3.new(0.1, 0.1, 0.1); anchor.Anchored = true; anchor.Transparency = 1; anchor.CanCollide = false
+	anchor.Position = position + Vector3.new(math.random(-1, 1), 2, math.random(-1, 1)); anchor.Parent = workspace
+
+	local bb = Instance.new("BillboardGui"); bb.Size = UDim2.new(0, 80, 0, 25); bb.StudsOffset = Vector3.new(0, 0, 0)
+	bb.AlwaysOnTop = false; bb.Adornee = anchor; bb.Parent = anchor
+
+	local label = Instance.new("TextLabel"); label.Size = UDim2.new(1, 0, 1, 0); label.BackgroundTransparency = 1
+	label.Text = "Value: $" .. FormatNumber(value); label.TextColor3 = Color3.fromRGB(255, 255, 255); label.TextScaled = true
+	label.Font = Enum.Font.Gotham; label.TextStrokeTransparency = 0.4; label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0); label.Parent = bb
+
+	TweenService:Create(bb, TweenInfo.new(1.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { StudsOffset = Vector3.new(0, 4, 0) }):Play()
+	TweenService:Create(label, TweenInfo.new(1.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { TextTransparency = 1, TextStrokeTransparency = 1 }):Play()
+	Debris:AddItem(anchor, 1.5)
+end
+
+local function AttachPermanentRateLabel(auraInstance, baseValue, auraColor)
+	local rootPart = GetRootPart(auraInstance)
+	if not rootPart then return end
+
+	local bb = Instance.new("BillboardGui"); bb.Name = "PermanentRateLabel"; bb.Size = UDim2.new(0, 90, 0, 25); bb.StudsOffset = Vector3.new(0, 0.5, 0); bb.AlwaysOnTop = false; bb.Adornee = rootPart
+
+	local label = Instance.new("TextLabel"); label.Size = UDim2.new(1, 0, 1, 0); label.BackgroundTransparency = 1
+	local ratePerSec = baseValue / currentPassiveInterval
+	label.Text = "+$" .. FormatNumber(ratePerSec) .. "/sec"
+
+	label.TextColor3 = auraColor or Color3.fromRGB(100, 255, 100); label.Font = Enum.Font.GothamBold; label.TextScaled = true
+	label.TextTransparency = 0.2; label.TextStrokeTransparency = 0.6; label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0); label.Parent = bb
+
+	bb.Parent = rootPart
+	return label -- We return the TextLabel
+end
+
+---------------------------------------------------------------
+-- ✨ DYNAMIC LABEL REFRESH
+---------------------------------------------------------------
+local function RefreshAllRateLabels()
+	for id, data in pairs(cubeDataMap) do
+		if data.rateLabel and data.baseValue and not data.isStored then
+			local ratePerSec = (data.baseValue * globalBoostMultiplier) / currentPassiveInterval
+			data.rateLabel.Text = "+$" .. FormatNumber(ratePerSec) .. "/sec"
+
+			if data.rateLabel.Parent then
+				local scale = data.rateLabel.Parent:FindFirstChildOfClass("UIScale") or Instance.new("UIScale", data.rateLabel.Parent)
+				TweenService:Create(scale, TweenInfo.new(0.2, Enum.EasingStyle.Bounce), {Scale = 1.2}):Play()
+				task.delay(0.2, function() TweenService:Create(scale, TweenInfo.new(0.2), {Scale = 1}):Play() end)
+			end
+		end
+	end
+end
+
+---------------------------------------------------------------
+-- DYNAMIC TRIGGER HOOKS
+---------------------------------------------------------------
+local AuraHolder = workspace:WaitForChild("AuraHolder")
+local HabitatHolder = workspace:WaitForChild("HabitatHolder")
+
+local function UpdateHabitatBar(actualPending, max)
+	local offset = player:GetAttribute("HabitatVisualOffset") or 0
+	local current = actualPending + offset
+
+	local habitatModel = HabitatHolder:FindFirstChildWhichIsA("Model")
+	if not habitatModel then return end
+
+	local habitatGui = habitatModel:FindFirstChild("HabitatGui", true)
+	if not habitatGui then return end
+
+	local bg = habitatGui:FindFirstChild("BarBackground")
+	if not bg then return end
+
+	local fill = bg:FindFirstChild("BarFill")
+	local textLabel = bg:FindFirstChild("CountLabel") or bg:FindFirstChild("AmountLabel")
+
+	if fill and max > 0 then
+		local ratio = math.clamp(current / max, 0, 1)
+
+		TweenService:Create(fill, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+			Size = UDim2.new(ratio, 0, 1, 0)
+		}):Play()
+
+		local targetColor = Color3.fromRGB(80, 220, 80)
+		if ratio >= 1 then targetColor = Color3.fromRGB(255, 60, 60)
+		elseif ratio >= 0.8 then targetColor = Color3.fromRGB(255, 200, 0) end
+
+		TweenService:Create(fill, TweenInfo.new(0.2), {BackgroundColor3 = targetColor}):Play()
+
+		if textLabel then
+			if current >= max then
+				textLabel.Text = "FULL!"
+				textLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+			else
+				textLabel.Text = math.floor(current) .. " / " .. max
+				textLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+			end
+		end
+	end
+end
+
+player:GetAttributeChangedSignal("HabitatVisualOffset"):Connect(function()
+	UpdateHabitatBar(latestPendingAuras, latestHabitatCapacity)
+end)
+
+local function GetAuraCubeFromHit(hit)
+	if hit:GetAttribute("AuraCube") then return hit end
+	local p = hit.Parent; if p and p:GetAttribute("AuraCube") then return p end
+	local m = hit:FindFirstAncestorWhichIsA("Model"); if m and m:GetAttribute("AuraCube") then return m end
 	return nil
 end
 
-return AreaRegistry
+local function HookAuraModel(model)
+	task.delay(0.1, function()
+		local smush = model:FindFirstChild("SmushTrigger", true)
+		if smush then
+			smush.Touched:Connect(function(hit)
+				local auraObj = GetAuraCubeFromHit(hit)
+				if auraObj then
+					for id, data in pairs(cubeDataMap) do
+						if data.instance == auraObj then
+							if data.isStored then return end
+							CubeSmushedBridge:Fire(id)
+							local root = GetRootPart(auraObj)
+							local pos = (root and root.Position) or hit.Position
+							PlayVFX("Spawn", pos, 0.5) 
+
+							PoolManager.ReturnAura(data.instance) 
+							cubeDataMap[id] = nil
+							break
+						end
+					end
+				end
+			end)
+		end
+
+		for _, conveyer in ipairs(model:GetDescendants()) do
+			if (conveyer.Name == "ConveyerPath" or conveyer.Name == "ConveyerPathCorner") and conveyer:IsA("BasePart") then
+				local forwardBeam = conveyer:FindFirstChild("Foward") or conveyer:FindFirstChild("Forward")
+				local backwardBeam = conveyer:FindFirstChild("Backward")
+
+				if forwardBeam then forwardBeam.Enabled = not habitatFull end
+				if backwardBeam then backwardBeam.Enabled = habitatFull end
+
+				if not conveyer:GetAttribute("OriginalVelocity") then
+					conveyer:SetAttribute("OriginalVelocity", conveyer.AssemblyLinearVelocity)
+				end
+
+				local origVel = conveyer:GetAttribute("OriginalVelocity")
+
+				if habitatFull then 
+					conveyer.AssemblyLinearVelocity = origVel * -2
+				else 
+					conveyer.AssemblyLinearVelocity = origVel 
+				end
+			end
+		end
+
+		local storageBelt = model:FindFirstChild("StorageBelt", true)
+		if not storageBelt then
+			local habModel = HabitatHolder:FindFirstChildWhichIsA("Model")
+			if habModel then storageBelt = habModel:FindFirstChild("StorageBelt", true) end
+		end
+
+		if storageBelt and storageBelt:IsA("BasePart") then
+			if not storageBelt:GetAttribute("OriginalVelocity") then
+				storageBelt:SetAttribute("OriginalVelocity", storageBelt.AssemblyLinearVelocity)
+			end
+
+			local origVel = storageBelt:GetAttribute("OriginalVelocity")
+
+			if habitatFull then
+				storageBelt.AssemblyLinearVelocity = origVel * -2
+			else
+				storageBelt.AssemblyLinearVelocity = origVel
+			end
+		end
+	end)
+end
+
+local function HookHabitatModel(model)
+	task.delay(0.1, function()
+		local storage = model:FindFirstChild("StorageTrigger", true)
+		if storage then
+			storage.Touched:Connect(function(hit)
+				local auraObj = GetAuraCubeFromHit(hit)
+				if auraObj then
+					for id, data in pairs(cubeDataMap) do
+						if data.instance == auraObj and not data.isStored then
+							data.isStored = true
+
+							if data.rateLabel and data.rateLabel.Parent and data.rateLabel.Parent:IsA("BillboardGui") then 
+								data.rateLabel.Parent.Enabled = false 
+							end
+
+							local root = GetRootPart(auraObj)
+							if root then
+								local dropOffset = Vector3.new(-10, 4, math.random(-4, 4))
+								auraObj:PivotTo(CFrame.new(storage.Position + dropOffset))
+								root.AssemblyLinearVelocity = Vector3.new(0, -10, 0)
+								root.AssemblyAngularVelocity = Vector3.new(math.random(-5, 5), math.random(-5, 5), math.random(-5, 5))
+							end
+
+							CubeStoredBridge:Fire(id)
+							break
+						end
+					end
+				end
+			end)
+		end
+	end)
+end
+
+AuraHolder.ChildAdded:Connect(function(child) if child:IsA("Model") then HookAuraModel(child) end end)
+HabitatHolder.ChildAdded:Connect(function(child) if child:IsA("Model") then HookHabitatModel(child) end end)
+
+for _, child in ipairs(AuraHolder:GetChildren()) do if child:IsA("Model") then HookAuraModel(child) end end
+for _, child in ipairs(HabitatHolder:GetChildren()) do if child:IsA("Model") then HookHabitatModel(child) end end
+
+---------------------------------------------------------------
+-- INPUT CONTROLS & TUTORIAL GATING
+---------------------------------------------------------------
+local trackedInputs = {}
+
+local function EvaluateHolding()
+	local hasInput = false
+	for _, _ in pairs(trackedInputs) do hasInput = true; break end
+
+	if hasInput and not holding then
+		if type(shared.TutorialCanPerform) == "function" then
+			if not shared.TutorialCanPerform("Action_ClickRedButton") then table.clear(trackedInputs); return end
+		end
+
+		if hatcheryEmpty then FlashEmpty() return end
+		if habitatFull then return end
+
+		holding = true; holdStart = tick()
+		TweenService:Create(clickScale, TweenInfo.new(0.1, Enum.EasingStyle.Sine), {Scale = 0.9}):Play()
+		ProduceAuraBridge:Fire("start")
+
+		if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
+	elseif not hasInput and holding then
+		holding = false; holdStart = nil
+		ProduceAuraBridge:Fire("stop")
+		UpdateButtonVisual(); UpdateMultiplier:Fire(1.0)
+	end
+end
+
+ClickButton.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		trackedInputs[input] = true; EvaluateHolding()
+	end
+end)
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if input.KeyCode == Enum.KeyCode.Space and not UserInputService:GetFocusedTextBox() then
+		trackedInputs[input] = true; EvaluateHolding()
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	if trackedInputs[input] then trackedInputs[input] = nil; EvaluateHolding() end
+end)
+
+UserInputService.WindowFocusReleased:Connect(function()
+	table.clear(trackedInputs); EvaluateHolding()
+end)
+
+ForceStopHold.OnClientEvent:Connect(function()
+	table.clear(trackedInputs); EvaluateHolding()
+end)
+
+HabitatFull.OnClientEvent:Connect(function()
+	habitatFull = true; HabitatFullEvent:Fire(true); table.clear(trackedInputs); EvaluateHolding()
+end)
+
+HabitatFullEvent.Event:Connect(function(isFull)
+	habitatFull = isFull
+	if not isFull then 
+		UpdateButtonVisual() 
+	end
+
+	-- ✨ FIX: Loop through ALL aura models, and ALL of their ConveyerPaths
+	for _, auraModel in ipairs(AuraHolder:GetChildren()) do
+		if auraModel:IsA("Model") then
+			for _, conveyer in ipairs(auraModel:GetDescendants()) do
+				if conveyer.Name == "ConveyerPath" and conveyer:IsA("BasePart") then
+					local forwardBeam = conveyer:FindFirstChild("Foward") or conveyer:FindFirstChild("Forward")
+					local backwardBeam = conveyer:FindFirstChild("Backward")
+
+					-- ✨ DYNAMIC VELOCITY: Uses the part's local X-axis instead of the world's X-axis
+					if isFull then 
+						conveyer.AssemblyLinearVelocity = conveyer.CFrame.RightVector * 10 
+						if forwardBeam then forwardBeam.Enabled = false end
+						if backwardBeam then backwardBeam.Enabled = true end
+					else 
+						conveyer.AssemblyLinearVelocity = conveyer.CFrame.RightVector * -5 
+						if forwardBeam then forwardBeam.Enabled = true end
+						if backwardBeam then backwardBeam.Enabled = false end
+					end
+				elseif conveyer.Name == "ConveyerPathCorner" and conveyer:IsA("BasePart") then
+					-- Extremely simple backwards logic for corners
+					if isFull then 
+						conveyer.AssemblyLinearVelocity = Vector3.new(10, 0, 0)
+					else 
+						conveyer.AssemblyLinearVelocity = Vector3.new(-5, 0, 0)
+					end
+				end
+			end
+		end
+	end
+end)
+
+UpdateHatcheryBridge:Connect(function(info)
+	local finalMax = info.max
+	local localHatchLvl = player:GetAttribute("LocalHatcheryLevel")
+
+	if localHatchLvl then
+		local UpgradeConfig = require(ReplicatedStorage.Modules.UpgradeConfig)
+		local cfg = UpgradeConfig.GetUpgradeConfig("hatcheryCapacity")
+		if cfg and cfg.apply then
+			local predictedMax = cfg.apply({ upgrades = { hatcheryCapacity = localHatchLvl } })
+			finalMax = math.max(info.max, predictedMax)
+		end
+	end
+	UpdateHatcheryBar(info.current, finalMax)
+end)
+
+local localUpgradesState = {}
+
+local function RecalculateMaxTier()
+	local speedData = localUpgradesState["multiplierSpeed"]
+	local speedLevel = (typeof(speedData) == "table" and speedData.level) or (typeof(speedData) == "number" and speedData) or 0
+	playerMultSpeed = 1.0 + (speedLevel * 0.05) 
+
+	local tierUnlocks = {
+		{ upgradeId = "unlockOmniMult",      tier = 10 },
+		{ upgradeId = "unlockUniversalMult", tier = 9 },
+		{ upgradeId = "unlockGodlyMult",     tier = 8 },
+		{ upgradeId = "unlockCosmicMult",    tier = 7 },
+		{ upgradeId = "unlockMythicMult",    tier = 6 },
+	}
+
+	local calculatedMaxTier = 5 
+	for _, data in ipairs(tierUnlocks) do
+		local upgData = localUpgradesState[data.upgradeId]
+		local level = (typeof(upgData) == "table" and upgData.level) or (typeof(upgData) == "number" and upgData) or 0
+		if level > 0 then calculatedMaxTier = data.tier; break end
+	end
+	playerMaxTier = calculatedMaxTier
+end
+
+ReplicatedStorage.RemoteEvents.UpgradeUpdated.OnClientEvent:Connect(function(info)
+	if not info then return end
+	if info.type == "fullState" and info.upgrades then
+		localUpgradesState = info.upgrades; RecalculateMaxTier()
+	elseif info.type == "purchased" then
+		if not localUpgradesState[info.upgradeId] then localUpgradesState[info.upgradeId] = {} end
+		if type(localUpgradesState[info.upgradeId]) == "number" then localUpgradesState[info.upgradeId] = { level = info.level }
+		else localUpgradesState[info.upgradeId].level = info.level end
+		RecalculateMaxTier()
+	end
+end)
+
+local EpicUpgradeUpdated = ReplicatedStorage.RemoteEvents:FindFirstChild("EpicUpgradeUpdated")
+if EpicUpgradeUpdated then
+	EpicUpgradeUpdated.OnClientEvent:Connect(function(info)
+		if not info then return end
+		if info.type == "fullState" and info.upgrades then
+			for k,v in pairs(info.upgrades) do localUpgradesState[k] = v end; RecalculateMaxTier()
+		elseif info.type == "purchased" then
+			if not localUpgradesState[info.upgradeId] then localUpgradesState[info.upgradeId] = {} end
+			if type(localUpgradesState[info.upgradeId]) == "number" then localUpgradesState[info.upgradeId] = { level = info.level }
+			else localUpgradesState[info.upgradeId].level = info.level end
+			RecalculateMaxTier()
+		end
+	end)
+end
+
+UpdateHUDBridge:Connect(function(stats)
+	local needsRefresh = false
+
+	if stats.passiveInterval ~= nil and stats.passiveInterval ~= currentPassiveInterval then 
+		currentPassiveInterval = stats.passiveInterval
+		needsRefresh = true
+	end
+
+	if stats.boostMultiplier ~= nil and stats.boostMultiplier ~= globalBoostMultiplier then
+		globalBoostMultiplier = stats.boostMultiplier
+		needsRefresh = true
+	end
+
+	if stats.currentFireRate ~= nil then
+		currentFireRate = stats.currentFireRate
+	end
+
+	if stats.upgrades then
+		for k, v in pairs(stats.upgrades) do localUpgradesState[k] = v end
+		RecalculateMaxTier()
+	end
+
+	if stats.pendingAuras ~= nil and stats.habitatCapacity ~= nil then
+		latestPendingAuras = stats.pendingAuras
+		latestHabitatCapacity = stats.habitatCapacity
+
+		if stats.pendingAuras < stats.habitatCapacity and habitatFull then
+			habitatFull = false; HabitatFullEvent:Fire(false); UpdateButtonVisual()
+		end
+		UpdateHabitatBar(stats.pendingAuras, stats.habitatCapacity)
+	end
+
+	if needsRefresh then RefreshAllRateLabels() end
+end)
+
+task.spawn(function()
+	while true do
+		if holding then
+			if hatcheryEmpty or habitatFull then
+				table.clear(trackedInputs); EvaluateHolding()
+			else
+				ProduceAuraBridge:Fire(); UpdateButtonVisual()
+			end
+		end
+		task.wait(currentFireRate)
+	end
+end)
+
+---------------------------------------------------------------
+-- AURA MUTATION RESPONSES (BRIDGENET2)
+---------------------------------------------------------------
+AuraSpawnedBridge:Connect(function(info)
+	local instance, isCustom = SpawnAuraInstance(info.tier, info.color, info.glow, info.spawnPos, info.currentArea)
+
+	instance:SetAttribute("AuraCube", true)
+	ScaleAura(instance, info.tier, false)
+	ShowCubeValue(info.spawnPos, info.value, info.color)
+	PlayVFX("Spawn", info.spawnPos, 1.0)
+
+	local permLabel = AttachPermanentRateLabel(instance, info.value, info.color)
+
+	if info.tier == "Legendary" then
+		ShowTierPopup(info.spawnPos, "Legendary", Color3.fromRGB(255, 200, 0))
+		PlayVFX("Legendary", info.spawnPos, 2.0)
+	end
+
+	if info.cubeId then
+		cubeDataMap[info.cubeId] = { 
+			instance = instance, 
+			tierName = info.tier, 
+			isCustom = isCustom,
+			rateLabel = permLabel,
+			baseValue = info.value 
+		}
+		instance.AncestryChanged:Connect(function(_, parent)
+			if not parent then cubeDataMap[info.cubeId] = nil end
+		end)
+	end
+end)
+
+CubeMutatedBatchBridge:Connect(function(batchData)
+	for _, info in ipairs(batchData) do
+		local cubeData = cubeDataMap[info.cubeId]
+		if not cubeData then continue end 
+
+		if info.newValue then
+			cubeData.baseValue = info.newValue
+		end
+
+		local instance = cubeData.instance
+		if not instance or not instance.Parent then continue end 
+
+		local rootPart = GetRootPart(instance)
+		if not rootPart then continue end 
+		local position = rootPart.Position
+
+		if info.mutationType == "tierUpgrade" then
+			PlayVFX("TierUpgrade", position, 1.5)
+			if info.tierName == "Legendary" then PlayVFX("Legendary", position, 2.0) end
+
+			local oldTierName = cubeData.tierName
+			local newAura = PoolManager.GetAura(info.currentArea, info.tierName)
+
+			if newAura:IsA("Model") then
+				newAura:PivotTo(CFrame.new(position))
+				if newAura.PrimaryPart then
+					newAura.PrimaryPart.Anchored = false
+					newAura.PrimaryPart.CanCollide = true
+					newAura.PrimaryPart.CollisionGroup = "Auras"
+				end
+			elseif newAura:IsA("BasePart") then
+				newAura.Position = position
+				newAura.Anchored = false
+				newAura.CanCollide = true
+				newAura.CollisionGroup = "Auras"
+				newAura.Color = info.newColor
+			end
+
+			for _, desc in ipairs(newAura:GetDescendants()) do
+				if desc:IsA("ParticleEmitter") or desc:IsA("Trail") then desc.Enabled = true end
+			end
+
+			newAura.Parent = workspace
+			newAura:SetAttribute("AuraCube", true)
+			ScaleAura(newAura, info.tierName, true, oldTierName)
+			ApplyHeavyPhysics(newAura)
+
+			if cubeData.rateLabel and cubeData.rateLabel.Parent and cubeData.rateLabel.Parent:IsA("BillboardGui") then
+				local bb = cubeData.rateLabel.Parent
+				bb.Adornee = GetRootPart(newAura)
+				bb.Parent = GetRootPart(newAura)
+				cubeData.rateLabel.TextColor3 = info.newColor or Color3.fromRGB(100, 255, 100)
+				if cubeData.isStored then bb.Enabled = false end
+			end
+
+			PoolManager.ReturnAura(instance)
+			cubeData.instance = newAura; cubeData.tierName = info.tierName; cubeData.isCustom = true
+			newAura.AncestryChanged:Connect(function(_, parent) if not parent then cubeDataMap[info.cubeId] = nil end end)
+
+			ShowTierPopup(position, info.tierName, info.newColor)
+		end
+
+		if cubeData.rateLabel and cubeData.rateLabel.Parent and not cubeData.isStored then
+			local ratePerSec = ((cubeData.baseValue or 0) * globalBoostMultiplier) / currentPassiveInterval
+			cubeData.rateLabel.Text = "+$" .. FormatNumber(ratePerSec) .. "/sec"
+		end
+	end
+end)
+
+---------------------------------------------------------------
+-- ✨ ANTI-STUCK / FALL-OFF FAILSAFE ✨
+---------------------------------------------------------------
+task.spawn(function()
+	while true do
+		task.wait(1.5)
+		local now = tick()
+
+		for id, data in pairs(cubeDataMap) do
+			if not data.isStored and data.instance and data.instance.Parent then
+				local root = GetRootPart(data.instance)
+				if root then
+					local currentPos = root.Position
+					if not data.spawnY then
+						data.spawnY = currentPos.Y; data.lastPos = currentPos; data.lastMovedTime = now
+					end
+					if currentPos.Y < data.spawnY - 12 then
+						CubeSmushedBridge:Fire(id)
+						PlayVFX("Spawn", currentPos, 0.5)
+						PoolManager.ReturnAura(data.instance)
+						cubeDataMap[id] = nil
+						continue
+					end
+
+					local dist = (currentPos - data.lastPos).Magnitude
+					if dist < 0.25 then
+						if now - data.lastMovedTime > 8 then
+							CubeSmushedBridge:Fire(id)
+							PlayVFX("Spawn", currentPos, 0.5)
+							PoolManager.ReturnAura(data.instance)
+							cubeDataMap[id] = nil
+						end
+					else
+						data.lastPos = currentPos; data.lastMovedTime = now
+					end
+				end
+			end
+		end
+	end
+end)
