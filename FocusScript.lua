@@ -1,1448 +1,1841 @@
--- ClickHandler
--- Location: StarterPlayer > StarterPlayerScripts > ClickHandler
+-- TutorialController
+-- Location: StarterPlayer > StarterPlayerScripts > TutorialController
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local TweenService = game:GetService("TweenService")
-local UserInputService = game:GetService("UserInputService")
-local Debris = game:GetService("Debris")
 local CollectionService = game:GetService("CollectionService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local Workspace = game:GetService("Workspace")
+local GuiService = game:GetService("GuiService")
+local TutorialConfig = require(ReplicatedStorage.Modules.TutorialConfig)
+local UITheme = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("UITheme"))
+local T = UITheme.Get("Custom")
+local SoundConfig = require(ReplicatedStorage.Modules.SoundConfig)
+local Formatter = require(ReplicatedStorage.Modules.NumberFormatter)
 
-local AdminConfig = require(ReplicatedStorage.Modules.AdminConfig)
-local UITheme = require(ReplicatedStorage.Modules.UITheme)
-local AreaRegistry = require(ReplicatedStorage.Modules.AreaRegistry) 
-local NumberFormatter = require(ReplicatedStorage.Modules.NumberFormatter)
+local RemoteEvents = ReplicatedStorage:WaitForChild("RemoteEvents")
+local TutorialStepComplete = RemoteEvents:WaitForChild("TutorialStepComplete", 10)
 
-local PoolManager = require(ReplicatedStorage.Modules:WaitForChild("PoolManager"))
+local BridgeNet2 = require(ReplicatedStorage.Modules:WaitForChild("BridgeNet2"))
+local UpdateHUDBridge = BridgeNet2.ClientBridge("UpdateHUD")
 
-local BridgeNet2             = require(ReplicatedStorage.Modules:WaitForChild("BridgeNet2"))
-local UpdateHUDBridge        = BridgeNet2.ClientBridge("UpdateHUD")
-local ProduceAuraBridge      = BridgeNet2.ClientBridge("ProduceAura")
-local AuraSpawnedBridge      = BridgeNet2.ClientBridge("AuraSpawned")
-local UpdateHatcheryBridge   = BridgeNet2.ClientBridge("UpdateHatchery")
-local CubeMutatedBatchBridge = BridgeNet2.ClientBridge("CubeMutatedBatch")
-local CubeSmushedBridge      = BridgeNet2.ClientBridge("CubeSmushed")
-local CubeStoredBridge       = BridgeNet2.ClientBridge("CubeStored") 
-
-local ForceStopHold = ReplicatedStorage.RemoteEvents:WaitForChild("ForceStopHold")
-local HabitatFull = ReplicatedStorage.RemoteEvents:WaitForChild("HabitatFull")
-local UpdateMultiplier = ReplicatedStorage:WaitForChild("UpdateMultiplier")
-local HabitatFullEvent = ReplicatedStorage:WaitForChild("HabitatFullEvent")
+local ForceCloseUI = ReplicatedStorage:FindFirstChild("ForceCloseUI")
+if not ForceCloseUI then
+	ForceCloseUI = Instance.new("BindableEvent")
+	ForceCloseUI.Name = "ForceCloseUI"
+	ForceCloseUI.Parent = ReplicatedStorage
+end
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
-local holding = false
-
--- Dynamic Sync State
-local currentFireRate = AdminConfig.FireRate 
-local globalBoostMultiplier = 1
-local currentPassiveInterval = AdminConfig.PassiveInterval
-
-local holdStart = nil
-local hatcheryEmpty = false
-local habitatFull = false
-
-local ClickButton = playerGui:WaitForChild("MainHUD"):WaitForChild("ClickButton")
-local HatcheryBar = playerGui:WaitForChild("MainHUD"):WaitForChild("HatcheryBar")
-local HatcheryFill = HatcheryBar:WaitForChild("Fill")
-local HatcheryLabel = HatcheryBar:WaitForChild("Label")
-
-local ModeToggle = playerGui:WaitForChild("MainHUD"):WaitForChild("ModeToggle")
-local SendButton = playerGui:WaitForChild("MainHUD"):WaitForChild("SendButton")
-
-CollectionService:AddTag(ClickButton, "Tutorial_ClickButton")
-CollectionService:AddTag(ModeToggle, "Tutorial_ToggleShipBtn")
-CollectionService:AddTag(SendButton, "Tutorial_SendShipBtn")
-
-local clickScale = ClickButton:FindFirstChildOfClass("UIScale") or Instance.new("UIScale", ClickButton)
-
-local ringFrame = ClickButton:FindFirstChild("ActionRing")
-if not ringFrame then
-	ringFrame = Instance.new("Frame")
-	ringFrame.Name = "ActionRing"
-	ringFrame.Size = UDim2.new(1, 0, 1, 0)
-	ringFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
-	ringFrame.AnchorPoint = Vector2.new(0.5, 0.5)
-	ringFrame.BackgroundTransparency = 1
-	ringFrame.ZIndex = ClickButton.ZIndex - 1
-
-	local btnCorner = ClickButton:FindFirstChildOfClass("UICorner")
-	if btnCorner then btnCorner:Clone().Parent = ringFrame end
-	ringFrame.Parent = ClickButton
-end
-
-local clickStroke = ringFrame:FindFirstChildOfClass("UIStroke") or Instance.new("UIStroke", ringFrame)
-clickStroke.Color = Color3.fromRGB(255, 215, 0)
-clickStroke.Thickness = 0
-clickStroke.Transparency = 1
-
-local basePos = ClickButton.Position
-local tiltSide = 1
-
-local Camera = workspace.CurrentCamera
-local defaultFOV = 70 
-local lastMilestone = 1
-
-local MilestoneData = AdminConfig.MilestoneData
-
-local playerMultSpeed = 1.0 
-local playerMaxTier = 5     
-local lastTierIndex = 1
-
-local latestPendingAuras = 0
-local latestHabitatCapacity = 50
-
-local function FormatNumber(n)
-	return NumberFormatter.Format(n)
-end	
+local camera = Workspace.CurrentCamera
 
 ---------------------------------------------------------------
--- AURA MODEL FOLDERS & INSTANTIATION
+-- STATE
 ---------------------------------------------------------------
-local VFXFolder = ReplicatedStorage:FindFirstChild("VFX")
-local cubeDataMap = {}
+local currentStepIndex = 1
+local tutorialComplete = false
+local tutorialActive = false
 
-local TierScale = {
-	Common    = 1.0,
-	Uncommon  = 1.15,
-	Rare      = 1.3,
-	Epic      = 1.5,
-	Legendary = 1.75,
+local activeFallbackStep = nil
+local lastDisplayedStepId = nil 
+
+local actionMatchedForAdvance = false 
+local isAdvancing = false 
+
+local liveStats = {
+	currency = 0,
+	totalEarned = 0,
+	farmEvaluation = 0,
+	soulAuras = 0,
+	goldenAuras = 0,
+	prestigeCount = 0,
+	currentArea = 1,
+	totalCubesProduced = 0,
+	totalPlatformsShipped = 0,
+	totalLegendaryCubes = 0,
+	piggyBank = 0,
+
+	pendingAuras = 0,
+	habitatCapacity = 99999,
+	rate = 0,
+	currentMultiplier = 1,
+
+	boostsBought = {},
+	boostsUsed = {}
 }
 
-local function GetRootPart(instance)
-	if instance:IsA("Model") then return instance.PrimaryPart or instance:FindFirstChildWhichIsA("BasePart") end
-	return instance
-end
-
-local function ApplyHeavyPhysics(instance)
-	local heavyProps = PhysicalProperties.new(100, 0.3, 0, 1, 100) 
-	if instance:IsA("BasePart") then instance.CustomPhysicalProperties = heavyProps
-	elseif instance:IsA("Model") then
-		for _, part in ipairs(instance:GetDescendants()) do
-			if part:IsA("BasePart") then part.CustomPhysicalProperties = heavyProps end
-		end
-	end
-end
-
-local function SpawnAuraInstance(tierName, color, glow, position, currentArea)
-	currentArea = currentArea or 1
-	local auraModel = PoolManager.GetAura(currentArea, tierName)
-
-	-- FIX: Prevent nil reference crash if PoolManager fails to return an aura
-	if not auraModel then
-		warn("PoolManager returned nil for Area: " .. tostring(currentArea) .. ", Tier: " .. tostring(tierName))
-		return nil, false
-	end
-
-	if auraModel:IsA("Model") then
-		auraModel:PivotTo(CFrame.new(position))
-		if auraModel.PrimaryPart then
-			auraModel.PrimaryPart.Anchored = false
-			auraModel.PrimaryPart.CanCollide = true
-			auraModel.PrimaryPart.CollisionGroup = "Auras"
-		end
-	elseif auraModel:IsA("BasePart") then
-		auraModel.Position = position
-		auraModel.Anchored = false
-		auraModel.CanCollide = true
-		auraModel.CollisionGroup = "Auras"
-		auraModel.Color = color
-		if glow then
-			local light = auraModel:FindFirstChildOfClass("PointLight")
-			if not light then light = Instance.new("PointLight"); light.Parent = auraModel end
-			light.Brightness = 3; light.Range = 8; light.Color = color
-		end
-	end
-
-	for _, desc in ipairs(auraModel:GetDescendants()) do
-		if desc:IsA("ParticleEmitter") or desc:IsA("Trail") then
-			desc.Enabled = true
-		end
-	end
-
-	auraModel.Parent = workspace
-	ApplyHeavyPhysics(auraModel)
-	return auraModel, true
-end
-
-local function ScaleAura(instance, tierName, animated, fromTierName)
-	local targetScale = TierScale[tierName] or 1.0
-	local fromScale = fromTierName and (TierScale[fromTierName] or 1.0) or nil
-
-	if instance:IsA("Model") then
-		if animated then
-			local scaleProxy = Instance.new("NumberValue")
-			scaleProxy.Value = fromScale or 1.0
-			local scaleTween = TweenService:Create(scaleProxy, TweenInfo.new(0.6, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Value = targetScale })
-			local conn
-			conn = scaleProxy.Changed:Connect(function(val)
-				if instance and instance.Parent then pcall(function() instance:ScaleTo(val) end) else conn:Disconnect() end
-			end)
-			scaleTween:Play()
-			scaleTween.Completed:Connect(function() scaleProxy:Destroy(); if conn then conn:Disconnect() end end)
-		else
-			pcall(function() instance:ScaleTo(targetScale) end)
-		end
-	elseif instance:IsA("BasePart") then
-		local baseSize = 1.5
-		local targetSize = Vector3.new(1, 1, 1) * (baseSize * targetScale)
-		if animated then
-			if fromScale then instance.Size = Vector3.new(1, 1, 1) * (baseSize * fromScale) end
-			TweenService:Create(instance, TweenInfo.new(0.6, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Size = targetSize }):Play()
-		else
-			instance.Size = targetSize
-		end
-	end
-end
-
----------------------------------------------------------------
--- VFX SYSTEM
----------------------------------------------------------------
-local function PlayVFX(effectName, position, duration)
-	if not VFXFolder then return end
-	local template = VFXFolder:FindFirstChild(effectName)
-	if not template then return end
-	local vfx = template:Clone()
-
-	if vfx:IsA("Model") then vfx:PivotTo(CFrame.new(position))
-	elseif vfx:IsA("BasePart") then vfx.Position = position end
-
-	for _, obj in ipairs(vfx:GetDescendants()) do
-		if obj:IsA("BasePart") then
-			obj.Anchored = true; obj.Transparency = 1; obj.CanCollide = false; obj.CastShadow = false
-		end
-	end
-	if vfx:IsA("BasePart") then
-		vfx.Anchored = true; vfx.Transparency = 1; vfx.CanCollide = false; vfx.CastShadow = false
-	end
-	vfx.Parent = workspace
-
-	for _, emitter in ipairs(vfx:GetDescendants()) do
-		if emitter:IsA("ParticleEmitter") then
-			emitter.Enabled = true; emitter:Emit(emitter:GetAttribute("BurstCount") or 15)
-		end
-	end
-	task.delay((duration or 1.0) * 0.5, function()
-		if vfx and vfx.Parent then
-			for _, emitter in ipairs(vfx:GetDescendants()) do
-				if emitter:IsA("ParticleEmitter") then emitter.Enabled = false end
-			end
-		end
-	end)
-	Debris:AddItem(vfx, duration or 1.5)
-end
-
----------------------------------------------------------------
--- GAMEPLAY VISUAL LOGIC
----------------------------------------------------------------
-local function GetCurrentMultiplier()
-	if not holding or not holdStart then return 1.0, 1 end
-	local holdTime = tick() - holdStart
-	local effectiveTime = holdTime * playerMultSpeed 
-
-	local currentTier = 1; local nextTier = 1
-	for i = 1, playerMaxTier do
-		if effectiveTime >= MilestoneData[i].time then
-			currentTier = i; nextTier = math.min(i + 1, playerMaxTier)
-		end
-	end
-
-	if currentTier == playerMaxTier then return MilestoneData[currentTier].mult, currentTier end
-
-	local timePassedInTier = effectiveTime - MilestoneData[currentTier].time
-	local timeNeededForNext = MilestoneData[nextTier].time - MilestoneData[currentTier].time
-	local progressRatio = timePassedInTier / timeNeededForNext
-
-	local currentMult = MilestoneData[currentTier].mult
-	local nextMult = MilestoneData[nextTier].mult
-	local smoothMult = currentMult + ((nextMult - currentMult) * progressRatio)
-
-	return smoothMult, currentTier
-end
-
-local function PlayMilestoneSound(soundValue)
-	if not soundValue or soundValue == "" then return end
-	local sfxToPlay = nil
-	if string.find(soundValue, "rbxassetid://") then
-		sfxToPlay = Instance.new("Sound"); sfxToPlay.SoundId = soundValue; sfxToPlay.Volume = 0.6
-	else
-		local sfxFolder = ReplicatedStorage:FindFirstChild("SFX") or ReplicatedStorage:FindFirstChild("Sounds")
-		if sfxFolder then
-			local foundSound = sfxFolder:FindFirstChild(soundValue)
-			if foundSound then sfxToPlay = foundSound:Clone(); sfxToPlay.Volume = 0.6 end
-		end
-	end
-	if sfxToPlay then
-		sfxToPlay.Parent = game:GetService("SoundService"); sfxToPlay:Play()
-		Debris:AddItem(sfxToPlay, sfxToPlay.TimeLength > 0 and sfxToPlay.TimeLength or 3)
-	end
-end
-
-local function SpawnMilestonePopup(multFloor)
-	local data = MilestoneData[multFloor]
-	if not data then return end 
-
-	PlayMilestoneSound(data.sound)
-
-	local pop = Instance.new("TextLabel")
-	pop.Text = data.name .. " (" .. string.format("%.1f", data.mult) .. "x)"
-	pop.Font = Enum.Font.FredokaOne; pop.TextScaled = true; pop.TextColor3 = data.color
-	pop.BackgroundTransparency = 1; pop.AnchorPoint = Vector2.new(0.5, 0.5)
-
-	pop.Position = UDim2.new(
-		ClickButton.Position.X.Scale, ClickButton.Position.X.Offset, 
-		ClickButton.Position.Y.Scale - 0.15, ClickButton.Position.Y.Offset
-	)
-	pop.Parent = ClickButton.Parent
-
-	local stroke = Instance.new("UIStroke", pop); stroke.Thickness = 3; stroke.Color = Color3.fromRGB(0, 0, 0)
-	pop.Size = UDim2.new(0.1, 0, 0.02, 0) 
-
-	TweenService:Create(pop, TweenInfo.new(0.4, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
-		Size = UDim2.new(0.35, 0, 0.08, 0),
-		Position = UDim2.new(pop.Position.X.Scale, pop.Position.X.Offset, ClickButton.Position.Y.Scale - 0.25, ClickButton.Position.Y.Offset)
-	}):Play()
-
-	task.delay(0.6, function()
-		TweenService:Create(pop, TweenInfo.new(0.3), {TextTransparency = 1}):Play()
-		TweenService:Create(stroke, TweenInfo.new(0.3), {Transparency = 1}):Play()
-		task.delay(0.3, function() pop:Destroy() end)
-	end)
-end
-
-local function UpdateButtonVisual()
-	local col; local mult = 1; local currentTierIndex = 1
-	if habitatFull then col = Color3.fromRGB(180, 60, 60)
-	elseif not holding then col = Color3.fromRGB(255, 0, 0)
-	else
-		mult, currentTierIndex = GetCurrentMultiplier()
-		col = MilestoneData[currentTierIndex].color
-		UpdateMultiplier:Fire(mult)
-	end
-
-	local targetFOV = defaultFOV + (mult * 1.2)
-	if not holding then targetFOV = defaultFOV end
-	TweenService:Create(Camera, TweenInfo.new(0.3, Enum.EasingStyle.Sine), {FieldOfView = targetFOV}):Play()
-
-	if holding then
-		if currentTierIndex > lastTierIndex then
-			if currentTierIndex > 1 then SpawnMilestonePopup(currentTierIndex) end
-			lastTierIndex = currentTierIndex
-		end
-	else lastTierIndex = 1 end
-
-	TweenService:Create(ClickButton, TweenInfo.new(0.2), { BackgroundColor3 = col }):Play()
-
-	if holding and not habitatFull then
-		tiltSide = tiltSide * -1 
-		if mult >= 5.0 then 
-			TweenService:Create(ClickButton, TweenInfo.new(0.05, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, 0, true), { Rotation = 8 * tiltSide }):Play()
-			clickStroke.Thickness = 12; clickStroke.Transparency = 0
-			TweenService:Create(clickStroke, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Thickness = 0, Transparency = 1}):Play()
-		else
-			TweenService:Create(ClickButton, TweenInfo.new(0.08, Enum.EasingStyle.Sine, Enum.EasingDirection.Out, 0, true), { Rotation = 3 * tiltSide }):Play()
-		end
-	elseif not holding then
-		TweenService:Create(ClickButton, TweenInfo.new(0.15, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Rotation = 0}):Play()
-		TweenService:Create(clickScale, TweenInfo.new(0.15), {Scale = 1}):Play()
-	end
-end
-
-local function UpdateHatcheryBar(current, max)
-	local ratio = math.clamp(current / max, 0, 1)
-	TweenService:Create(HatcheryFill, TweenInfo.new(0.1), { Size = UDim2.new(ratio, 0, 1, 0) }):Play()
-
-	local color = Color3.fromRGB(255, 60, 60)
-	if ratio > 0.5 then color = Color3.fromRGB(80, 220, 80)
-	elseif ratio > 0.25 then color = Color3.fromRGB(255, 200, 0) end
-
-	TweenService:Create(HatcheryFill, TweenInfo.new(0.1), { BackgroundColor3 = color }):Play()
-	HatcheryLabel.Text = "Hatchery: " .. math.floor(current) .. " / " .. max
-	hatcheryEmpty = (current <= 0)
-end
-
-local function FlashEmpty()
-	TweenService:Create(HatcheryFill, TweenInfo.new(0.1), { BackgroundColor3 = Color3.fromRGB(255, 255, 255) }):Play()
-	task.delay(0.1, function() TweenService:Create(HatcheryFill, TweenInfo.new(0.1), { BackgroundColor3 = Color3.fromRGB(255, 60, 60) }):Play() end)
-end
-
-local function ShowTierPopup(position, tierName, tierColor)
-	local anchor = Instance.new("Part"); anchor.Size = Vector3.new(0.1, 0.1, 0.1); anchor.Anchored = true; anchor.Transparency = 1; anchor.CanCollide = false
-	anchor.Position = position + Vector3.new(0, 3, 0); anchor.Parent = workspace
-
-	local bb = Instance.new("BillboardGui"); bb.Size = UDim2.new(0, 120, 0, 40); bb.StudsOffset = Vector3.new(0, 2, 0)
-	bb.AlwaysOnTop = false; bb.Adornee = anchor; bb.Parent = anchor
-
-	local label = Instance.new("TextLabel"); label.Size = UDim2.new(1, 0, 1, 0); label.BackgroundTransparency = 1
-	label.Text = tierName:upper(); label.TextColor3 = tierColor; label.TextScaled = true
-	label.Font = Enum.Font.GothamBold; label.TextStrokeTransparency = 0.3; label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0); label.Parent = bb
-
-	TweenService:Create(bb, TweenInfo.new(1.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { StudsOffset = Vector3.new(0, 6, 0) }):Play()
-	TweenService:Create(label, TweenInfo.new(1.5, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { TextTransparency = 1, TextStrokeTransparency = 1 }):Play()
-	Debris:AddItem(anchor, 2)
-end
-
-local function ShowCubeValue(position, value, color)
-	local anchor = Instance.new("Part"); anchor.Size = Vector3.new(0.1, 0.1, 0.1); anchor.Anchored = true; anchor.Transparency = 1; anchor.CanCollide = false
-	anchor.Position = position + Vector3.new(math.random(-1, 1), 2, math.random(-1, 1)); anchor.Parent = workspace
-
-	local bb = Instance.new("BillboardGui"); bb.Size = UDim2.new(0, 80, 0, 25); bb.StudsOffset = Vector3.new(0, 0, 0)
-	bb.AlwaysOnTop = false; bb.Adornee = anchor; bb.Parent = anchor
-
-	local label = Instance.new("TextLabel"); label.Size = UDim2.new(1, 0, 1, 0); label.BackgroundTransparency = 1
-	label.Text = "Value: $" .. FormatNumber(value); label.TextColor3 = Color3.fromRGB(255, 255, 255); label.TextScaled = true
-	label.Font = Enum.Font.Gotham; label.TextStrokeTransparency = 0.4; label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0); label.Parent = bb
-
-	TweenService:Create(bb, TweenInfo.new(1.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { StudsOffset = Vector3.new(0, 4, 0) }):Play()
-	TweenService:Create(label, TweenInfo.new(1.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { TextTransparency = 1, TextStrokeTransparency = 1 }):Play()
-	Debris:AddItem(anchor, 1.5)
-end
-
-local function AttachPermanentRateLabel(auraInstance, baseValue, auraColor)
-	local rootPart = GetRootPart(auraInstance)
-	if not rootPart then return end
-
-	local bb = Instance.new("BillboardGui"); bb.Name = "PermanentRateLabel"; bb.Size = UDim2.new(0, 90, 0, 25); bb.StudsOffset = Vector3.new(0, 0.5, 0); bb.AlwaysOnTop = false; bb.Adornee = rootPart
-
-	local label = Instance.new("TextLabel"); label.Size = UDim2.new(1, 0, 1, 0); label.BackgroundTransparency = 1
-	local ratePerSec = baseValue / currentPassiveInterval
-	label.Text = "+$" .. FormatNumber(ratePerSec) .. "/sec"
-
-	label.TextColor3 = auraColor or Color3.fromRGB(100, 255, 100); label.Font = Enum.Font.GothamBold; label.TextScaled = true
-	label.TextTransparency = 0.2; label.TextStrokeTransparency = 0.6; label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0); label.Parent = bb
-
-	bb.Parent = rootPart
-	return label
-end
-
----------------------------------------------------------------
--- DYNAMIC LABEL REFRESH
----------------------------------------------------------------
-local function RefreshAllRateLabels()
-	for id, data in pairs(cubeDataMap) do
-		if data.rateLabel and data.baseValue and not data.isStored then
-			local ratePerSec = (data.baseValue * globalBoostMultiplier) / currentPassiveInterval
-			data.rateLabel.Text = "+$" .. FormatNumber(ratePerSec) .. "/sec"
-
-			if data.rateLabel.Parent then
-				local scale = data.rateLabel.Parent:FindFirstChildOfClass("UIScale") or Instance.new("UIScale", data.rateLabel.Parent)
-				TweenService:Create(scale, TweenInfo.new(0.2, Enum.EasingStyle.Bounce), {Scale = 1.2}):Play()
-				task.delay(0.2, function() TweenService:Create(scale, TweenInfo.new(0.2), {Scale = 1}):Play() end)
-			end
-		end
-	end
-end
-
----------------------------------------------------------------
--- DYNAMIC TRIGGER HOOKS
----------------------------------------------------------------
-local AuraHolder = workspace:WaitForChild("AuraHolder")
-local HabitatHolder = workspace:WaitForChild("HabitatHolder")
-
-local function UpdateHabitatBar(actualPending, max)
-	local offset = player:GetAttribute("HabitatVisualOffset") or 0
-	local current = actualPending + offset
-
-	local habitatModel = HabitatHolder:FindFirstChildWhichIsA("Model")
-	if not habitatModel then return end
-
-	local habitatGui = habitatModel:FindFirstChild("HabitatGui", true)
-	if not habitatGui then return end
-
-	local bg = habitatGui:FindFirstChild("BarBackground")
-	if not bg then return end
-
-	local fill = bg:FindFirstChild("BarFill")
-	local textLabel = bg:FindFirstChild("CountLabel") or bg:FindFirstChild("AmountLabel")
-
-	if fill and max > 0 then
-		local ratio = math.clamp(current / max, 0, 1)
-
-		TweenService:Create(fill, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-			Size = UDim2.new(ratio, 0, 1, 0)
-		}):Play()
-
-		local targetColor = Color3.fromRGB(80, 220, 80)
-		if ratio >= 1 then targetColor = Color3.fromRGB(255, 60, 60)
-		elseif ratio >= 0.8 then targetColor = Color3.fromRGB(255, 200, 0) end
-
-		TweenService:Create(fill, TweenInfo.new(0.2), {BackgroundColor3 = targetColor}):Play()
-
-		if textLabel then
-			if current >= max then
-				textLabel.Text = "FULL!"
-				textLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
-			else
-				textLabel.Text = math.floor(current) .. " / " .. max
-				textLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-			end
-		end
-	end
-end
-
-player:GetAttributeChangedSignal("HabitatVisualOffset"):Connect(function()
-	UpdateHabitatBar(latestPendingAuras, latestHabitatCapacity)
+local UpdateMultiplier = ReplicatedStorage:WaitForChild("UpdateMultiplier")
+UpdateMultiplier.Event:Connect(function(mult)
+	liveStats.currentMultiplier = mult
 end)
 
-local function GetAuraCubeFromHit(hit)
-	if hit:GetAttribute("AuraCube") then return hit end
-	local p = hit.Parent; if p and p:GetAttribute("AuraCube") then return p end
-	local m = hit:FindFirstAncestorWhichIsA("Model"); if m and m:GetAttribute("AuraCube") then return m end
+local baselineCubes = 0
+local baselineShipped = 0
+local baselineGoldenAuras = 0
+local baselineBoostsBought = {}
+local baselineBoostsUsed = {}
+
+local function GetStepCubes() return math.max(0, liveStats.totalCubesProduced - baselineCubes) end
+local function GetStepShipped() return math.max(0, liveStats.totalPlatformsShipped - baselineShipped) end
+local function GetStepBoostsBought(id) return math.max(0, (liveStats.boostsBought[id] or 0) - (baselineBoostsBought[id] or 0)) end
+local function GetStepBoostsUsed(id) return math.max(0, (liveStats.boostsUsed[id] or 0) - (baselineBoostsUsed[id] or 0)) end
+
+local function GetStepGoldenAuras() 
+	local current = player:GetAttribute("LiveGoldenAuras") or liveStats.goldenAuras
+	return math.max(0, current - baselineGoldenAuras) 
+end
+
+local lockedAura = nil
+
+local function GetActiveAura()
+	if lockedAura and lockedAura.Parent and lockedAura.Parent.Name == "AuraHolder" and lockedAura:GetAttribute("AuraCube") then 
+		return lockedAura 
+	end
+	local auraHolder = Workspace:FindFirstChild("AuraHolder")
+	if auraHolder then
+		local children = auraHolder:GetChildren()
+		for i = #children, 1, -1 do
+			local child = children[i]
+			if child:GetAttribute("AuraCube") then lockedAura = child; return child end
+		end
+	end
 	return nil
 end
 
-local function HookAuraModel(model)
-	task.delay(0.1, function()
-		local smush = model:FindFirstChild("SmushTrigger", true)
-		if smush then
-			smush.Touched:Connect(function(hit)
-				local auraObj = GetAuraCubeFromHit(hit)
-				if auraObj then
-					for id, data in pairs(cubeDataMap) do
-						if data.instance == auraObj then
-							if data.isStored then return end
-							CubeSmushedBridge:Fire(id)
-							local root = GetRootPart(auraObj)
-							local pos = (root and root.Position) or hit.Position
-							PlayVFX("Spawn", pos, 0.5) 
+local currentTrackedPhysicsAura = nil
 
-							PoolManager.ReturnAura(data.instance) 
-							cubeDataMap[id] = nil
-							break
-						end
-					end
-				end
-			end)
+local function GetActivePhysicsAura()
+	if currentTrackedPhysicsAura and currentTrackedPhysicsAura.Parent and not currentTrackedPhysicsAura:GetAttribute("Landed") then
+		return currentTrackedPhysicsAura
+	end
+
+	local auras = CollectionService:GetTagged("PhysicsAura")
+	for _, aura in ipairs(auras) do
+		if aura and aura.Parent and not aura:GetAttribute("Landed") then
+			currentTrackedPhysicsAura = aura
+			return aura
 		end
+	end
 
-		for _, conveyer in ipairs(model:GetDescendants()) do
-			if (conveyer.Name == "ConveyerPath" or conveyer.Name == "ConveyerPathCorner") and conveyer:IsA("BasePart") then
-				local forwardBeam = conveyer:FindFirstChild("Foward") or conveyer:FindFirstChild("Forward")
-				local backwardBeam = conveyer:FindFirstChild("Backward")
+	currentTrackedPhysicsAura = nil
+	return nil
+end
 
-				if forwardBeam then forwardBeam.Enabled = not habitatFull end
-				if backwardBeam then backwardBeam.Enabled = habitatFull end
+shared.TutorialRecordAuraSpawned = function() liveStats.totalCubesProduced += 1 end
+shared.TutorialRecordShipSent = function() task.delay(4, function() liveStats.totalPlatformsShipped += 1 end) end
+shared.TutorialRecordBoostBought = function(id) liveStats.boostsBought[id] = (liveStats.boostsBought[id] or 0) + 1 end
+shared.TutorialRecordBoostUsed = function(id) liveStats.boostsUsed[id] = (liveStats.boostsUsed[id] or 0) + 1 end
 
-				if not conveyer:GetAttribute("OriginalVelocity") then
-					conveyer:SetAttribute("OriginalVelocity", conveyer.AssemblyLinearVelocity)
-				end
+local tutorialGui = nil
+local activePointer = nil
+local activeHighlight = nil
+local questBanner = nil
+local trackingConnection = nil
 
-				local origVel = conveyer:GetAttribute("OriginalVelocity")
+-- ✨ PANEL AWARENESS
+local PANELS_TO_CHECK = {
+	"Tutorial_AchievePanel",
+	"Tutorial_ShopPanel",
+	"Tutorial_PrestigePanel",
+	"Tutorial_TravelPanel",
+	"Tutorial_BoostShopPanel"
+}
 
-				if habitatFull then 
-					conveyer.AssemblyLinearVelocity = origVel * -2
-				else 
-					conveyer.AssemblyLinearVelocity = origVel 
+local HUD_DIRECTIONS = {
+	Tutorial_ClickButton    = "TOP_HIGH",  
+	Tutorial_ToggleShipBtn  = "TOP",
+	Tutorial_SendShipBtn    = "TOP",
+	Tutorial_TravelButton   = "TOP",
+	Tutorial_PrestigeButton = "RIGHT", 
+	Tutorial_ShopButton     = "RIGHT", 
+	Tutorial_BoostMenuBtn   = "RIGHT", 
+	Tutorial_AchieveMenuBtn = "RIGHT", 
+	Tutorial_LbTab_Top10    = "LEFT",  
+	Tutorial_LbTab_AurasGenerated = "LEFT",
+	Tutorial_LbTab_MostMoneyMade = "LEFT",
+}
+
+---------------------------------------------------------------
+-- VISIBILITY & GATING EVALUATION
+---------------------------------------------------------------
+local function IsVisibleOnScreen(guiObject)
+	local current = guiObject
+	while current and current ~= game do
+		if current:IsA("GuiObject") and not current.Visible then return false
+		elseif current:IsA("LayerCollector") and not current.Enabled then return false end
+		current = current.Parent
+	end
+	return true
+end
+
+local function GetActivePanel()
+	for _, tag in ipairs(PANELS_TO_CHECK) do
+		local panel = CollectionService:GetTagged(tag)[1]
+		if panel and IsVisibleOnScreen(panel) then return panel end
+	end
+	return nil
+end
+
+local function MeetsStrictGates(step)
+	if not step then return false end
+
+	local currentCash = player:GetAttribute("LiveCurrency") or liveStats.currency
+	local currentGoldenAuras = player:GetAttribute("LiveGoldenAuras") or liveStats.goldenAuras
+
+	if step.requireHabitatFull and liveStats.pendingAuras < liveStats.habitatCapacity then return false end
+	if step.requireRateZero and liveStats.rate > 0.1 then return false end
+	if step.reachMultiplier and liveStats.currentMultiplier < step.reachMultiplier then return false end
+	if step.requireCubesProduced and GetStepCubes() < step.requireCubesProduced then return false end
+	if step.requirePlatformsShipped and GetStepShipped() < step.requirePlatformsShipped then return false end
+	if step.requireBoostBought and GetStepBoostsBought(step.requireBoostBought.id) < step.requireBoostBought.count then return false end
+	if step.requireBoostUsed and GetStepBoostsUsed(step.requireBoostUsed.id) < step.requireBoostUsed.count then return false end
+	if step.requireGoldenAuras and currentGoldenAuras < step.requireGoldenAuras then return false end
+	if step.requireStepGoldenAuras and GetStepGoldenAuras() < step.requireStepGoldenAuras then return false end
+	if step.requireCurrency and currentCash < step.requireCurrency then return false end
+	if step.requireFarmEval and liveStats.farmEvaluation < step.requireFarmEval then return false end
+	if step.requireSoulAuras and liveStats.soulAuras < step.requireSoulAuras then return false end
+	if step.requirePrestigeCount and liveStats.prestigeCount < step.requirePrestigeCount then return false end
+	if step.requireArea and liveStats.currentArea < step.requireArea then return false end
+	if step.requireLegendaryCubes and liveStats.totalLegendaryCubes < step.requireLegendaryCubes then return false end
+	if step.requirePiggyBankValue and liveStats.piggyBank < step.requirePiggyBankValue then return false end
+
+	return true
+end
+
+---------------------------------------------------------------
+-- LOGIC-LEVEL GATING (The Soft Lock)
+---------------------------------------------------------------
+shared.TutorialCanPerform = function(requestedAction)
+	actionMatchedForAdvance = false 
+
+	if tutorialComplete or not tutorialActive then return true end
+
+	local activeStep = activeFallbackStep or TutorialConfig.GetStepByIndex(currentStepIndex)
+	if not activeStep then return true end
+
+	if activeStep.action == "Action_Wait" and not activeStep.allowClicking then
+		if activeStep.duration and activeStep.duration > 0 then
+			if shared.PlayUISound then shared.PlayUISound(SoundConfig.ErrorBuzz or "") end
+			return false
+		end
+		if requestedAction == "Action_ClickRedButton" then
+			if shared.PlayUISound then shared.PlayUISound(SoundConfig.ErrorBuzz or "") end
+			return false
+		end
+	end
+
+	if not activeStep.action then return true end
+	if activeStep.action == requestedAction then actionMatchedForAdvance = true; return true end
+
+	local isPermanentlyUnlocked = false
+	for i = 1, currentStepIndex do
+		local pastStep = TutorialConfig.GetStepByIndex(i)
+		if pastStep then
+			if i < currentStepIndex and pastStep.action == requestedAction then
+				isPermanentlyUnlocked = true; break
+			end
+			if pastStep.unlockActions then
+				for _, act in ipairs(pastStep.unlockActions) do
+					if act == requestedAction then isPermanentlyUnlocked = true; break end
 				end
 			end
 		end
+	end
+	if isPermanentlyUnlocked then return true end
 
-		local storageBelt = model:FindFirstChild("StorageBelt", true)
-		if not storageBelt then
-			local habModel = HabitatHolder:FindFirstChildWhichIsA("Model")
-			if habModel then storageBelt = habModel:FindFirstChild("StorageBelt", true) end
-		end
+	if requestedAction == "Action_ClickRedButton" and not MeetsStrictGates(activeStep) then return true end
+	if shared.PlayUISound then shared.PlayUISound(SoundConfig.ErrorBuzz or "") end
+	return false
+end
 
-		if storageBelt and storageBelt:IsA("BasePart") then
-			if not storageBelt:GetAttribute("OriginalVelocity") then
-				storageBelt:SetAttribute("OriginalVelocity", storageBelt.AssemblyLinearVelocity)
-			end
+---------------------------------------------------------------
+-- INITIALIZATION & UI
+---------------------------------------------------------------
+local function InitTutorialUI()
+	tutorialGui = Instance.new("ScreenGui"); tutorialGui.Name = "TutorialOverlays"; tutorialGui.DisplayOrder = 1000 
+	tutorialGui.IgnoreGuiInset = false 
+	tutorialGui.ResetOnSpawn = false; tutorialGui.Parent = playerGui
 
-			local origVel = storageBelt:GetAttribute("OriginalVelocity")
+	activeHighlight = Instance.new("Frame"); activeHighlight.Name = "TutorialHighlight"
+	activeHighlight.AnchorPoint = Vector2.new(0.5, 0.5) 
+	activeHighlight.BackgroundColor3 = Color3.new(1, 1, 1); activeHighlight.BackgroundTransparency = 1 
+	activeHighlight.Interactable = false; activeHighlight.Active = false; activeHighlight.Visible = false
+	activeHighlight.ZIndex = 99; activeHighlight.Parent = tutorialGui
 
-			if habitatFull then
-				storageBelt.AssemblyLinearVelocity = origVel * -2
+	local highlightStroke = Instance.new("UIStroke", activeHighlight)
+	highlightStroke.Color = TutorialConfig.DefaultColor; highlightStroke.Thickness = 3; highlightStroke.Transparency = 0.2
+	Instance.new("UICorner", activeHighlight).CornerRadius = UDim.new(0, 8)
+	TweenService:Create(highlightStroke, TweenInfo.new(0.6, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {Transparency = 0.8}):Play()
+
+	activePointer = Instance.new("ImageLabel"); activePointer.Name = "GhostHand"
+	activePointer.Size = TutorialConfig.PointerSize; activePointer.BackgroundTransparency = 1
+	activePointer.Image = TutorialConfig.PointerImage; activePointer.AnchorPoint = Vector2.new(0.5, 0.5)
+	activePointer.Visible = false; activePointer.Active = false; activePointer.ZIndex = 100; activePointer.Parent = tutorialGui
+
+	-- ✨ DYNAMICALLY SCALING BANNER
+	questBanner = Instance.new("Frame"); questBanner.Name = "QuestBanner"
+	questBanner.Size = UDim2.new(0, 650, 0, 100) -- Starts at 100, grows downward automatically
+	questBanner.AutomaticSize = Enum.AutomaticSize.Y -- ✨ The Magic Property
+	questBanner.AnchorPoint = Vector2.new(0.5, 0)
+	questBanner.Position = UDim2.new(0.5, 0, 0, -250); questBanner.BackgroundColor3 = T.panelBG or Color3.fromRGB(20, 20, 30)
+	questBanner.BorderSizePixel = 0; questBanner.Visible = false; questBanner.Active = false; questBanner.Parent = tutorialGui
+	Instance.new("UICorner", questBanner).CornerRadius = UDim.new(0, 12)
+
+	local bannerPadding = Instance.new("UIPadding", questBanner)
+	bannerPadding.PaddingBottom = UDim.new(0, 16) -- Prevents text from hugging the bottom edge when it expands
+
+	local sizeConstraint = Instance.new("UISizeConstraint", questBanner)
+	sizeConstraint.MaxSize = Vector2.new(650, 800) -- Allow a huge vertical expansion if needed
+	sizeConstraint.MinSize = Vector2.new(280, 100)
+	Instance.new("UIScale", questBanner)
+
+	local bgGrad = Instance.new("UIGradient", questBanner)
+	bgGrad.Rotation = 90
+	bgGrad.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.3), NumberSequenceKeypoint.new(1, 0.95) })
+
+	local stroke = Instance.new("UIStroke", questBanner); stroke.Name = "BannerStroke"
+	stroke.Color = TutorialConfig.DefaultColor; stroke.Thickness = 2.5; stroke.Transparency = 0.1
+	local strokeGrad = Instance.new("UIGradient", stroke); strokeGrad.Name = "StrokeGradient"; strokeGrad.Rotation = 45
+
+	-- Fixed Icon anchoring so it stays glued to the top-left regardless of Banner expansion
+	local iconFrame = Instance.new("Frame", questBanner); iconFrame.Name = "IconFrame"
+	iconFrame.Size = UDim2.new(0, 72, 0, 72); iconFrame.AnchorPoint = Vector2.new(0, 0)
+	iconFrame.Position = UDim2.new(0, 16, 0, 14); iconFrame.BackgroundColor3 = TutorialConfig.DefaultColor
+	iconFrame.BackgroundTransparency = 0.85; iconFrame.Active = false
+	Instance.new("UICorner", iconFrame).CornerRadius = UDim.new(0, 12)
+	Instance.new("UIStroke", iconFrame).Color = TutorialConfig.DefaultColor
+
+	local icon = Instance.new("ImageLabel", iconFrame); icon.Name = "IconImage"
+	icon.Size = UDim2.new(0.65, 0, 0.65, 0); icon.Position = UDim2.new(0.175, 0, 0.175, 0)
+	icon.BackgroundTransparency = 1; icon.Image = TutorialConfig.DefaultIcon
+	icon.ScaleType = Enum.ScaleType.Fit; icon.Active = false
+
+	-- ✨ TEXT CONTAINER (Organizes growing text elements natively)
+	local textContainer = Instance.new("Frame", questBanner)
+	textContainer.Name = "TextContainer"
+	textContainer.Size = UDim2.new(1, -114, 0, 0)
+	textContainer.Position = UDim2.new(0, 104, 0, 14)
+	textContainer.BackgroundTransparency = 1
+	textContainer.AutomaticSize = Enum.AutomaticSize.Y
+
+	local txtLayout = Instance.new("UIListLayout", textContainer)
+	txtLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	txtLayout.Padding = UDim.new(0, 4)
+
+	local title = Instance.new("TextLabel", textContainer); title.Name = "Title"
+	title.Size = UDim2.new(1, 0, 0, 32)
+	title.BackgroundTransparency = 1; title.TextColor3 = TutorialConfig.DefaultColor
+	title.TextScaled = false; title.TextSize = 30; title.Font = Enum.Font.FredokaOne -- Massive and Crisp
+	title.TextXAlignment = Enum.TextXAlignment.Left; title.Active = false
+	title.LayoutOrder = 1
+
+	local titleStrokeObj = Instance.new("UIStroke", title)
+	titleStrokeObj.Color = Color3.new(0, 0, 0); titleStrokeObj.Thickness = 2; titleStrokeObj.Transparency = 0.3
+
+	local body = Instance.new("TextLabel", textContainer); body.Name = "Body"
+	body.Size = UDim2.new(1, 0, 0, 0)
+	body.AutomaticSize = Enum.AutomaticSize.Y -- Allows Body to stretch infinitely downwards!
+	body.BackgroundTransparency = 1; body.TextColor3 = T.bodyText or Color3.fromRGB(230, 230, 240)
+	body.TextWrapped = true; body.TextScaled = false; body.TextSize = 20 -- Massive and Crisp
+	body.RichText = true; body.Font = Enum.Font.GothamMedium
+	body.TextXAlignment = Enum.TextXAlignment.Left; body.TextYAlignment = Enum.TextYAlignment.Top
+	body.Active = false; body.LineHeight = 1.2; body.LayoutOrder = 2 -- 1.2 Line height adds beautiful breathing room
+
+	local bodyStrokeObj = Instance.new("UIStroke", body)
+	bodyStrokeObj.Color = Color3.new(0, 0, 0); bodyStrokeObj.Thickness = 1; bodyStrokeObj.Transparency = 0.5
+end
+
+local function AutoScrollToTarget(target)
+	local scrollFrame = target:FindFirstAncestorOfClass("ScrollingFrame")
+	if scrollFrame then
+		local relativeY = (target.AbsolutePosition.Y - scrollFrame.AbsolutePosition.Y) + scrollFrame.CanvasPosition.Y
+		local targetCanvasY = relativeY - (scrollFrame.AbsoluteSize.Y / 2) + (target.AbsoluteSize.Y / 2)
+		local maxScroll = math.max(0, scrollFrame.AbsoluteCanvasSize.Y - scrollFrame.AbsoluteSize.Y)
+		TweenService:Create(scrollFrame, TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+			CanvasPosition = Vector2.new(scrollFrame.CanvasPosition.X, math.clamp(targetCanvasY, 0, maxScroll))
+		}):Play()
+	end
+end
+
+local function HideBanner()
+	if not questBanner or not questBanner.Visible then return end
+	TweenService:Create(questBanner, TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Position = UDim2.new(0.5, 0, 0, -250) }):Play()
+	task.delay(0.4, function() if lastDisplayedStepId == nil then questBanner.Visible = false end end)
+end
+
+local function GetBannerTarget()
+	local activePanel = GetActivePanel()
+	local screenW = camera.ViewportSize.X
+	local screenH = camera.ViewportSize.Y
+
+	local isMobile   = screenW <= 850 or screenH <= 600
+	local isPortrait = screenH > screenW * 1.1   
+
+	local leftHudWidth  = isPortrait and 70  or 100
+	local rightHudWidth = isPortrait and 160 or 270
+	local availableCenterWidth = math.max(200, screenW - leftHudWidth - rightHudWidth)
+
+	local baseBannerWidth = 650
+	local targetScale = 1.0
+	if availableCenterWidth < baseBannerWidth then
+		targetScale = math.clamp(availableCenterWidth / baseBannerWidth, 0.42, 0.9)
+	end
+
+	if activePanel then
+		local panelName = activePanel.Name
+		local bannerW = baseBannerWidth * targetScale
+
+		if panelName == "ShopPanel" then
+			if isMobile then
+				return UDim2.new(0.5, 60, 1, -340), (targetScale * 0.8)
 			else
-				storageBelt.AssemblyLinearVelocity = origVel
-			end
-		end
-	end)
-end
-
-local function HookHabitatModel(model)
-	task.delay(0.1, function()
-		local storage = model:FindFirstChild("StorageTrigger", true)
-		if storage then
-			storage.Touched:Connect(function(hit)
-				local auraObj = GetAuraCubeFromHit(hit)
-				if auraObj then
-					for id, data in pairs(cubeDataMap) do
-						if data.instance == auraObj and not data.isStored then
-							data.isStored = true
-
-							if data.rateLabel and data.rateLabel.Parent and data.rateLabel.Parent:IsA("BillboardGui") then 
-								data.rateLabel.Parent.Enabled = false 
-							end
-
-							local root = GetRootPart(auraObj)
-							if root then
-								local dropOffset = Vector3.new(-10, 4, math.random(-4, 4))
-								auraObj:PivotTo(CFrame.new(storage.Position + dropOffset))
-								root.AssemblyLinearVelocity = Vector3.new(0, -10, 0)
-								root.AssemblyAngularVelocity = Vector3.new(math.random(-5, 5), math.random(-5, 5), math.random(-5, 5))
-							end
-
-							CubeStoredBridge:Fire(id)
-							break
-						end
-					end
-				end
-			end)
-		end
-	end)
-end
-
-AuraHolder.ChildAdded:Connect(function(child) if child:IsA("Model") then HookAuraModel(child) end end)
-HabitatHolder.ChildAdded:Connect(function(child) if child:IsA("Model") then HookHabitatModel(child) end end)
-
-for _, child in ipairs(AuraHolder:GetChildren()) do if child:IsA("Model") then HookAuraModel(child) end end
-for _, child in ipairs(HabitatHolder:GetChildren()) do if child:IsA("Model") then HookHabitatModel(child) end end
-
----------------------------------------------------------------
--- INPUT CONTROLS & TUTORIAL GATING
----------------------------------------------------------------
-local trackedInputs = {}
-
-local function EvaluateHolding()
-	local hasInput = false
-	for _, _ in pairs(trackedInputs) do hasInput = true; break end
-
-	if hasInput and not holding then
-		if type(shared.TutorialCanPerform) == "function" then
-			if not shared.TutorialCanPerform("Action_ClickRedButton") then table.clear(trackedInputs); return end
-		end
-
-		if hatcheryEmpty then FlashEmpty() return end
-		if habitatFull then return end
-
-		holding = true; holdStart = tick()
-		TweenService:Create(clickScale, TweenInfo.new(0.1, Enum.EasingStyle.Sine), {Scale = 0.9}):Play()
-		ProduceAuraBridge:Fire("start")
-
-		if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
-	elseif not hasInput and holding then
-		holding = false; holdStart = nil
-		ProduceAuraBridge:Fire("stop")
-		UpdateButtonVisual(); UpdateMultiplier:Fire(1.0)
-	end
-end
-
-ClickButton.InputBegan:Connect(function(input)
-	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-		trackedInputs[input] = true; EvaluateHolding()
-	end
-end)
-
-UserInputService.InputBegan:Connect(function(input, gameProcessed)
-	if input.KeyCode == Enum.KeyCode.Space and not UserInputService:GetFocusedTextBox() then
-		trackedInputs[input] = true; EvaluateHolding()
-	end
-end)
-
-UserInputService.InputEnded:Connect(function(input)
-	if trackedInputs[input] then trackedInputs[input] = nil; EvaluateHolding() end
-end)
-
-UserInputService.WindowFocusReleased:Connect(function()
-	table.clear(trackedInputs); EvaluateHolding()
-end)
-
-ForceStopHold.OnClientEvent:Connect(function()
-	table.clear(trackedInputs); EvaluateHolding()
-end)
-
-HabitatFull.OnClientEvent:Connect(function()
-	habitatFull = true; HabitatFullEvent:Fire(true); table.clear(trackedInputs); EvaluateHolding()
-end)
-
-HabitatFullEvent.Event:Connect(function(isFull)
-	habitatFull = isFull
-	if not isFull then 
-		UpdateButtonVisual() 
-	end
-
-	for _, auraModel in ipairs(AuraHolder:GetChildren()) do
-		if auraModel:IsA("Model") then
-			for _, conveyer in ipairs(auraModel:GetDescendants()) do
-				if (conveyer.Name == "ConveyerPath" or conveyer.Name == "ConveyerPathCorner") and conveyer:IsA("BasePart") then
-					local forwardBeam = conveyer:FindFirstChild("Foward") or conveyer:FindFirstChild("Forward")
-					local backwardBeam = conveyer:FindFirstChild("Backward")
-
-					if forwardBeam then forwardBeam.Enabled = not isFull end
-					if backwardBeam then backwardBeam.Enabled = isFull end
-
-					if not conveyer:GetAttribute("OriginalVelocity") then
-						conveyer:SetAttribute("OriginalVelocity", conveyer.AssemblyLinearVelocity)
-					end
-
-					local origVel = conveyer:GetAttribute("OriginalVelocity")
-
-					if isFull then 
-						conveyer.AssemblyLinearVelocity = origVel * -2
-					else 
-						conveyer.AssemblyLinearVelocity = origVel 
-					end
-				end
+				local panelRightEdge = activePanel.AbsolutePosition.X + activePanel.AbsoluteSize.X
+				local targetPixelX = panelRightEdge + 35 + (bannerW / 2)
+				targetPixelX = math.min(targetPixelX, screenW - (bannerW / 2) - 10)
+				return UDim2.new(0, targetPixelX, 0, math.max(15, activePanel.AbsolutePosition.Y)), targetScale
 			end
 
-			local storageBelt = auraModel:FindFirstChild("StorageBelt", true)
-			if storageBelt and storageBelt:IsA("BasePart") then
-				if not storageBelt:GetAttribute("OriginalVelocity") then
-					storageBelt:SetAttribute("OriginalVelocity", storageBelt.AssemblyLinearVelocity)
+		elseif panelName == "BoostShopPanel" then
+			return UDim2.new(0.5, 0, 0, isMobile and -15 or -5), targetScale
+
+		elseif panelName == "TravelPanel" or panelName == "PrestigePanel" then
+			return UDim2.new(0.5, 0, 0, isMobile and -15 or 25), targetScale
+
+		elseif panelName == "AchievementPanel" then
+			if screenH < 850 then
+				return UDim2.new(0.5, 0, 1, -110), targetScale
+			else
+				return UDim2.new(0.5, 0, 1, -300), targetScale
+			end
+
+		else
+			return UDim2.new(0.5, 0, 0, isMobile and -15 or -5), targetScale
+		end
+	else
+		if isPortrait then
+			return UDim2.new(0.5, 0, 0, -25), targetScale
+		elseif isMobile then
+			return UDim2.new(0.5, 0, 0, -25), targetScale
+		else
+			return UDim2.new(0.5, 0, 0, -10), targetScale
+		end
+	end
+end
+
+local function ShowBanner(step)
+	local stepColor = step.color or TutorialConfig.DefaultColor
+
+	-- ✨ Updated targets to correctly map to the new TextContainer wrapper
+	questBanner.TextContainer.Title.Text = step.bannerTitle; 
+	questBanner.TextContainer.Body.Text = step.bannerBody
+	questBanner.TextContainer.Title.TextColor3 = stepColor; 
+	questBanner.IconFrame.BackgroundColor3 = stepColor; 
+	questBanner.IconFrame.UIStroke.Color = stepColor
+	questBanner.IconFrame.IconImage.Image = step.icon or TutorialConfig.DefaultIcon
+
+	if activeHighlight then
+		local stroke = activeHighlight:FindFirstChildOfClass("UIStroke")
+		if stroke then stroke.Color = stepColor end
+	end
+
+	local strokeGrad = questBanner.BannerStroke:FindFirstChild("StrokeGradient")
+	if strokeGrad then
+		strokeGrad.Color = ColorSequence.new({ ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1)), ColorSequenceKeypoint.new(1, stepColor) })
+	end
+
+	local targetPos, targetScale = GetBannerTarget()
+
+	if not questBanner.Visible then
+		questBanner.Position = UDim2.new(0.5, 0, 0, -250); questBanner.Visible = true
+		TweenService:Create(questBanner, TweenInfo.new(0.6, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Position = targetPos }):Play()
+	else
+		TweenService:Create(questBanner, TweenInfo.new(0.4, Enum.EasingStyle.Sine), { Position = targetPos }):Play()
+	end
+
+	local scaleObj = questBanner:FindFirstChildOfClass("UIScale")
+	if scaleObj then
+		TweenService:Create(scaleObj, TweenInfo.new(0.4, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = targetScale }):Play()
+	end
+
+	if shared.PlayUISound then shared.PlayUISound(SoundConfig.TutorialHint or "6895079853") end
+end
+
+-- Corrects AbsolutePosition to TutorialOverlays screen space (IgnoreGuiInset=true)
+local function GetScreenPos(guiObject)
+	local pos  = guiObject.AbsolutePosition
+	local sGui = guiObject:FindFirstAncestorOfClass("ScreenGui")
+	if sGui and not sGui.IgnoreGuiInset then
+		local inset = GuiService:GetGuiInset()
+		return Vector2.new(pos.X + inset.X, pos.Y + inset.Y)
+	end
+	return pos
+end
+
+---------------------------------------------------------------
+-- CORE LOOP (RenderStepped)
+---------------------------------------------------------------
+local function StartTrackingLoop()
+	if trackingConnection then trackingConnection:Disconnect() end
+
+	local bounceTime = 0
+	local isAutoScrolling = false
+
+	trackingConnection = RunService.RenderStepped:Connect(function(dt)
+		local allLockedTags = {}; local currentUnlockedTags = {}
+
+		for i, stp in ipairs(TutorialConfig.Steps) do
+			if stp.unlockTags then
+				for _, tag in ipairs(stp.unlockTags) do
+					allLockedTags[tag] = true
+					if tutorialComplete or i <= currentStepIndex then currentUnlockedTags[tag] = true end
 				end
-				local origVel = storageBelt:GetAttribute("OriginalVelocity")
-				if isFull then
-					storageBelt.AssemblyLinearVelocity = origVel * -2
+			end
+		end
+
+		for tag, _ in pairs(allLockedTags) do
+			local isUnlocked = currentUnlockedTags[tag] or tutorialComplete
+			local elements = CollectionService:GetTagged(tag)
+			for _, el in ipairs(elements) do
+				local overlay = el:FindFirstChild("TutorialLockOverlay")
+				if not isUnlocked then
+					if not overlay then
+						overlay = Instance.new("TextButton"); overlay.Name = "TutorialLockOverlay"; overlay.Size = UDim2.new(1, 0, 1, 0)
+						overlay.Position = UDim2.new(0, 0, 0, 0); overlay.AnchorPoint = Vector2.new(0, 0)
+						overlay.BackgroundColor3 = Color3.fromRGB(15, 15, 20); overlay.BackgroundTransparency = 0.5
+						overlay.ZIndex = 99998; overlay.Text = ""; overlay.AutoButtonColor = false
+
+						local corner = el:FindFirstChildOfClass("UICorner")
+						if corner then corner:Clone().Parent = overlay end
+
+						local icon = Instance.new("ImageLabel"); icon.Name = "PadlockIcon"; icon.Size = UDim2.new(0, 24, 0, 24)
+						icon.AnchorPoint = Vector2.new(0.5, 0.5); icon.Position = UDim2.new(0.5, 0, 0.5, 0)
+						icon.BackgroundTransparency = 1; icon.Image = "rbxassetid://14921768814"; icon.ImageColor3 = Color3.fromRGB(255, 255, 255)
+						icon.ScaleType = Enum.ScaleType.Fit; icon.ZIndex = 99999; icon.Parent = overlay
+
+						overlay.Parent = el
+					end
 				else
-					storageBelt.AssemblyLinearVelocity = origVel
+					if overlay then overlay:Destroy() end
 				end
 			end
 		end
-	end
 
-	local habModel = HabitatHolder:FindFirstChildWhichIsA("Model")
-	if habModel then
-		local storageBelt = habModel:FindFirstChild("StorageBelt", true)
-		if storageBelt and storageBelt:IsA("BasePart") then
-			if not storageBelt:GetAttribute("OriginalVelocity") then
-				storageBelt:SetAttribute("OriginalVelocity", storageBelt.AssemblyLinearVelocity)
+		if tutorialComplete then 
+			if activePointer then activePointer.Visible = false end
+			if activeHighlight then activeHighlight.Visible = false end
+			HideBanner()
+			if trackingConnection then trackingConnection:Disconnect() end
+			return 
+		end
+
+		bounceTime += dt * 5
+
+		local screenW = camera.ViewportSize.X
+		local screenH = camera.ViewportSize.Y
+
+		local refSize        = math.max(screenW, screenH)          
+		local pointerScaleFactor = math.clamp(refSize / 1080, 0.45, 1.3)
+
+		local basePointerSize    = TutorialConfig.PointerSize or UDim2.new(0, 80, 0, 80)
+		local scaledPointerW     = basePointerSize.X.Offset * pointerScaleFactor
+		local scaledPointerH     = basePointerSize.Y.Offset * pointerScaleFactor
+
+		activePointer.Size = UDim2.new(
+			basePointerSize.X.Scale, scaledPointerW,
+			basePointerSize.Y.Scale, scaledPointerH
+		)
+
+		local bounceAmp    = screenH * 0.022
+		local bounceOffset = math.abs(math.sin(bounceTime)) * bounceAmp
+
+		local isMobileView = screenW <= 850 or screenH <= 600
+
+		local step = activeFallbackStep or TutorialConfig.GetStepByIndex(currentStepIndex)
+		if not step then return end
+
+		if not activeFallbackStep then
+			if not MeetsStrictGates(step) then
+				if step.fallbackStepId then
+					local foundFallback = TutorialConfig.GetStepById(step.fallbackStepId)
+					if foundFallback then activeFallbackStep = foundFallback; step = activeFallbackStep end
+				end
 			end
-			local origVel = storageBelt:GetAttribute("OriginalVelocity")
-			if isFull then
-				storageBelt.AssemblyLinearVelocity = origVel * -2
+		else
+			local originalStep = TutorialConfig.GetStepByIndex(currentStepIndex)
+			if originalStep and MeetsStrictGates(originalStep) then
+				activeFallbackStep = nil; step = originalStep
+			end
+		end
+
+		if not step then return end 
+
+		if step.bannerTitle then
+			if lastDisplayedStepId ~= step.id then
+				lastDisplayedStepId = step.id
+				ShowBanner(step)
+				if step.cameraTarget or step.cameraTrackMode then ForceCloseUI:Fire() end
+			end
+
+			if questBanner and questBanner.Visible then
+				local targetPos, targetScale = GetBannerTarget()
+				questBanner.Position = questBanner.Position:Lerp(targetPos, 0.15)
+				local scaleObj = questBanner:FindFirstChildOfClass("UIScale")
+				if scaleObj then
+					scaleObj.Scale = scaleObj.Scale + ((targetScale - scaleObj.Scale) * 0.15)
+				end
+			end
+
+			local progressText = ""
+			local checkStep = activeFallbackStep and TutorialConfig.GetStepByIndex(currentStepIndex) or step
+
+			if checkStep.requireCubesProduced then
+				local capCubes = math.min(GetStepCubes(), checkStep.requireCubesProduced)
+				progressText = "\n<b><font color='rgb(100, 255, 100)'>Progress: " .. capCubes .. " / " .. checkStep.requireCubesProduced .. "</font></b>"
+			elseif checkStep.requirePlatformsShipped then
+				local capShipped = math.min(GetStepShipped(), checkStep.requirePlatformsShipped)
+				progressText = "\n<b><font color='rgb(100, 255, 100)'>Progress: " .. capShipped .. " / " .. checkStep.requirePlatformsShipped .. "</font></b>"
+			elseif checkStep.requireCurrency then
+				local currentCash = player:GetAttribute("LiveCurrency") or liveStats.currency
+				local capCash = math.min(math.floor(currentCash), checkStep.requireCurrency)
+				progressText = "\n<b><font color='rgb(100, 255, 100)'>Progress: $" .. capCash .. " / $" .. checkStep.requireCurrency .. "</font></b>"
+			elseif checkStep.reachMultiplier then
+				local currentMult = liveStats.currentMultiplier or 1
+				local capMult = math.min(currentMult, checkStep.reachMultiplier)
+				progressText = "\n<b><font color='rgb(255, 255, 50)'>Progress: " .. string.format("%.1f", capMult) .. "x / " .. string.format("%.1f", checkStep.reachMultiplier) .. "x</font></b>"
+			elseif checkStep.requireStepGoldenAuras then
+				local capGA = math.min(GetStepGoldenAuras(), checkStep.requireStepGoldenAuras)
+				progressText = "\n<b><font color='rgb(255, 215, 0)'>Progress: " .. capGA .. " / " .. checkStep.requireStepGoldenAuras .. " GA</font></b>"
+			elseif checkStep.requireFarmEval then
+				local capFE = math.min(math.floor(liveStats.farmEvaluation), checkStep.requireFarmEval)
+				progressText = "\n<b><font color='rgb(100, 255, 100)'>Progress: $" .. Formatter.Format(capFE) .. " / $" .. Formatter.Format(checkStep.requireFarmEval) .. "</font></b>"
+			elseif checkStep.requireBoostBought then
+				local cap = math.min(GetStepBoostsBought(checkStep.requireBoostBought.id), checkStep.requireBoostBought.count)
+				progressText = "\n<b><font color='rgb(100, 255, 100)'>Progress: " .. cap .. " / " .. checkStep.requireBoostBought.count .. "</font></b>"
+			elseif checkStep.requireBoostUsed then
+				local cap = math.min(GetStepBoostsUsed(checkStep.requireBoostUsed.id), checkStep.requireBoostUsed.count)
+				progressText = "\n<b><font color='rgb(100, 255, 100)'>Progress: " .. cap .. " / " .. checkStep.requireBoostUsed.count .. "</font></b>"
+			end
+
+			-- ✨ Write to the new TextContainer wrapper
+			questBanner.TextContainer.Body.Text = step.bannerBody .. progressText
+
+		else
+			if lastDisplayedStepId ~= nil then lastDisplayedStepId = nil; HideBanner() end
+		end
+
+		local targetToTrack2D = nil
+		local targetToTrack3D = nil
+
+		if step.target3D then
+			if string.find(string.lower(step.target3D), "aura") then
+				local aura = GetActiveAura()
+				if aura then targetToTrack3D = aura:IsA("Model") and aura:GetPivot().Position or aura.Position end
 			else
-				storageBelt.AssemblyLinearVelocity = origVel
+				local obj = CollectionService:GetTagged(step.target3D)[1]
+				if obj then targetToTrack3D = obj:IsA("Model") and obj:GetPivot().Position or obj.Position end
+			end
+		elseif step.targetTag then
+			if step.menuTag and step.menuOpenBtnTag then
+				local menuInstances = CollectionService:GetTagged(step.menuTag)
+				local menuIsOpen = false
+				for _, menu in ipairs(menuInstances) do
+					if IsVisibleOnScreen(menu) then menuIsOpen = true; break end
+				end
+				targetToTrack2D = menuIsOpen and CollectionService:GetTagged(step.targetTag)[1] or CollectionService:GetTagged(step.menuOpenBtnTag)[1]
+			else
+				targetToTrack2D = CollectionService:GetTagged(step.targetTag)[1]
 			end
 		end
-	end
-end)
 
-UpdateHatcheryBridge:Connect(function(info)
-	local finalMax = info.max
-	local localHatchLvl = player:GetAttribute("LocalHatcheryLevel")
+		if targetToTrack3D then
+			local screenPos, onScreen = camera:WorldToViewportPoint(targetToTrack3D)
+			if onScreen and screenPos.Z > 0 then
+				activePointer.Visible = true; activeHighlight.Visible = false 
+				activePointer.Rotation = 0
+				activePointer.Position = UDim2.new(0, screenPos.X, 0, screenPos.Y - (activePointer.Size.Y.Offset / 2) - bounceOffset)
+			else
+				activePointer.Visible = false; activeHighlight.Visible = false
+			end
 
-	if localHatchLvl then
-		local UpgradeConfig = require(ReplicatedStorage.Modules.UpgradeConfig)
-		local cfg = UpgradeConfig.GetUpgradeConfig("hatcheryCapacity")
-		if cfg and cfg.apply then
-			local predictedMax = cfg.apply({ upgrades = { hatcheryCapacity = localHatchLvl } })
-			finalMax = math.max(info.max, predictedMax)
+		elseif targetToTrack2D and targetToTrack2D:IsA("GuiObject") then
+
+			local function ResolveButton(obj)
+				if obj:IsA("GuiButton") and obj.AbsoluteSize.Magnitude > 1 then return obj end
+				local b = obj:FindFirstChildWhichIsA("TextButton", true)
+					or obj:FindFirstChildWhichIsA("ImageButton", true)
+				if b and b.AbsoluteSize.Magnitude > 1 then return b end
+				if obj.Parent and obj.Parent:IsA("GuiObject") then
+					b = obj.Parent:FindFirstChildWhichIsA("TextButton", true)
+						or obj.Parent:FindFirstChildWhichIsA("ImageButton", true)
+					if b and b.AbsoluteSize.Magnitude > 1 then return b end
+				end
+				return obj  
+			end
+
+			targetToTrack2D = ResolveButton(targetToTrack2D)
+
+			if targetToTrack2D.AbsoluteSize.Magnitude <= 1 or not IsVisibleOnScreen(targetToTrack2D) then
+				activePointer.Visible = false
+				activeHighlight.Visible = false
+			else
+				activePointer.Visible   = true
+				activeHighlight.Visible = true
+
+				local tgtW = targetToTrack2D.AbsoluteSize.X
+				local tgtH = targetToTrack2D.AbsoluteSize.Y
+				local corrected = GetScreenPos(targetToTrack2D)
+
+				local tgtX = targetToTrack2D.AbsolutePosition.X
+				local tgtY = targetToTrack2D.AbsolutePosition.Y
+
+				local scaleObj = targetToTrack2D:FindFirstChildOfClass("UIScale")
+				if scaleObj and scaleObj.Scale ~= 1 then
+					local s      = scaleObj.Scale
+					local anchor = targetToTrack2D.AnchorPoint
+					local anchorPxX = tgtX + (tgtW * anchor.X)
+					local anchorPxY = tgtY + (tgtH * anchor.Y)
+					tgtW = tgtW * s;  tgtH = tgtH * s
+					tgtX = anchorPxX - (tgtW * anchor.X)
+					tgtY = anchorPxY - (tgtH * anchor.Y)
+				end
+
+				local centerX = tgtX + (tgtW / 2)
+				local centerY = tgtY + (tgtH / 2)
+
+				local padding      = screenH * 0.018   
+				local topHighExtra = screenH * 0.065   
+
+				local pointerW = scaledPointerW
+				local pointerH = scaledPointerH
+
+				local pX, pY, rot
+				local dir = "BOTTOM"
+				local tagCheck = step.targetTag or ""
+
+				if HUD_DIRECTIONS[tagCheck] then
+					dir = HUD_DIRECTIONS[tagCheck]
+				elseif tagCheck:match("Tutorial_AchieveRow") or tagCheck:match("Tutorial_BuyBoost") or tagCheck:match("Tutorial_UseBoost") then
+					dir = "RIGHT"
+				else
+					if centerX < screenW * 0.3 then        dir = "RIGHT"
+					elseif centerX > screenW * 0.7 then    dir = "LEFT"
+					elseif centerY > screenH * 0.5 then    dir = "TOP"
+					else                                   dir = "BOTTOM" end
+				end
+
+				if dir == "RIGHT" then
+					pX = centerX + (tgtW / 2) + (pointerW / 2) + padding + bounceOffset
+					pY = centerY;  rot = 90
+				elseif dir == "LEFT" then
+					pX = centerX - (tgtW / 2) - (pointerW / 2) - padding - bounceOffset
+					pY = centerY;  rot = -90
+				elseif dir == "TOP_HIGH" then
+					pX = centerX
+					pY = centerY - (tgtH / 2) - (pointerH / 2) - topHighExtra - bounceOffset
+					rot = 0
+				elseif dir == "TOP" then
+					pX = centerX
+					pY = centerY - (tgtH / 2) - (pointerH / 2) - padding - bounceOffset
+					rot = 0
+				elseif dir == "BOTTOM" then
+					pX = (tgtW > screenW * 0.18) and (centerX + (tgtW / 2) - tgtW * 0.08) or centerX
+					pY = centerY + (tgtH / 2) + (pointerH / 2) + padding * 0.15 + bounceOffset
+					rot = 180
+				end
+
+				pX = math.clamp(pX, pointerW / 2 + 4, screenW - pointerW / 2 - 4)
+				pY = math.clamp(pY, pointerH / 2 + 4, screenH - pointerH / 2 - 4)
+
+				activePointer.Position = activePointer.Position:Lerp(UDim2.new(0, pX, 0, pY), 0.3)
+				activePointer.Rotation = rot
+
+				local highlightPad = math.max(6, screenH * 0.010)
+				activeHighlight.Position = activeHighlight.Position:Lerp(UDim2.new(0, centerX, 0, centerY), 0.4)
+				activeHighlight.Size     = activeHighlight.Size:Lerp(
+					UDim2.new(0, tgtW + highlightPad * 2, 0, tgtH + highlightPad * 2), 0.4)
+
+				local targetCorner    = targetToTrack2D:FindFirstChildOfClass("UICorner")
+				local highlightCorner = activeHighlight:FindFirstChildOfClass("UICorner")
+				if targetCorner and highlightCorner then
+					highlightCorner.CornerRadius = targetCorner.CornerRadius
+				end
+
+				local scrollFrame = targetToTrack2D:FindFirstAncestorOfClass("ScrollingFrame")
+				if scrollFrame and not isAutoScrolling then
+					local targetY2   = targetToTrack2D.AbsolutePosition.Y
+					local scrollY    = scrollFrame.AbsolutePosition.Y
+					local scrollBot  = scrollY + scrollFrame.AbsoluteSize.Y
+					if (targetY2 + tgtH < scrollY) or (targetY2 > scrollBot) then
+						isAutoScrolling = true
+						AutoScrollToTarget(targetToTrack2D)
+						task.delay(0.5, function() isAutoScrolling = false end)
+					end
+				end
+			end  
+		else
+			activePointer.Visible = false; activeHighlight.Visible = false
 		end
-	end
-	UpdateHatcheryBar(info.current, finalMax)
-end)
 
-local localUpgradesState = {}
+		if step.cameraTrackMode == "FollowAura" then
+			local aura = GetActiveAura()
+			if aura then
+				if camera.CameraType ~= Enum.CameraType.Scriptable then camera.CameraType = Enum.CameraType.Scriptable end
+				local targetPos = aura:IsA("Model") and aura:GetPivot().Position or aura.Position
+				local offset = step.cameraOffset or Vector3.new(0, 8, 10) 
+				camera.CFrame = camera.CFrame:Lerp(CFrame.new(targetPos + offset, targetPos), 0.025) 
+			else
+				local fallbackCam = CollectionService:GetTagged("Tutorial_AuraHolderCam")[1]
+				if fallbackCam then
+					if camera.CameraType ~= Enum.CameraType.Scriptable then camera.CameraType = Enum.CameraType.Scriptable end
+					local desiredCFrame = fallbackCam:IsA("Model") and fallbackCam:GetPivot() or fallbackCam.CFrame
+					camera.CFrame = camera.CFrame:Lerp(desiredCFrame, 0.025)
+				end
+			end
 
-local function RecalculateMaxTier()
-	local speedData = localUpgradesState["multiplierSpeed"]
-	local speedLevel = (typeof(speedData) == "table" and speedData.level) or (typeof(speedData) == "number" and speedData) or 0
-	playerMultSpeed = 1.0 + (speedLevel * 0.05) 
+		elseif step.cameraTrackMode == "FollowPhysicsAura" then
+			local physicsAura = GetActivePhysicsAura()
 
-	local tierUnlocks = {
-		{ upgradeId = "unlockOmniMult",      tier = 10 },
-		{ upgradeId = "unlockUniversalMult", tier = 9 },
-		{ upgradeId = "unlockGodlyMult",     tier = 8 },
-		{ upgradeId = "unlockCosmicMult",    tier = 7 },
-		{ upgradeId = "unlockMythicMult",    tier = 6 },
-	}
+			local cameraTimeExpired = false
+			if step.cameraDuration then
+				if not step._cameraStartTime then step._cameraStartTime = tick() end
+				if tick() - step._cameraStartTime >= step.cameraDuration then
+					cameraTimeExpired = true
+				end
+			end
 
-	local calculatedMaxTier = 5 
-	for _, data in ipairs(tierUnlocks) do
-		local upgData = localUpgradesState[data.upgradeId]
-		local level = (typeof(upgData) == "table" and upgData.level) or (typeof(upgData) == "number" and upgData) or 0
-		if level > 0 then calculatedMaxTier = data.tier; break end
-	end
-	playerMaxTier = calculatedMaxTier
-end
+			if physicsAura and not cameraTimeExpired then
+				step._returningToPlayer = nil 
+				if camera.CameraType ~= Enum.CameraType.Scriptable then camera.CameraType = Enum.CameraType.Scriptable end
+				local targetPos = physicsAura:IsA("Model") and physicsAura:GetPivot().Position or physicsAura.Position
+				local offset = step.cameraOffset or Vector3.new(0, 15, 25) 
+				camera.CFrame = camera.CFrame:Lerp(CFrame.new(targetPos + offset, targetPos), 0.05) 
+			else
+				if camera.CameraType == Enum.CameraType.Scriptable then
+					if not step._returningToPlayer then
+						step._returningToPlayer = true
+						local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+						if hrp then
+							local targetCF = CFrame.new(hrp.Position + Vector3.new(0, 8, 12), hrp.Position)
+							local tween = TweenService:Create(camera, TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {CFrame = targetCF})
+							tween:Play()
+							tween.Completed:Once(function()
+								if step._returningToPlayer then
+									camera.CameraType = Enum.CameraType.Custom
+									camera.CameraSubject = player.Character:FindFirstChild("Humanoid")
+								end
+							end)
+						else
+							camera.CameraType = Enum.CameraType.Custom
+						end
+					end
+				end
+			end
 
-ReplicatedStorage.RemoteEvents.UpgradeUpdated.OnClientEvent:Connect(function(info)
-	if not info then return end
-	if info.type == "fullState" and info.upgrades then
-		localUpgradesState = info.upgrades; RecalculateMaxTier()
-	elseif info.type == "purchased" then
-		if not localUpgradesState[info.upgradeId] then localUpgradesState[info.upgradeId] = {} end
-		if type(localUpgradesState[info.upgradeId]) == "number" then localUpgradesState[info.upgradeId] = { level = info.level }
-		else localUpgradesState[info.upgradeId].level = info.level end
-		RecalculateMaxTier()
-	end
-end)
+		elseif step.cameraTarget then
+			local camTarget = CollectionService:GetTagged(step.cameraTarget)[1]
+			if not camTarget or not camTarget.Parent then
+				if camera.CameraType ~= Enum.CameraType.Custom then
+					camera.CameraType = Enum.CameraType.Custom
+					if player.Character and player.Character:FindFirstChild("Humanoid") then
+						camera.CameraSubject = player.Character:FindFirstChild("Humanoid")
+					end
+				end
+			else
+				if camera.CameraType ~= Enum.CameraType.Scriptable then camera.CameraType = Enum.CameraType.Scriptable end
+				local desiredCFrame = camTarget:IsA("Model") and camTarget:GetPivot() or camTarget.CFrame
+				camera.CFrame = camera.CFrame:Lerp(desiredCFrame, 0.03)
+			end
+		else
+			if camera.CameraType ~= Enum.CameraType.Custom then
+				camera.CameraType = Enum.CameraType.Custom
+				if player.Character and player.Character:FindFirstChild("Humanoid") then
+					camera.CameraSubject = player.Character:FindFirstChild("Humanoid")
+				end
+			end
+		end
 
-local EpicUpgradeUpdated = ReplicatedStorage.RemoteEvents:FindFirstChild("EpicUpgradeUpdated")
-if EpicUpgradeUpdated then
-	EpicUpgradeUpdated.OnClientEvent:Connect(function(info)
-		if not info then return end
-		if info.type == "fullState" and info.upgrades then
-			for k,v in pairs(info.upgrades) do localUpgradesState[k] = v end; RecalculateMaxTier()
-		elseif info.type == "purchased" then
-			if not localUpgradesState[info.upgradeId] then localUpgradesState[info.upgradeId] = {} end
-			if type(localUpgradesState[info.upgradeId]) == "number" then localUpgradesState[info.upgradeId] = { level = info.level }
-			else localUpgradesState[info.upgradeId].level = info.level end
-			RecalculateMaxTier()
+		if not step._startTime then step._startTime = tick() end
+
+		if step.duration and step.duration > 0 then
+			if tick() - step._startTime >= step.duration then shared.AdvanceTutorialStep(true) end
+		elseif step.duration == 0 then
+			if MeetsStrictGates(step) and not activeFallbackStep then shared.AdvanceTutorialStep(true) 
+			elseif step.failsafeDuration and (tick() - step._startTime >= step.failsafeDuration) then shared.AdvanceTutorialStep(true) end
 		end
 	end)
 end
 
+---------------------------------------------------------------
+-- EXTERNAL ADVANCEMENT (Server or Local UI)
+---------------------------------------------------------------
+shared.AdvanceTutorialStep = function(forceAdvance)
+	if isAdvancing then return end 
+	if tutorialComplete then return end
+	if activeFallbackStep then return end
+
+	local currentStepData = TutorialConfig.GetStepByIndex(currentStepIndex)
+	if currentStepData and currentStepData.duration ~= 0 and not forceAdvance then
+		if not actionMatchedForAdvance then return end
+	end
+
+	actionMatchedForAdvance = false; lockedAura = nil 
+
+	if currentStepData and currentStepData.duration == 0 and not forceAdvance then
+		if not MeetsStrictGates(currentStepData) then return end
+	end
+
+	isAdvancing = true 
+
+	if currentStepData then TutorialStepComplete:FireServer(currentStepData.id) end
+	currentStepIndex += 1
+
+	baselineCubes = liveStats.totalCubesProduced
+	baselineShipped = liveStats.totalPlatformsShipped
+	baselineGoldenAuras = player:GetAttribute("LiveGoldenAuras") or liveStats.goldenAuras
+	for k, v in pairs(liveStats.boostsBought) do baselineBoostsBought[k] = v end
+	for k, v in pairs(liveStats.boostsUsed) do baselineBoostsUsed[k] = v end
+
+	local nextStep = TutorialConfig.GetStepByIndex(currentStepIndex)
+
+	if not nextStep then
+		tutorialComplete = true
+		if activePointer then activePointer.Visible = false end
+		if activeHighlight then activeHighlight.Visible = false end
+		HideBanner()
+		if trackingConnection then trackingConnection:Disconnect() end
+
+		camera.CameraType = Enum.CameraType.Custom
+		if player.Character and player.Character:FindFirstChild("Humanoid") then
+			camera.CameraSubject = player.Character:FindFirstChild("Humanoid")
+		end
+
+		TutorialStepComplete:FireServer("__tutorialComplete__")
+
+		local successSound = Instance.new("Sound")
+		successSound.SoundId = "rbxassetid://4612385808"; successSound.Volume = 0.6
+		successSound.Parent = game:GetService("SoundService"); successSound:Play()
+		game:GetService("Debris"):AddItem(successSound, 4)
+	end
+
+	task.delay(0.1, function() isAdvancing = false end)
+end
+
+---------------------------------------------------------------
+-- STATE RECONCILIATION & DATA SYNC
+---------------------------------------------------------------
 UpdateHUDBridge:Connect(function(stats)
-	local needsRefresh = false
+	if stats.currency ~= nil then liveStats.currency = stats.currency end
+	if stats.totalEarned ~= nil then liveStats.totalEarned = stats.totalEarned end
+	if stats.farmEvaluation ~= nil then liveStats.farmEvaluation = stats.farmEvaluation end
+	if stats.soulAuras ~= nil then liveStats.soulAuras = stats.soulAuras end
+	if stats.goldenAuras ~= nil then liveStats.goldenAuras = stats.goldenAuras end
+	if stats.prestigeCount ~= nil then liveStats.prestigeCount = stats.prestigeCount end
+	if stats.currentArea ~= nil then liveStats.currentArea = stats.currentArea end
 
-	if stats.passiveInterval ~= nil and stats.passiveInterval ~= currentPassiveInterval then 
-		currentPassiveInterval = stats.passiveInterval
-		needsRefresh = true
-	end
+	if stats.pendingAuras ~= nil then liveStats.pendingAuras = stats.pendingAuras end
+	if stats.habitatCapacity ~= nil then liveStats.habitatCapacity = stats.habitatCapacity end
+	if stats.rate ~= nil then liveStats.rate = stats.rate end
 
-	if stats.boostMultiplier ~= nil and stats.boostMultiplier ~= globalBoostMultiplier then
-		globalBoostMultiplier = stats.boostMultiplier
-		needsRefresh = true
-	end
+	if stats.totalCubesProduced ~= nil then liveStats.totalCubesProduced = math.max(liveStats.totalCubesProduced, stats.totalCubesProduced) end
+	if stats.totalPlatformsShipped ~= nil then liveStats.totalPlatformsShipped = math.max(liveStats.totalPlatformsShipped, stats.totalPlatformsShipped) end
+	if stats.totalLegendaryCubes ~= nil then liveStats.totalLegendaryCubes = math.max(liveStats.totalLegendaryCubes, stats.totalLegendaryCubes) end
+	if stats.piggyBank ~= nil then liveStats.piggyBank = stats.piggyBank end
 
-	if stats.currentFireRate ~= nil then
-		currentFireRate = stats.currentFireRate
-	end
+	if stats.tutorialComplete ~= nil then tutorialComplete = stats.tutorialComplete end
 
-	if stats.upgrades then
-		for k, v in pairs(stats.upgrades) do localUpgradesState[k] = v end
-		RecalculateMaxTier()
-	end
+	if stats.tutorialProgress and not tutorialComplete then
+		local highestCompletedIndex = 0
 
-	if stats.pendingAuras ~= nil and stats.habitatCapacity ~= nil then
-		latestPendingAuras = stats.pendingAuras
-		latestHabitatCapacity = stats.habitatCapacity
-
-		if stats.pendingAuras < stats.habitatCapacity and habitatFull then
-			habitatFull = false; HabitatFullEvent:Fire(false); UpdateButtonVisual()
-		end
-		UpdateHabitatBar(stats.pendingAuras, stats.habitatCapacity)
-	end
-
-	if needsRefresh then RefreshAllRateLabels() end
-end)
-
-task.spawn(function()
-	while true do
-		if holding then
-			if hatcheryEmpty or habitatFull then
-				table.clear(trackedInputs); EvaluateHolding()
-			else
-				ProduceAuraBridge:Fire(); UpdateButtonVisual()
-			end
-		end
-		task.wait(currentFireRate)
-	end
-end)
-
----------------------------------------------------------------
--- AURA MUTATION RESPONSES (BRIDGENET2)
----------------------------------------------------------------
-AuraSpawnedBridge:Connect(function(info)
-	local instance, isCustom = SpawnAuraInstance(info.tier, info.color, info.glow, info.spawnPos, info.currentArea)
-
-	-- FIX: Prevent errors if instance fails to spawn
-	if not instance then return end
-
-	instance:SetAttribute("AuraCube", true)
-	ScaleAura(instance, info.tier, false)
-	ShowCubeValue(info.spawnPos, info.value, info.color)
-	PlayVFX("Spawn", info.spawnPos, 1.0)
-
-	local permLabel = AttachPermanentRateLabel(instance, info.value, info.color)
-
-	if info.tier == "Legendary" then
-		ShowTierPopup(info.spawnPos, "Legendary", Color3.fromRGB(255, 200, 0))
-		PlayVFX("Legendary", info.spawnPos, 2.0)
-	end
-
-	if info.cubeId then
-		cubeDataMap[info.cubeId] = { 
-			instance = instance, 
-			tierName = info.tier, 
-			isCustom = isCustom,
-			rateLabel = permLabel,
-			baseValue = info.value 
-		}
-		instance.AncestryChanged:Connect(function(_, parent)
-			if not parent then cubeDataMap[info.cubeId] = nil end
-		end)
-	end
-end)
-
-CubeMutatedBatchBridge:Connect(function(batchData)
-	for _, info in ipairs(batchData) do
-		local cubeData = cubeDataMap[info.cubeId]
-		if not cubeData then continue end 
-
-		if info.newValue then
-			cubeData.baseValue = info.newValue
+		for index, stepData in ipairs(TutorialConfig.Steps) do
+			if stats.tutorialProgress[stepData.id] then highestCompletedIndex = index end
 		end
 
-		local instance = cubeData.instance
-		if not instance or not instance.Parent then continue end 
+		if highestCompletedIndex >= currentStepIndex then
+			currentStepIndex = highestCompletedIndex + 1
 
-		local rootPart = GetRootPart(instance)
-		if not rootPart then continue end 
-		local position = rootPart.Position
+			baselineCubes = liveStats.totalCubesProduced
+			baselineShipped = liveStats.totalPlatformsShipped
+			baselineGoldenAuras = player:GetAttribute("LiveGoldenAuras") or liveStats.goldenAuras
+			for k, v in pairs(liveStats.boostsBought) do baselineBoostsBought[k] = v end
+			for k, v in pairs(liveStats.boostsUsed) do baselineBoostsUsed[k] = v end
 
-		if info.mutationType == "tierUpgrade" then
-			PlayVFX("TierUpgrade", position, 1.5)
-			if info.tierName == "Legendary" then PlayVFX("Legendary", position, 2.0) end
-
-			local oldTierName = cubeData.tierName
-			local newAura = PoolManager.GetAura(info.currentArea, info.tierName)
-
-			if newAura:IsA("Model") then
-				newAura:PivotTo(CFrame.new(position))
-				if newAura.PrimaryPart then
-					newAura.PrimaryPart.Anchored = false
-					newAura.PrimaryPart.CanCollide = true
-					newAura.PrimaryPart.CollisionGroup = "Auras"
-				end
-			elseif newAura:IsA("BasePart") then
-				newAura.Position = position
-				newAura.Anchored = false
-				newAura.CanCollide = true
-				newAura.CollisionGroup = "Auras"
-				newAura.Color = info.newColor
+			if not TutorialConfig.GetStepByIndex(currentStepIndex) then
+				tutorialComplete = true
+				if trackingConnection then trackingConnection:Disconnect() end
+				if questBanner then HideBanner() end
+				if activePointer then activePointer.Visible = false end
+				if activeHighlight then activeHighlight.Visible = false end
 			end
-
-			for _, desc in ipairs(newAura:GetDescendants()) do
-				if desc:IsA("ParticleEmitter") or desc:IsA("Trail") then desc.Enabled = true end
-			end
-
-			newAura.Parent = workspace
-			newAura:SetAttribute("AuraCube", true)
-			ScaleAura(newAura, info.tierName, true, oldTierName)
-			ApplyHeavyPhysics(newAura)
-
-			if cubeData.rateLabel and cubeData.rateLabel.Parent and cubeData.rateLabel.Parent:IsA("BillboardGui") then
-				local bb = cubeData.rateLabel.Parent
-				bb.Adornee = GetRootPart(newAura)
-				bb.Parent = GetRootPart(newAura)
-				cubeData.rateLabel.TextColor3 = info.newColor or Color3.fromRGB(100, 255, 100)
-				if cubeData.isStored then bb.Enabled = false end
-			end
-
-			PoolManager.ReturnAura(instance)
-			cubeData.instance = newAura; cubeData.tierName = info.tierName; cubeData.isCustom = true
-			newAura.AncestryChanged:Connect(function(_, parent) if not parent then cubeDataMap[info.cubeId] = nil end end)
-
-			ShowTierPopup(position, info.tierName, info.newColor)
-		end
-
-		if cubeData.rateLabel and cubeData.rateLabel.Parent and not cubeData.isStored then
-			local ratePerSec = ((cubeData.baseValue or 0) * globalBoostMultiplier) / currentPassiveInterval
-			cubeData.rateLabel.Text = "+$" .. FormatNumber(ratePerSec) .. "/sec"
 		end
 	end
 end)
 
 ---------------------------------------------------------------
--- ANTI-STUCK / FALL-OFF FAILSAFE
+-- BOOT & MENU GATE
 ---------------------------------------------------------------
 task.spawn(function()
-	while true do
-		task.wait(1.5)
-		local now = tick()
+	local menuGate = ReplicatedStorage:WaitForChild("MenuDismissed", 10)
+	if menuGate and not menuGate:GetAttribute("Fired") then menuGate.Event:Wait() end
 
-		for id, data in pairs(cubeDataMap) do
-			if not data.isStored and data.instance and data.instance.Parent then
-				local root = GetRootPart(data.instance)
-				if root then
-					local currentPos = root.Position
-					if not data.spawnY then
-						data.spawnY = currentPos.Y; data.lastPos = currentPos; data.lastMovedTime = now
-					end
-					if currentPos.Y < data.spawnY - 12 then
-						CubeSmushedBridge:Fire(id)
-						PlayVFX("Spawn", currentPos, 0.5)
-						PoolManager.ReturnAura(data.instance)
-						cubeDataMap[id] = nil
-						continue
-					end
+	local character = player.Character or player.CharacterAdded:Wait()
+	local humanoid = character:WaitForChild("Humanoid", 5)
+	camera.CameraType = Enum.CameraType.Custom
+	if humanoid then camera.CameraSubject = humanoid end
 
-					local dist = (currentPos - data.lastPos).Magnitude
-					if dist < 0.25 then
-						if now - data.lastMovedTime > 8 then
-							CubeSmushedBridge:Fire(id)
-							PlayVFX("Spawn", currentPos, 0.5)
-							PoolManager.ReturnAura(data.instance)
-							cubeDataMap[id] = nil
-						end
-					else
-						data.lastPos = currentPos; data.lastMovedTime = now
-					end
-				end
-			end
-		end
-	end
+	tutorialActive = true
+	InitTutorialUI()
+	StartTrackingLoop()
 end)
 
+-- TutorialConfig
+-- Location: ReplicatedStorage > Modules > TutorialConfig
 
--- AuraSpawner
--- Location: ServerScriptService > AuraSpawner
+local TutorialConfig = {}
 
-local Players             = game:GetService("Players")
-local ReplicatedStorage   = game:GetService("ReplicatedStorage")
-local ServerScriptService = game:GetService("ServerScriptService")
+TutorialConfig.TutorialEndArea = 5
 
-local TierConfig     = require(ReplicatedStorage.Modules.TierConfig)
-local UpgradeConfig  = require(ReplicatedStorage.Modules.UpgradeConfig)
-local PrestigeModule = require(ReplicatedStorage.Modules.PrestigeModule)
-local AdminConfig    = require(ReplicatedStorage.Modules.AdminConfig)
-local MutationConfig = require(ReplicatedStorage.Modules.MutationConfig)
-local AreaRegistry   = require(ReplicatedStorage.Modules.AreaRegistry)
-local GameManager    = require(ServerScriptService.GameManager)
-local BoostManager   = require(ServerScriptService.BoostManager)
-local WeatherManager = require(ServerScriptService.WeatherManager) 
+-- The Ghost Hand / Pointer asset
+TutorialConfig.PointerImage = "rbxassetid://14914009728"
+TutorialConfig.PointerSize = UDim2.new(0, 75, 0, 75)
 
-local HabitatFull    = ReplicatedStorage.RemoteEvents:WaitForChild("HabitatFull")
+-- Default Styling
+TutorialConfig.DefaultColor = Color3.fromRGB(100, 200, 255)
+TutorialConfig.DefaultIcon  = "rbxassetid://14914018910"
 
--- ✨ BRIDGENET2 UPGRADES
-local BridgeNet2             = require(ReplicatedStorage.Modules:WaitForChild("BridgeNet2"))
-local UpdateHUDBridge        = BridgeNet2.ServerBridge("UpdateHUD")
-local ProduceAuraBridge      = BridgeNet2.ServerBridge("ProduceAura")
-local AuraSpawnedBridge      = BridgeNet2.ServerBridge("AuraSpawned")
-local UpdateHatcheryBridge   = BridgeNet2.ServerBridge("UpdateHatchery")
-local CubeMutatedBatchBridge = BridgeNet2.ServerBridge("CubeMutatedBatch")
-local CubeSmushedBridge      = BridgeNet2.ServerBridge("CubeSmushed")
-local CubeStoredBridge       = BridgeNet2.ServerBridge("CubeStored")
+-- THE FSM SEQUENCE
+TutorialConfig.Steps = {
 
-local HABITAT_HOLDER = workspace:WaitForChild("HabitatHolder")
-local HABITAT_PART   = HABITAT_HOLDER:WaitForChild("Position")
-local AURA_HOLDER    = workspace:WaitForChild("AuraHolder") 
+	-- ✨ STEP 1: Welcome & First Click
+	[1] = {
+		id           = "a1_welcome_click",
+		action       = "Action_ClickRedButton",
+		targetTag    = "Tutorial_ClickButton",
 
-local lastFire          = {}
-local holdStart         = {}
-local hatchery          = {}
+		bannerTitle  = "Welcome to Aura Inc!",
+		bannerBody   = "Spam Click the Red Button below to produce your first Auras.",
 
-local function GetAreaAuraModels(areaId)
-	local config = nil
-	if type(AreaRegistry.GetArea) == "function" then
-		config = AreaRegistry.GetArea(areaId)
-	elseif type(AreaRegistry.GetAreaConfig) == "function" then
-		config = AreaRegistry.GetAreaConfig(areaId)
-	elseif AreaRegistry.Areas then
-		config = AreaRegistry.Areas[areaId]
-	end
-	return config and config.auraModels or nil
+		icon         = "rbxassetid://14922082255", 
+		color        = Color3.fromRGB(143, 255, 131), 
+	},
+
+	-- ✨ STEP 2: Cinematic Camera Follow
+	[2] = {
+		id               = "a1_watch_aura",
+		action           = "Action_Wait",
+
+		cameraTrackMode  = "FollowAura", 
+		target3D         = "Aura",       
+		duration         = 5,          
+		allowClicking = true, 
+
+		bannerTitle  = "Generating Profit",
+		bannerBody   = "Each Aura generates cash every second based on its rarity.",
+
+		icon         = "rbxassetid://14949455379", --profit
+		color        = Color3.fromRGB(255, 255, 255), 
+	},
+
+	-- ✨ STEP 3: Produce Bulk
+	[3] = {
+		id           = "a1_produce_25",
+		action       = "Action_ClickRedButton",
+		targetTag    = "Tutorial_ClickButton",
+		cameraTarget = "Tutorial_AuraHolderCam",
+
+		requireCubesProduced = 25,
+		failsafeDuration = 35, 
+		bannerTitle  = "Producing Auras",
+		bannerBody   = "Keep clicking to produce 25 Auras! The more you make, the more money you earn.",
+		duration     = 0, 
+
+		icon         = "rbxassetid://14949472931", --produce
+		color        = Color3.fromRGB(130, 226, 255), 
+	},
+
+	-- ✨ STEP 4: Farm up Cash
+	[4] = {
+		id           = "a1_farm_150",
+		action       = "Action_ClickRedButton",
+
+		requireCurrency = 150,
+
+		bannerTitle  = "Stacking Cash",
+		bannerBody   = "Your Auras are passively generating income while on the Conveyer. Keep producing until you save up $150!",
+		duration     = 0,
+		failsafeDuration = 25, 
+		icon         = "rbxassetid://14957592517", --cash
+		color        = Color3.fromRGB(150, 255, 150), 
+	},
+
+	-- ✨ STEP 5: Unlock Shop
+	[5] = {
+		id           = "a1_open_shop",
+		action       = "Action_OpenShop",
+		targetTag    = "Tutorial_ShopButton",
+
+		unlockTags    = {"Tutorial_ShopButton"},
+		unlockActions = {"Action_OpenShop", "Action_CloseShop"},
+
+		bannerTitle  = "Open The Shop",
+		bannerBody   = "You have enough Money! Click the Shop icon to view your upgrades.",
+
+		icon         = "rbxassetid://14957358690", --unlock
+		color        = Color3.fromRGB(123, 216, 250),
+	},
+
+	-- ✨ STEP 6: First Upgrade
+	[6] = {
+		id             = "a1_buy_blockValue",
+		action         = "Action_BuyUpgrade",
+		targetTag      = "Tutorial_Buy_blockValue",
+
+		unlockTags     = {"Tutorial_Buy_blockValue"},
+
+		menuTag        = "Tutorial_ShopPanel",
+		menuOpenBtnTag = "Tutorial_ShopButton",
+
+		bannerTitle  = "Increase Value",
+		bannerBody   = "Buy the Value upgrade to increase the Value of your Auras by +10%",
+
+		icon         = "rbxassetid://14917130166",
+		color        = Color3.fromRGB(142, 206, 255), 
+	},
+
+	-- ✨ STEP 7: Habitat Fill
+	[7] = {
+		id           = "a1_fill_habitat",
+		action       = "Action_ClickRedButton",
+		targetTag    = "Tutorial_ClickButton",
+
+		requireHabitatFull = true,
+		duration           = 0, 
+
+		bannerTitle  = "Keep Producing",
+		bannerBody   = "Close the shop and keep Producing Auras. Spam Click or HOLD the red button To keep producing Auras.",
+
+		icon         = "rbxassetid://14958750319",
+		color        = Color3.fromRGB(130, 226, 255),
+	},
+
+	-- ✨ STEP 8: Watch Aura Die
+	[8] = {
+		id               = "a1_watch_aura_die",
+		action           = "Action_Wait",
+
+		cameraTrackMode  = "FollowAura",
+		cameraOffset     = Vector3.new(0, 22, 28), 
+
+		requireRateZero  = true, 
+		duration         = 0, 
+
+		bannerTitle  = "Incinerated!",
+		bannerBody   = "Since your habitat Got full, Auras get incinerated. Wait for your Rate to hit $0.",
+
+		icon         = "rbxassetid://14957307741",
+		color        = Color3.fromRGB(255, 0, 4), 
+	},
+
+	-- ✨ STEP 9: Pan to Habitat
+	[9] = {
+		id           = "a1_look_at_habitat",
+		action       = "Action_Wait",
+		cameraTarget = "Tutorial_HabitatCam",
+
+		duration     = 7, 
+
+		bannerTitle  = "Habitat is Full!",
+		bannerBody   = "Your storage is completely Full. You need to clear some Space.",
+
+		icon         = "rbxassetid://14950864016",
+		color        = Color3.fromRGB(255, 155, 155), 
+	},
+
+	-- ✨ STEP 10: Send Ship
+	[10] = {
+		id           = "a1_send_ship",
+		action       = "Action_SendShip",
+		targetTag    = "Tutorial_SendShipBtn",
+
+		unlockTags    = {"Tutorial_SendShipBtn"},
+		unlockActions = {"Action_SendShip"},
+
+		bannerTitle  = "Clear Space",
+		bannerBody   = "Click the newly unlocked SEND button to clear out your habitat of the Auras.",
+
+		icon         = "rbxassetid://14958914404",
+		color        = Color3.fromRGB(100, 255, 255), 
+	},
+
+	-- ✨ STEP 11: Watch Ship
+	[11] = {
+		id           = "a1_wait_for_ship",
+		action       = "Action_Wait",
+		cameraTarget = "Tutorial_ShippingCam",
+
+		requirePlatformsShipped = 2,
+
+		bannerTitle  = "Ship Delivery",
+		bannerBody   = "Ships collect all your Auras and pay out the cash directly to your wallet. Send 2 Ships Out.",
+		duration     = 0,
+
+		icon         = "rbxassetid://14949455379",
+		color        = Color3.fromRGB(150, 200, 255), 
+	},
+
+	-- ✨ STEP 12: Auto Ship
+	[12] = {
+		id           = "a1_toggle_auto",
+		action       = "Action_ToggleAutoShip",
+		targetTag    = "Tutorial_ToggleShipBtn",
+
+		unlockTags    = {"Tutorial_ToggleShipBtn"},
+		unlockActions = {"Action_ToggleAutoShip"},
+
+		bannerTitle  = "Automate Ships",
+		bannerBody   = "Click the new unlocked Toggle Button to automate your shipments!",
+
+		icon         = "rbxassetid://14923526147",
+		color        = Color3.fromRGB(50, 150, 50), 
+	},
+
+	-- ✨ STEP 13: Business as usual
+	[13] = {
+		id           = "a1_farm_500",
+		action       = "Action_ClickRedButton",
+
+		requireCurrency = 500,
+
+		bannerTitle  = "More Upgrades!",
+		bannerBody   = "Make $500 to afford your next upgrade.",
+		duration     = 0,
+
+		icon         = "rbxassetid://14949455379",
+		color        = Color3.fromRGB(150, 255, 150),
+	},
+
+	[14] = {
+		id             = "a1_buy_auraExpansion",
+		action         = "Action_BuyUpgrade",
+		targetTag      = "Tutorial_Buy_hatcheryCapacity",
+
+		unlockTags     = {"Tutorial_Buy_hatcheryCapacity"},
+
+		menuTag        = "Tutorial_ShopPanel",
+		menuOpenBtnTag = "Tutorial_ShopButton",
+
+		bannerTitle  = "More Hatchery",
+		bannerBody   = "Buy the Aura Expansion upgrade to increase your Hatchery space!",
+
+		icon         = "rbxassetid://14950910139",
+		color        = Color3.fromRGB(105, 255, 250), 
+	},
+
+	[15] = {
+		id           = "a1_farm_1500",
+		action       = "Action_ClickRedButton",
+
+		requireCurrency = 1500,
+
+		bannerTitle  = "Growing the Factory",
+		bannerBody   = "Make $1500 to afford the Habitat upgrade, allowing you to store more auras! Buy the aura value upgrade if you feel stuck.",
+		duration     = 0,
+
+		icon         = "rbxassetid://14949455379",
+		color        = Color3.fromRGB(87, 255, 98),
+	},
+
+	[16] = {
+		id             = "a1_buy_habitatCapacity",
+		action         = "Action_BuyUpgrade",
+		targetTag      = "Tutorial_Buy_habitatCapacity",
+
+		unlockTags     = {"Tutorial_Buy_habitatCapacity"},
+
+		menuTag        = "Tutorial_ShopPanel",
+		menuOpenBtnTag = "Tutorial_ShopButton",
+
+		bannerTitle  = "More Habitat Space",
+		bannerBody   = "Buy the Habitat Reservoir Upgrade to store more Auras before they get Incinirated!",
+
+		icon         = "rbxassetid://14950912147",
+		color        = Color3.fromRGB(120, 248, 255),
+	},
+
+	[17] = {
+		id           = "a1_multiply",
+		action       = "Action_ClickRedButton",
+
+		reachMultiplier = 5,
+
+		bannerTitle  = "Hatchery Multipliers",
+		bannerBody   = "Hold the Red button to reach the legendary multiplier! Make sure you have enough Hatchery and Space",
+		duration     = 0,
+
+		icon         = "rbxassetid://14949158172",
+		color        = Color3.fromRGB(255, 255, 0), 
+	},
+
+	[18] = {
+		id           = "a1_farm_25000",
+		action       = "Action_ClickRedButton",
+
+		requireCurrency = 5000,
+
+		bannerTitle  = "Mythic Multiplier",
+		bannerBody   = "Multipliers Increase Ship and Aura Value. Save up $5,000 to afford the Mythic Multiplier! Upgrade Aura Value If Stuck.",
+		duration     = 0,
+
+		icon         = "rbxassetid://14949455379",
+		color        = Color3.fromRGB(137, 255, 110), 
+	},
+
+	[19] = {
+		id             = "a1_buy_mythicMult",
+		action         = "Action_BuyUpgrade",
+		targetTag      = "Tutorial_Buy_unlockMythicMult", 
+
+		unlockTags     = {"Tutorial_Buy_unlockMythicMult"},
+
+		menuTag        = "Tutorial_ShopPanel",
+		menuOpenBtnTag = "Tutorial_ShopButton",
+
+		bannerTitle  = "Mythic Multiplier",
+		bannerBody   = "Buy the Mythic Multiplier to hold past the legendary multiplier limit!",
+
+		icon         = "rbxassetid://14921959974",
+		color        = Color3.fromRGB(80, 246, 255),
+	},
+
+	[20] = {
+		id           = "a1_multiply",
+		action       = "Action_ClickRedButton",
+
+		reachMultiplier = 10,
+
+		bannerTitle  = "Hatchery Multipliers",
+		bannerBody   = "Hold the Red button to reach the Mythic multiplier! Make sure to have plenty of Hatchery and Space",
+		duration     = 0,
+
+		icon         = "rbxassetid://14949158172",
+		color        = Color3.fromRGB(134, 24, 161), 
+	},
+
+	[21] = {
+		id           = "a1_open_prestige",
+		action       = "Action_OpenPrestige",
+		targetTag    = "Tutorial_PrestigeButton",
+
+		unlockTags    = {"Tutorial_PrestigeButton", "Tutorial_PrestigeCloseBtn"},
+		unlockActions = {"Action_OpenPrestige", "Action_ClosePrestige"},
+
+		bannerTitle  = "How to Prestige",
+		bannerBody   = "Click the Prestige button to restart with a massive permanent earnings multiplier.",
+
+		icon         = "rbxassetid://14959712404",
+		color        = Color3.fromRGB(180, 100, 255),
+	},
+
+	[22] = {
+		id             = "a1_confirm_prestige",
+		action         = "Action_PrestigeConfirm",
+		targetTag      = "Tutorial_PrestigeConfirm",
+
+		unlockTags     = {"Tutorial_PrestigeConfirm"},
+		unlockActions  = {"Action_PrestigeConfirm"},
+
+		menuTag        = "Tutorial_PrestigePanel",
+		menuOpenBtnTag = "Tutorial_PrestigeButton",
+
+		bannerTitle  = "Confirm Prestige",
+		bannerBody   = "Click 'Prestige Now' to get your Soul Auras and increase your earnings permentantly.",
+
+		icon         = "rbxassetid://14959709038",
+		color        = Color3.fromRGB(215, 121, 255),
+	},
+	[23] = {
+		id           = "a1_post_prestige_pan",
+		action       = "Action_Wait", 
+		duration     = 0,             
+		allowClicking = true, 
+		cameraTrackMode = "FollowPhysicsAura", 
+		cameraOffset    = Vector3.new(0, 15, 25), 
+
+		requireStepGoldenAuras = 5, 
+
+		bannerTitle  = "Golden Auras",
+		bannerBody   = "Collect Auras that spawn from the Producer OR claim your mailbox rewards!",
+
+		icon         = "rbxassetid://14949477468",
+		color        = Color3.fromRGB(255, 215, 0),
+	},
+
+	-- ✨ STEP 24: Farm for the next area
+	[24] = {
+		id           = "a1_farm_area2",
+		action       = "Action_Wait", 
+		duration     = 0,             
+		allowClicking = true, 
+		requireFarmEval = 50000, 
+		unlockTags    = {"Tutorial_TravelButton", "Tutorial_TravelCloseBtn"},
+		unlockActions = {"Action_OpenTravel", "Action_CloseTravel"},
+		bannerTitle  = "Reaching More Areas",
+		bannerBody   = "Open the travel menu to unlock the next Area. Your farm evaluation is based on the total amount of money made in that area.",
+
+		icon         = "rbxassetid://14949455379",
+		color        = Color3.fromRGB(126, 255, 212),
+	},
+
+	-- ✨ STEP 25: Open Area Travel
+	[25] = {
+		id           = "a1_open_travel",
+		action       = "Action_OpenTravel",
+		targetTag    = "Tutorial_TravelButton",
+
+		bannerTitle  = "New Area Unlocked!",
+		bannerBody   = "Click the Area Travel button to open the travel menu.",
+
+		icon         = "rbxassetid://14951953206",
+		color        = Color3.fromRGB(100, 200, 255),
+	},
+
+	-- ✨ STEP 26: Browse to Area 2
+	[26] = {
+		id             = "a1_travel_arrow",
+		action         = "Action_ClickRightArrow",
+		targetTag      = "Tutorial_RightArrow",
+
+		unlockTags     = {"Tutorial_RightArrow"},
+		unlockActions  = {"Action_ClickRightArrow", "Action_ClickLeftArrow"},
+
+		menuTag        = "Tutorial_TravelPanel",
+		menuOpenBtnTag = "Tutorial_TravelButton",
+		fallbackStepId = "a1_open_travel", 
+
+		bannerTitle  = "Browse Areas",
+		bannerBody   = "Click the Arrows to view the newly unlocked area and other areas.",
+
+		icon         = "rbxassetid://14951953206",
+		color        = Color3.fromRGB(150, 200, 255),
+	},
+
+	-- ✨ STEP 27: Confirm Travel
+	[27] = {
+		id             = "a1_confirm_travel",
+		action         = "Action_TravelConfirm",
+		targetTag      = "Tutorial_TravelConfirm",
+
+		unlockTags     = {"Tutorial_TravelConfirm"},
+		unlockActions  = {"Action_TravelConfirm"},
+
+		menuTag        = "Tutorial_TravelPanel",
+		menuOpenBtnTag = "Tutorial_TravelButton",
+		fallbackStepId = "a1_open_travel",
+
+		bannerTitle  = "Travel Now",
+		bannerBody   = "Click TRAVEL to jump to the new Area!",
+
+		icon         = "rbxassetid://14957414873",
+		color        = Color3.fromRGB(107, 255, 161),
+	},
+
+	-- ✨ STEP 28: Open Boost Shop
+	[28] = {
+		id           = "a1_open_boosts",
+		action       = "Action_OpenBoostShop",
+		targetTag    = "Tutorial_BoostMenuBtn",
+
+		unlockTags    = {"Tutorial_BoostMenuBtn", "Tutorial_BoostShopClose", "Tutorial_BoostTab_Shop", "Tutorial_BoostTab_Inventory"},
+		unlockActions = {"Action_OpenBoostShop", "Action_CloseBoostShop", "Action_BoostTab_Shop", "Action_BoostTab_Inventory"},
+
+		bannerTitle  = "Area Boosts and Multipliers",
+		bannerBody   = "Auras in this area have much higher base values! Open the new Boosts menu.",
+
+		icon         = "rbxassetid://14950005878",
+		color        = Color3.fromRGB(75, 255, 174),
+	},
+
+	-- ✨ STEP 29: Buy Aura Spawner Boost
+	[29] = {
+		id           = "a1_buy_boost1",
+		action       = "Action_BuyBoost_AuraRush",
+		targetTag    = "Tutorial_BuyBoost_AuraRush",
+
+		unlockTags    = {"Tutorial_BuyBoost_AuraRush"},
+		unlockActions = {"Action_BuyBoost_AuraRush"},
+
+		menuTag        = "Tutorial_BoostShopPanel",
+		menuOpenBtnTag = "Tutorial_BoostMenuBtn",
+
+		requireBoostBought = { id = "AuraRush", count = 1 },
+
+		bannerTitle  = "Buy a Boost",
+		bannerBody   = "Buy the Aura Rush Boost using your Golden Auras.",
+
+		icon         = "rbxassetid://14915278241",
+		color        = Color3.fromRGB(114, 213, 255),
+	},
+
+	-- ✨ STEP 30: Switch to Inventory Tab
+	[30] = {
+		id           = "a1_click_inv_tab",
+		action       = "Action_BoostTab_Inventory",
+		targetTag    = "Tutorial_BoostTab_Inventory",
+
+		menuTag        = "Tutorial_BoostShopPanel",
+		menuOpenBtnTag = "Tutorial_BoostMenuBtn",
+
+		bannerTitle  = "Check Inventory",
+		bannerBody   = "Click the INVENTORY tab at the top of the menu to view the boosts you own.",
+
+		icon         = "rbxassetid://14951953206",
+		color        = Color3.fromRGB(82, 76, 255),
+	},
+
+	-- ✨ STEP 31: Use Aura Spawner Boost
+	[31] = {
+		id           = "a1_use_boost1",
+		action       = "Action_UseBoost_AuraRush",
+		targetTag    = "Tutorial_UseBoost_AuraRush",
+
+		unlockTags    = {"Tutorial_UseBoost_AuraRush"},
+		unlockActions = {"Action_UseBoost_AuraRush"},
+
+		menuTag        = "Tutorial_BoostShopPanel",
+		menuOpenBtnTag = "Tutorial_BoostMenuBtn",
+
+		requireBoostUsed = { id = "AuraRush", count = 1 },
+
+		bannerTitle  = "Activate the Boost",
+		bannerBody   = "Click ACTIVATE to use your new Aura Rush boost!",
+
+		icon         = "rbxassetid://14951953206",
+		color        = Color3.fromRGB(103, 111, 255),
+	},
+
+	-- ✨ STEP 32: Spawn 30 Auras
+	[32] = {
+		id           = "a1_spawn_30",
+		action       = "Action_Wait", 
+		targetTag    = "Tutorial_ClickButton",
+		allowClicking = true, 
+
+		requireCubesProduced = 30,
+		duration     = 0,
+
+		bannerTitle  = "Double Spawn Speed",
+		bannerBody   = "Your boost is now active. Produce 30 Auras with the increased spawn speed.",
+
+		icon         = "rbxassetid://14915278241",
+		color        = Color3.fromRGB(105, 255, 200),
+	},
+
+	-- ✨ STEP 33: Open Boost Shop Again
+	[33] = {
+		id           = "a1_open_boosts2",
+		action       = "Action_OpenBoostShop",
+		targetTag    = "Tutorial_BoostMenuBtn",
+
+		bannerTitle  = "Buy More Boosts",
+		bannerBody   = "Open up the boosts menu again to buy more boosts.",
+
+		icon         = "rbxassetid://14951953206",
+		color        = Color3.fromRGB(106, 255, 188),
+	},
+
+	-- ✨ STEP 34: Switch back to Shop Tab
+	[34] = {
+		id           = "a1_click_shop_tab",
+		action       = "Action_BoostTab_Shop",
+		targetTag    = "Tutorial_BoostTab_Shop",
+
+		menuTag        = "Tutorial_BoostShopPanel",
+		menuOpenBtnTag = "Tutorial_BoostMenuBtn",
+
+		bannerTitle  = "Return to Shop",
+		bannerBody   = "Click the SHOP tab to view the boosts available for purchase.",
+
+		icon         = "rbxassetid://14951953206",
+		color        = Color3.fromRGB(114, 213, 255),
+	},
+
+	-- ✨ STEP 35: Buy 5 Aura Spawners
+	[35] = {
+		id           = "a1_buy_boost3",
+		action       = "Action_BuyBoost_AuraRush",
+		targetTag    = "Tutorial_BuyBoost_AuraRush",
+
+		menuTag        = "Tutorial_BoostShopPanel",
+		menuOpenBtnTag = "Tutorial_BoostMenuBtn",
+		duration = 0,
+		requireBoostBought = { id = "AuraRush", count = 5 },
+
+		bannerTitle  = "Buy More Aura Rush Boosts",
+		bannerBody   = "Buy 5 more Aura Rush Boosts. Note Boosts can stack for even faster production and MONEY.",
+
+		icon         = "rbxassetid://14951953206",
+		color        = Color3.fromRGB(99, 122, 255),
+	},
+
+	-- ✨ STEP 36: Mass Produce 150 Auras
+	[36] = {
+		id           = "a1_spawn_150",
+		action       = "Action_Wait",
+		targetTag    = "Tutorial_ClickButton",
+		allowClicking = true, 
+
+		requireCubesProduced = 150,
+		duration     = 0,
+
+		bannerTitle  = "Mass Production",
+		bannerBody   = "Produce 150 Auras. Don't forget you can use those boosts you just bought!",
+
+		icon         = "rbxassetid://14958750319",
+		color        = Color3.fromRGB(130, 226, 255),
+	},
+
+	-- ✨ STEP 37: Open Achievements
+	[37] = {
+		id           = "a1_open_achievements",
+		action       = "Action_OpenAchievements",
+		targetTag    = "Tutorial_AchieveMenuBtn",
+
+		unlockTags    = {"Tutorial_AchieveMenuBtn", "Tutorial_AchieveCloseBtn", "Tutorial_AchieveTab_Challenges"},
+		unlockActions = {"Action_OpenAchievements", "Action_CloseAchievements", "Action_ClickAchieveTab_Challenges"},
+
+		bannerTitle  = "Achievements Unlocked!",
+		bannerBody   = "You've hit a huge milestone! Click the new Achievements button to view your Progression.",
+
+		icon         = "rbxassetid://14915547975",
+		color        = Color3.fromRGB(255, 255, 130),
+	},
+
+	-- ✨ STEP 38: Claim Boost Challenge (Target fixed to Aura Tycoon!)
+	[38] = {
+		id           = "a1_claim_boost_chal",
+		action       = "Action_ClaimChallenge_unlock_fastrefill",
+		targetTag    = "Tutorial_AchieveRow_Chal_unlock_fastrefill",
+
+		unlockTags    = {"Tutorial_AchieveRow_Chal_unlock_fastrefill"},
+		unlockActions = {"Action_ClaimChallenge_unlock_fastrefill"},
+
+		menuTag        = "Tutorial_AchievePanel",
+		menuOpenBtnTag = "Tutorial_AchieveMenuBtn",
+
+		bannerTitle  = "Claim Your Rewards",
+		bannerBody   = "Claim the Explorer Challenge which will unlock the Value Boost(Boost)",
+	
+		icon         = "rbxassetid://14922140529",
+		color        = Color3.fromRGB(146, 73, 255),
+	},
+
+	-- ✨ STEP 39: Click Index Tab
+	[39] = {
+		id           = "a1_click_index_tab",
+		action       = "Action_ClickAchieveTab_Index",
+		targetTag    = "Tutorial_AchieveTab_Index",
+
+		unlockTags    = {"Tutorial_AchieveTab_Index"},
+		unlockActions = {"Action_ClickAchieveTab_Index"},
+
+		menuTag        = "Tutorial_AchievePanel",
+		menuOpenBtnTag = "Tutorial_AchieveMenuBtn",
+
+		bannerTitle  = "The Aura Index",
+		bannerBody   = "Click the Auras tab. Here you can track every single Aura you have discovered across all Areas!",
+
+		icon         = "rbxassetid://14916698520",
+		color        = Color3.fromRGB(255, 232, 99),
+	},
+
+	-- ✨ STEP 40: Claim Aura Index Reward
+	[40] = {
+		id           = "a1_claim_index_reward",
+		action       = "Action_ClaimAura_1_Common",
+		targetTag    = "Tutorial_AchieveRow_Index_1",
+
+		unlockTags    = {"Tutorial_AchieveRow_Index_1"},
+		unlockActions = {"Action_ClaimAura_1_Common"},
+
+		menuTag        = "Tutorial_AchievePanel",
+		menuOpenBtnTag = "Tutorial_AchieveMenuBtn",
+
+		bannerTitle  = "Discovery Bonus",
+		bannerBody   = "Click on the Area 1 Gear Aura to claim a Golden Aura bonus for discovering it!",
+
+		icon         = "rbxassetid://14916698520",
+		color        = Color3.fromRGB(255, 246, 125),
+	},
+
+	-- ✨ STEP 41: Click Badges Tab
+	[41] = {
+		id           = "a1_click_badges_tab",
+		action       = "Action_ClickAchieveTab_Badges",
+		targetTag    = "Tutorial_AchieveTab_Badges",
+
+		unlockTags    = {"Tutorial_AchieveTab_Badges"},
+		unlockActions = {"Action_ClickAchieveTab_Badges"},
+
+		menuTag        = "Tutorial_AchievePanel",
+		menuOpenBtnTag = "Tutorial_AchieveMenuBtn",
+
+		bannerTitle  = "Roblox Badges",
+		bannerBody   = "Click the Badges tab. You can officially earn Roblox Badges for reaching massive milestones.",
+
+		icon         = "rbxassetid://14923411730",
+		color        = Color3.fromRGB(255, 243, 149),
+	},
+
+	-- ✨ STEP 42: Claim Badge
+	[42] = {
+		id           = "a1_claim_badge_1",
+		action       = "Action_ClaimBadge_1", 
+		targetTag    = "Tutorial_AchieveRow_Badge_1",
+
+		unlockTags    = {"Tutorial_AchieveRow_Badge_1"},
+		unlockActions = {"Action_ClaimBadge_1"},
+
+		menuTag        = "Tutorial_AchievePanel",
+		menuOpenBtnTag = "Tutorial_AchieveMenuBtn",
+
+		bannerTitle  = "Claim Badge",
+		bannerBody   = "Click the First Prestige badge to officially unlock it on your Roblox profile!",
+
+		icon         = "rbxassetid://14923411730",
+		color        = Color3.fromRGB(255, 232, 115),
+	},
+
+	-- ✨ STEP 43: Click Leaderboard Tab
+	[43] = {
+		id           = "a1_click_leaderboard",
+		action       = "Action_ClickAchieveTab_Leaderboard",
+		targetTag    = "Tutorial_AchieveTab_Leaderboard",
+
+		unlockTags    = {"Tutorial_AchieveTab_Leaderboard", "Tutorial_LbTab_Top10", "Tutorial_LbTab_AurasGenerated", "Tutorial_LbTab_MostMoneyMade"},
+		unlockActions = {"Action_ClickAchieveTab_Leaderboard", "Action_ClickLbTab_Top10", "Action_ClickLbTab_AurasGenerated", "Action_ClickLbTab_MostMoneyMade"},
+
+		menuTag        = "Tutorial_AchievePanel",
+		menuOpenBtnTag = "Tutorial_AchieveMenuBtn",
+
+		bannerTitle  = "Global Rankings",
+		bannerBody   = "Click the Leaderboard tab to view the best players!",
+
+		icon         = "rbxassetid://14917051047",
+		color        = Color3.fromRGB(235, 255, 103),
+	},
+
+	-- ✨ STEP 44: Click the Top 10 Sub-Tab (NEW STEP!)
+	[44] = {
+		id           = "a1_click_top10",
+		action       = "Action_ClickLbTab_Top10",
+		targetTag    = "Tutorial_LbTab_Top10",
+
+		menuTag        = "Tutorial_AchievePanel",
+		menuOpenBtnTag = "Tutorial_AchieveMenuBtn",
+
+		bannerTitle  = "Top 10 Players",
+		bannerBody   = "Click the Top 10 button to view the most Soul Auras in the game!",
+
+		icon         = "rbxassetid://14959709038",
+		color        = Color3.fromRGB(253, 255, 119),
+	},
+
+	-- ✨ STEP 45: Click Settings Tab
+	[45] = {
+		id           = "a1_click_settings",
+		action       = "Action_ClickAchieveTab_Settings",
+		targetTag    = "Tutorial_AchieveTab_Settings",
+
+		unlockTags    = {"Tutorial_AchieveTab_Settings"},
+		unlockActions = {"Action_ClickAchieveTab_Settings"},
+
+		menuTag        = "Tutorial_AchievePanel",
+		menuOpenBtnTag = "Tutorial_AchieveMenuBtn",
+
+		bannerTitle  = "Customize Your Farm",
+		bannerBody   = "Finally, click the Settings tab.",
+
+		icon         = "rbxassetid://14958964040",
+		color        = Color3.fromRGB(245, 255, 133),
+	},
+
+	-- ✨ STEP 46: Toggle Jumping
+	[46] = {
+		id           = "a1_toggle_jump",
+		action       = "Action_ToggleSetting_jump",
+		targetTag    = "Tutorial_SettingToggle_jump",
+
+		unlockTags    = {"Tutorial_SettingToggle_jump"},
+		unlockActions = {"Action_ToggleSetting_jump"},
+
+		menuTag        = "Tutorial_AchievePanel",
+		menuOpenBtnTag = "Tutorial_AchieveMenuBtn",
+
+		bannerTitle  = "Disable Jumping",
+		bannerBody   = "Click to disable Jumping. (You can also quick toggle jumping at any time by pressing 'T' on your keyboard)",
+
+		icon         = "rbxassetid://14949400330",
+		color        = Color3.fromRGB(255, 188, 157),
+	},
+
+	-- ✨ STEP 47: Open Area Travel
+	[47] = {
+		id           = "a1_final_travel",
+		action       = "Action_OpenTravel",
+		targetTag    = "Tutorial_TravelButton",
+
+		bannerTitle  = "Check the Next Area",
+		bannerBody   = "Good job learning the basic mechanics! Open the Area Panel",
+
+		icon         = "rbxassetid://14951953206",
+		color        = Color3.fromRGB(164, 226, 255),
+	},
+
+	-- ✨ STEP 48: Browse to Area 3
+	[48] = {
+		id             = "a1_travel_arrow_3",
+		action         = "Action_ClickRightArrow",
+		targetTag      = "Tutorial_RightArrow",
+
+		menuTag        = "Tutorial_TravelPanel",
+		menuOpenBtnTag = "Tutorial_TravelButton",
+		fallbackStepId = "a1_final_travel", 
+
+		bannerTitle  = "Browse Areas",
+		bannerBody   = "Click the Arrows to view more areas",
+
+		icon         = "rbxassetid://14951953206",
+		color        = Color3.fromRGB(150, 200, 255),
+	},
+
+	-- ✨ STEP 49: Confirm Travel to Area 3 (End of Area 2)
+	[49] = {
+		id             = "a1_confirm_travel_3",
+		action         = "Action_TravelConfirm",
+		targetTag      = "Tutorial_TravelConfirm",
+
+		menuTag        = "Tutorial_TravelPanel",
+		menuOpenBtnTag = "Tutorial_TravelButton",
+		fallbackStepId = "a1_final_travel",
+
+		bannerTitle  = "Head to Area 3",
+		bannerBody   = "Once you have enough farm evaluation head to the next area to Unlock your first Aurmer",
+
+		icon         = "rbxassetid://14951953206",
+		color        = Color3.fromRGB(120, 255, 129),
+	},
+}
+
+function TutorialConfig.GetStepByIndex(index)
+	return TutorialConfig.Steps[index]
 end
 
-local function GetHatcheryMax(data)
-	local cfg = UpgradeConfig.GetUpgradeConfig("hatcheryCapacity")
-	return (cfg and cfg.apply) and cfg.apply(data) or AdminConfig.HatcheryMax
+function TutorialConfig.GetStepById(id)
+	for _, step in ipairs(TutorialConfig.Steps) do
+		if step.id == id then return step end
+	end
+	return nil
 end
 
-local function GetHabitatCapacity(data)
-	local cfg = UpgradeConfig.GetUpgradeConfig("habitatCapacity")
-	return (cfg and cfg.apply) and cfg.apply(data) or AdminConfig.BaseHabitatCapacity
-end
-
-local function GetMutationSpeedMult(data)
-	local cfg = UpgradeConfig.GetUpgradeConfig("mutationSpeed")
-	return (cfg and cfg.apply) and cfg.apply(data) or 1
-end
-
-Players.PlayerAdded:Connect(function(p)
-	hatchery[p.UserId] = AdminConfig.HatcheryMax
-end)
-
-Players.PlayerRemoving:Connect(function(p)
-	hatchery[p.UserId]=nil; holdStart[p.UserId]=nil; lastFire[p.UserId]=nil
-end)
-
-task.spawn(function()
-	local PR = ServerScriptService:WaitForChild("PrestigeReset", 30)
-	if PR then
-		PR.Event:Connect(function(player)
-			local uid = player.UserId
-			local data = GameManager.GetData(uid)
-			hatchery[uid] = data and GetHatcheryMax(data) or AdminConfig.HatcheryMax
-			holdStart[uid]=nil; lastFire[uid]=nil
-		end)
-	end
-end)
-
-task.spawn(function()
-	while true do
-		task.wait(0.1)
-		for _, player in ipairs(Players:GetPlayers()) do
-			local uid = player.UserId
-			local data = GameManager.GetData(uid)
-			local hatchMax = data and GetHatcheryMax(data) or AdminConfig.HatcheryMax
-			local prev = hatchery[uid] or hatchMax
-
-			if holdStart[uid] then
-				hatchery[uid] = math.max(0, prev - AdminConfig.HatcheryDrainRate * 0.1)
-			else
-				hatchery[uid] = math.min(hatchMax, prev + AdminConfig.HatcheryRefillRate * 0.1)
-			end
-
-			if hatchery[uid] ~= prev then
-				UpdateHatcheryBridge:Fire(player, { current=hatchery[uid], max=hatchMax })
-			end
-
-			if hatchery[uid] <= 0 and holdStart[uid] then
-				holdStart[uid] = nil
-				ReplicatedStorage.RemoteEvents.ForceStopHold:FireClient(player)
-			end
-		end
-	end
-end)
-
-local function GetAFKSpeed(runtime)
-	local idleTime = tick() - runtime.lastActiveTime
-	local speed = MutationConfig.AFKDecay[1].speed
-	for _, e in ipairs(MutationConfig.AFKDecay) do
-		if idleTime >= e.time then speed = e.speed end
-	end
-	return speed
-end
-
-local function GetEffectiveFireRate(uid)
-	local rushMult = BoostManager.GetSpawnRateMultiplier(uid)
-	local weatherSpawnMult, _ = WeatherManager.GetMultipliers(uid)
-	local effectiveFireRate = AdminConfig.FireRate / (rushMult * weatherSpawnMult)
-	if effectiveFireRate < 0.05 then effectiveFireRate = 0.05 end
-	return effectiveFireRate
-end
-
-local function SendHUDUpdate(player)
-	local uid = player.UserId
-	local data = GameManager.GetData(uid)
-	local runtime = GameManager.GetRuntime(uid)
-	if not data or not runtime then return end
-
-	local storedCount = runtime.storedCubeCount or 0
-	local activeMV = runtime.activeMutatedValue or 0
-
-	local boostMult = BoostManager.GetValueMultiplier(uid) * BoostManager.GetSpawnRateMultiplier(uid)
-	local displayRate = math.floor(activeMV * boostMult)
-
-	local passTickCfg = UpgradeConfig.GetUpgradeConfig("passiveTickSpeed")
-	local passInt = (passTickCfg and passTickCfg.apply) and passTickCfg.apply(data) or AdminConfig.PassiveInterval
-
-	UpdateHUDBridge:Fire(player, {
-		currency        = data.currency, 
-		pendingAuras    = storedCount, 
-		habitatCapacity = GetHabitatCapacity(data), 
-		rate            = displayRate,
-		passiveInterval = passInt, 
-		totalEarned     = data.totalEarned or 0,
-		soulAuras       = data.soulAuras or 0, 
-		farmEvaluation  = data.farmEvaluation or 0,
-		goldenAuras     = data.goldenAuras or 0, 
-		boostInventory  = data.boostInventory or {},
-		prestigeCount   = data.prestigeCount or 0,
-		upgrades        = data.upgrades or {},
-		totalCubesProduced = data.totalCubesProduced or 0,
-		currentArea     = data.currentArea or 1,
-		discoveredTiers = data.discoveredTiers or {},
-		currentFireRate = GetEffectiveFireRate(uid),
-		boostMultiplier = boostMult 
-	})
-end
-
-task.spawn(function()
-	while true do
-		local tickInterval = AdminConfig.MutationTickInterval or MutationConfig.CheckInterval
-		task.wait(tickInterval)
-
-		for _, player in ipairs(Players:GetPlayers()) do
-			local uid = player.UserId
-			local data = GameManager.GetData(uid)
-			local runtime = GameManager.GetRuntime(uid)
-			if not data or not runtime then continue end
-
-			local dt = tickInterval * GetAFKSpeed(runtime) * GetMutationSpeedMult(data) * (AdminConfig.MutationSpeedMultiplier or 1)
-			local mutationBatch = {}
-			local currentArea = data.currentArea or 1
-			local areaModels = GetAreaAuraModels(currentArea)
-
-			for cubeId, cube in pairs(runtime.cubes) do
-				local oldMutatedValue = MutationConfig.GetMutatedValue(cube)
-				local mutated = false
-
-				local prev = cube.effectiveElapsed
-				cube.effectiveElapsed += dt
-				local pl = MutationConfig.GetValueBonusLevel(prev)
-				local nl = MutationConfig.GetValueBonusLevel(cube.effectiveElapsed)
-
-				if nl > pl then
-					mutated = true
-					local be = MutationConfig.ValueBonuses[nl]
-					table.insert(mutationBatch, { 
-						cubeId = cubeId, mutationType = "valueBonus", bonusLevel = nl, 
-						bonusPercent = be and math.floor(be.bonus * 100) or 0 
-					})
-				end
-
-				local maxTier = AdminConfig.MutationMaxTierIndex or 3
-				local upgrades = 0
-
-				while cube.tierIndex < maxTier and cube.tierIndex < #TierConfig.Tiers and upgrades < 5 do
-					if areaModels then
-						local nextTierName = TierConfig.Tiers[cube.tierIndex + 1].name
-						if not areaModels[nextTierName] then break end
-					end
-
-					local timeSince = cube.effectiveElapsed - (cube.lastUpgradeElapsed or 0)
-					local bestChance, bestTime = 0, 0
-					for _, threshold in ipairs(MutationConfig.TierUpgrades) do
-						if timeSince >= threshold.time then bestChance = threshold.chance; bestTime = threshold.time end
-					end
-
-					if bestChance <= 0 then break end
-
-					if math.random() <= bestChance then
-						local oldTier = TierConfig.Tiers[cube.tierIndex]
-						cube.tierIndex += 1
-						local newTier = TierConfig.Tiers[cube.tierIndex]
-						cube.baseValue = math.floor(cube.baseValue * (newTier.multiplier/oldTier.multiplier))
-						cube.color = newTier.color; cube.glow = newTier.glow; cube.tierName = newTier.name
-						cube.lastUpgradeElapsed = (cube.lastUpgradeElapsed or 0) + bestTime
-						upgrades += 1; mutated = true
-
-						-- ✨ THE FIX: Track discovered tier upon mutation!
-						local auraKey = currentArea .. "_" .. newTier.name
-						if not data.discoveredTiers then data.discoveredTiers = {} end
-						if not data.discoveredTiers[auraKey] then
-							data.discoveredTiers[auraKey] = true
-						end
-
-						table.insert(mutationBatch, { 
-							cubeId = cubeId, mutationType = "tierUpgrade",
-							newColor = newTier.color, newGlow = newTier.glow, 
-							tierName = newTier.name, currentArea = currentArea
-						})
-
-						if newTier.name == "Legendary" then data.totalLegendaryCubes = (data.totalLegendaryCubes or 0) + 1 end
-					else break end
-				end
-
-				if mutated then
-					local newMutatedValue = MutationConfig.GetMutatedValue(cube)
-					runtime.totalMutatedValue = (runtime.totalMutatedValue or 0) + (newMutatedValue - oldMutatedValue)
-					if not cube.isStored then runtime.activeMutatedValue = (runtime.activeMutatedValue or 0) + (newMutatedValue - oldMutatedValue) end
-
-					if #mutationBatch > 0 then
-						for i = #mutationBatch, 1, -1 do
-							if mutationBatch[i].cubeId == cubeId then
-								mutationBatch[i].newValue = newMutatedValue
-								break
-							end
-						end
-					end
-				end
-			end
-
-			if #mutationBatch > 0 then CubeMutatedBatchBridge:Fire(player, mutationBatch) end
-			SendHUDUpdate(player)
-		end
-	end
-end)
-
-local function GetHoldMultiplier(holdTime, data)
-	local upgrades = data and data.upgrades or {}
-	local speedData = upgrades["multiplierSpeed"]
-	local speedLevel = (typeof(speedData) == "table" and speedData.level) or (typeof(speedData) == "number" and speedData) or 0
-	local playerMultSpeed = 1.0 + (speedLevel * 0.05)
-
-	local playerMaxTier = 5
-	local tierUnlocks = {
-		{ upgradeId = "unlockOmniMult", tier = 10 }, { upgradeId = "unlockUniversalMult", tier = 9 },
-		{ upgradeId = "unlockGodlyMult", tier = 8 }, { upgradeId = "unlockCosmicMult", tier = 7 },
-		{ upgradeId = "unlockMythicMult", tier = 6 },
-	}
-
-	for _, tData in ipairs(tierUnlocks) do
-		local lvl = upgrades[tData.upgradeId]
-		local finalLvl = (typeof(lvl) == "table" and lvl.level) or (typeof(lvl) == "number" and lvl) or 0
-		if finalLvl > 0 then playerMaxTier = tData.tier; break end
-	end
-
-	local effectiveTime = holdTime * playerMultSpeed
-	local currentTier = 1
-
-	for i = 1, playerMaxTier do
-		if AdminConfig.MilestoneData[i] and effectiveTime >= AdminConfig.MilestoneData[i].time then currentTier = i end
-	end
-
-	local nextTier = math.min(currentTier + 1, playerMaxTier)
-	if currentTier == playerMaxTier then return AdminConfig.MilestoneData[currentTier].mult, AdminConfig.MilestoneData[currentTier].luck end
-
-	local timePassed = effectiveTime - AdminConfig.MilestoneData[currentTier].time
-	local timeNeeded = AdminConfig.MilestoneData[nextTier].time - AdminConfig.MilestoneData[currentTier].time
-	local ratio = timePassed / timeNeeded
-
-	local cMult = AdminConfig.MilestoneData[currentTier].mult
-	local nMult = AdminConfig.MilestoneData[nextTier].mult
-	local smoothMult = cMult + ((nMult - cMult) * ratio)
-
-	return smoothMult, AdminConfig.MilestoneData[currentTier].luck
-end
-
-local function RollWithLuck(luckBonus)
-	local tiers = TierConfig.Tiers
-	local adjusted, total = {}, 0
-	for _, tier in ipairs(tiers) do
-		local chance = tier.chance
-		if tier.name ~= "Common" then chance += luckBonus/(#tiers-1) end
-		table.insert(adjusted, { tier=tier, chance=chance })
-		total += chance
-	end
-
-	local r, cum = math.random() * total, 0
-	for _, e in ipairs(adjusted) do cum += e.chance; if r <= cum then return e.tier end end
-	return tiers[1]
-end
-
-local function SpawnAura(player, data, runtime, holdMult, luckBonus)
-	local uid  = player.UserId
-	local tier = RollWithLuck(luckBonus)
-	local tierIndex = 1
-	for i, t in ipairs(TierConfig.Tiers) do if t.name == tier.name then tierIndex=i; break end end
-
-	local currentArea = data.currentArea or 1
-	local areaModels = GetAreaAuraModels(currentArea)
-
-	if areaModels then
-		while tierIndex > 1 do
-			local checkName = TierConfig.Tiers[tierIndex].name
-			if areaModels[checkName] then break end
-			tierIndex -= 1
-		end
-		tier = TierConfig.Tiers[tierIndex] 
-	end
-
-	local totalValueMultiplier = 1.0 
-	local valueUpgrades = {"blockValue", "blockValueT2", "auraValueT3", "auraValueT4", "auraValueT6", "auraValueT8", "auraValueT10"}
-
-	for _, upgradeId in ipairs(valueUpgrades) do
-		local cfg = UpgradeConfig.GetUpgradeConfig(upgradeId)
-		if cfg and cfg.apply then totalValueMultiplier += cfg.apply(data) end
-	end
-
-	local prestigeMult    = PrestigeModule.GetMultiplier(data.soulAuras)
-	local areaMult        = AreaRegistry.GetMultiplier(data.currentArea or 1)
-	local boostValueMult  = BoostManager.GetValueMultiplier(uid)
-	local _, weatherValueMult = WeatherManager.GetMultipliers(uid)
-
-	local calcMultFloat = totalValueMultiplier * prestigeMult * areaMult * boostValueMult * weatherValueMult
-	local baseValue = math.floor(AdminConfig.BaseAuraValue * tier.multiplier * calcMultFloat)
-	local totalValue = baseValue + math.floor(baseValue * (holdMult - 1))
-
-	local spawnPos = HABITAT_PART.Position + Vector3.new(math.random(-3,3), 10, math.random(-3,3))	
-
-	local areaFolder = ReplicatedStorage:FindFirstChild("AreaAssets") and ReplicatedStorage.AreaAssets:FindFirstChild("Area" .. currentArea)
-	if areaFolder then
-		local auraModel = areaFolder:FindFirstChild("AuraModel")
-		if auraModel then
-			local spawnPoint = auraModel:FindFirstChild("AuraSpawnPoint", true)
-			if spawnPoint and spawnPoint:IsA("BasePart") then
-				local size = spawnPoint.Size
-				local randX = (math.random() - 0.5) * size.X
-				local randZ = (math.random() - 0.5) * size.Z
-				spawnPos = (spawnPoint.CFrame * CFrame.new(randX, 0, randZ)).Position
-			end
-		end
-	end
-
-	local cubeRecord = { spawnTime=tick(), effectiveElapsed=0, lastUpgradeElapsed=0, baseValue=totalValue, tierIndex=tierIndex, tierName=tier.name, color=tier.color, glow=tier.glow, isStored=false, currentArea=currentArea }
-
-	if AdminConfig.MutationInstantMax then
-		local mb = MutationConfig.ValueBonuses[#MutationConfig.ValueBonuses]
-		if mb then cubeRecord.effectiveElapsed = mb.time + 1 end
-	end
-
-	local cubeId = GameManager.AddCube(uid, cubeRecord)
-	if not cubeId then return end
-
-	-- ✨ THE FIX: Track discovered tier upon spawning!
-	local auraKey = currentArea .. "_" .. tier.name
-	if not data.discoveredTiers then data.discoveredTiers = {} end
-	if not data.discoveredTiers[auraKey] then
-		data.discoveredTiers[auraKey] = true
-	end
-
-	data.totalCubesProduced = (data.totalCubesProduced or 0) + 1
-	if tier.name == "Legendary" then data.totalLegendaryCubes = (data.totalLegendaryCubes or 0) + 1 end
-	runtime.lastActiveTime = tick()
-
-	AuraSpawnedBridge:Fire(player, { cubeId=cubeId, tier=tier.name, color=tier.color, glow=tier.glow, value=totalValue, spawnPos=spawnPos, currentArea = currentArea })
-end
-
-ProduceAuraBridge:Connect(function(player, action)
-	local uid = player.UserId
-	local now = tick()
-	local data = GameManager.GetData(uid)
-	local runtime = GameManager.GetRuntime(uid)
-
-	if action == "start" then 
-		if data and runtime then
-			local storedCount = runtime.storedCubeCount or 0
-			if storedCount >= GetHabitatCapacity(data) then HabitatFull:FireClient(player); return end
-		end
-		if (hatchery[uid] or 0) > 0.5 then holdStart[uid] = now 
-		else UpdateHatcheryBridge:Fire(player, { current = 0, max = data and GetHatcheryMax(data) or AdminConfig.HatcheryMax }) end
-		return 
-	end
-
-	if action == "stop" then holdStart[uid] = nil; return end
-	if not data or not runtime then return end
-
-	local capacity = GetHabitatCapacity(data)
-	local storedCount = runtime.storedCubeCount or 0
-
-	if storedCount >= capacity then HabitatFull:FireClient(player); return end
-
-	if runtime.cubeCount >= capacity + 600 then return end 
-
-	if (hatchery[uid] or 0) <= 0.5 then 
-		UpdateHatcheryBridge:Fire(player, { current = 0, max = data and GetHatcheryMax(data) or AdminConfig.HatcheryMax })
-		return 
-	end
-	if not holdStart[uid] then return end
-
-	local rushMult = BoostManager.GetSpawnRateMultiplier(uid)
-	local weatherSpawnMult, _ = WeatherManager.GetMultipliers(uid)
-	local effectiveFireRate = AdminConfig.FireRate / (rushMult * weatherSpawnMult)
-	local spawnCount = 1
-
-	if effectiveFireRate < 0.05 then
-		spawnCount = math.floor(0.05 / effectiveFireRate)
-		effectiveFireRate = 0.05
-	end
-
-	if lastFire[uid] then
-		local timeSinceLast = now - lastFire[uid]
-		if timeSinceLast < (effectiveFireRate - 0.015) then return end 
-	end
-	lastFire[uid] = now
-
-	local holdTime = now - holdStart[uid]
-	local holdMult, luckBonus = GetHoldMultiplier(holdTime, data)
-
-	for i = 1, spawnCount do SpawnAura(player, data, runtime, holdMult, luckBonus) end
-	SendHUDUpdate(player)
-	UpdateHatcheryBridge:Fire(player, { current=hatchery[uid], max=GetHatcheryMax(data) })
-end)
-
-CubeStoredBridge:Connect(function(player, cubeId)
-	local uid = player.UserId
-	local runtime = GameManager.GetRuntime(uid)
-	local data = GameManager.GetData(uid)
-	if runtime and runtime.cubes[cubeId] then
-		GameManager.MarkCubeStored(uid, cubeId)
-		SendHUDUpdate(player)
-		local storedCount = runtime.storedCubeCount or 0
-		if storedCount >= GetHabitatCapacity(data) then HabitatFull:FireClient(player) end
-	end
-end)
-
-CubeSmushedBridge:Connect(function(player, cubeId)
-	local uid = player.UserId
-	GameManager.RemoveCube(uid, cubeId)
-	SendHUDUpdate(player)
-	local data = GameManager.GetData(uid)
-	UpdateHatcheryBridge:Fire(player, { current = hatchery[uid], max = GetHatcheryMax(data) })
-end)
+return TutorialConfig
