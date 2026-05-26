@@ -1,1841 +1,1105 @@
--- TutorialController
--- Location: StarterPlayer > StarterPlayerScripts > TutorialController
+-- ShopController
+-- Location: StarterPlayer > StarterPlayerScripts > ShopController
 
-local Players = game:GetService("Players")
+local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService      = game:GetService("TweenService")
+local RunService        = game:GetService("RunService")
 local CollectionService = game:GetService("CollectionService")
-local RunService = game:GetService("RunService")
-local TweenService = game:GetService("TweenService")
-local Workspace = game:GetService("Workspace")
-local GuiService = game:GetService("GuiService")
-local TutorialConfig = require(ReplicatedStorage.Modules.TutorialConfig)
-local UITheme = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("UITheme"))
-local T = UITheme.Get("Custom")
-local SoundConfig = require(ReplicatedStorage.Modules.SoundConfig)
-local Formatter = require(ReplicatedStorage.Modules.NumberFormatter)
 
-local RemoteEvents = ReplicatedStorage:WaitForChild("RemoteEvents")
-local TutorialStepComplete = RemoteEvents:WaitForChild("TutorialStepComplete", 10)
+local UpgradeConfig     = require(ReplicatedStorage.Modules:WaitForChild("UpgradeConfig"))
+local Formatter         = require(ReplicatedStorage.Modules:WaitForChild("NumberFormatter"))
+local EpicUpgradeConfig = require(ReplicatedStorage.Modules:WaitForChild("EpicUpgradeConfig"))
+local UIConfig          = require(ReplicatedStorage.Modules:WaitForChild("UIConfig"))
+local UITheme           = require(ReplicatedStorage.Modules:WaitForChild("UITheme"))
+local T                 = UITheme.Get("Custom")
+local SoundConfig       = require(ReplicatedStorage.Modules:WaitForChild("SoundConfig"))
 
-local BridgeNet2 = require(ReplicatedStorage.Modules:WaitForChild("BridgeNet2"))
-local UpdateHUDBridge = BridgeNet2.ClientBridge("UpdateHUD")
+local RemoteEvents        = ReplicatedStorage:WaitForChild("RemoteEvents")
+local PurchaseUpgrade     = RemoteEvents:WaitForChild("PurchaseUpgrade", 15)
+local UpgradeUpdated      = RemoteEvents:WaitForChild("UpgradeUpdated", 15)
+local PurchaseEpicUpgrade = RemoteEvents:WaitForChild("PurchaseEpicUpgrade", 15)
+local EpicUpgradeUpdated  = RemoteEvents:WaitForChild("EpicUpgradeUpdated", 15)
 
-local ForceCloseUI = ReplicatedStorage:FindFirstChild("ForceCloseUI")
-if not ForceCloseUI then
-	ForceCloseUI = Instance.new("BindableEvent")
-	ForceCloseUI.Name = "ForceCloseUI"
-	ForceCloseUI.Parent = ReplicatedStorage
+-- ✨ UI MUTUAL EXCLUSION
+local ForceCloseUI = ReplicatedStorage:FindFirstChild("ForceCloseUI") or Instance.new("BindableEvent")
+ForceCloseUI.Name = "ForceCloseUI"
+if not ForceCloseUI.Parent then ForceCloseUI.Parent = ReplicatedStorage end
+
+local player    = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local mainHUD   = playerGui:WaitForChild("MainHUD")
+
+local upgradeState      = {}
+local epicUpgradeState  = {}
+local currentCurrency   = 0
+local liveGoldenAuras   = 0
+local shopOpen          = false
+local activeMainTab     = "Upgrades"
+local regularCardRefs   = {}
+local epicCardRefs      = {}
+local isLoadingData     = true
+local globalHoldActive  = false  
+local globalHoldGeneration = 0    
+
+-- FORWARD DECLARATIONS
+local UpdateLockedTierProgress = nil
+local RebuildRegularShop = nil 
+
+for _, tierData in ipairs(UpgradeConfig.Tiers) do
+	for upgradeId, cfg in pairs(tierData.upgrades) do
+		upgradeState[upgradeId] = { level = 0, maxLevel = cfg.maxLevel, cost = UpgradeConfig.CalculateCost(upgradeId, 0), maxed = false }
+	end
 end
 
-local player = Players.LocalPlayer
-local playerGui = player:WaitForChild("PlayerGui")
-local camera = Workspace.CurrentCamera
+for _, tierData in ipairs(EpicUpgradeConfig.Tiers) do
+	for upgradeId, cfg in pairs(tierData.upgrades) do
+		epicUpgradeState[upgradeId] = { level = 0, maxLevel = cfg.maxLevel, cost = EpicUpgradeConfig.CalculateCost(upgradeId, 0), maxed = false }
+	end
+end
 
----------------------------------------------------------------
--- STATE
----------------------------------------------------------------
-local currentStepIndex = 1
-local tutorialComplete = false
-local tutorialActive = false
+-- ─────────────────────────────────────────────────────────────────────────────
+-- VFX / SOUND HELPERS
+-- ─────────────────────────────────────────────────────────────────────────────
+local function PlayUIBurst(targetElement, amount, colorTheme)
+	if not shopOpen then return end
+	local burstGui = Instance.new("ScreenGui")
+	burstGui.Name   = "JuiceBurst"
+	burstGui.Parent = playerGui
 
-local activeFallbackStep = nil
-local lastDisplayedStepId = nil 
+	local absPos  = targetElement.AbsolutePosition
+	local absSize = targetElement.AbsoluteSize
+	local center  = absPos + (absSize / 2)
 
-local actionMatchedForAdvance = false 
-local isAdvancing = false 
+	for i = 1, amount do
+		local particle = Instance.new("Frame")
+		particle.BackgroundColor3 = colorTheme or Color3.fromRGB(255, 215, 0)
+		particle.BorderSizePixel  = 0
+		particle.Size             = UDim2.new(0, math.random(6, 12), 0, math.random(6, 12))
+		particle.Position         = UDim2.new(0, center.X, 0, center.Y)
+		particle.Rotation         = math.random(0, 360)
 
-local liveStats = {
-	currency = 0,
-	totalEarned = 0,
-	farmEvaluation = 0,
-	soulAuras = 0,
-	goldenAuras = 0,
-	prestigeCount = 0,
-	currentArea = 1,
-	totalCubesProduced = 0,
-	totalPlatformsShipped = 0,
-	totalLegendaryCubes = 0,
-	piggyBank = 0,
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0.5, 0)
+		corner.Parent       = particle
+		particle.Parent     = burstGui
 
-	pendingAuras = 0,
-	habitatCapacity = 99999,
-	rate = 0,
-	currentMultiplier = 1,
+		local angle    = math.rad(math.random(0, 360))
+		local distance = math.random(50, 150)
+		local endPos   = UDim2.new(0, center.X + math.cos(angle) * distance, 0, center.Y + math.sin(angle) * distance + 50)
 
-	boostsBought = {},
-	boostsUsed = {}
-}
+		local tInfo = TweenInfo.new(math.random(4, 7) / 10, Enum.EasingStyle.Cubic, Enum.EasingDirection.Out)
+		TweenService:Create(particle, tInfo, { Position = endPos, Size = UDim2.new(0, 0, 0, 0), Rotation = particle.Rotation + math.random(-180, 180), BackgroundTransparency = 1 }):Play()
+	end
+	task.delay(1, function() burstGui:Destroy() end)
+end
 
-local UpdateMultiplier = ReplicatedStorage:WaitForChild("UpdateMultiplier")
-UpdateMultiplier.Event:Connect(function(mult)
-	liveStats.currentMultiplier = mult
+local comboPitch  = 1.0
+local lastBuyTime = tick()
+
+local function PlayPurchaseSound()
+	if tick() - lastBuyTime < 0.3 then comboPitch = math.min(comboPitch + 0.05, 2.5) else comboPitch = 1.0 end
+	lastBuyTime = tick()
+	local sfxFolder = ReplicatedStorage:FindFirstChild("SFX") or ReplicatedStorage:FindFirstChild("Sounds")
+	if sfxFolder and sfxFolder:FindFirstChild("BuyPing") then
+		local sfx = sfxFolder.BuyPing:Clone()
+		sfx.PlaybackSpeed = comboPitch
+		sfx.Parent        = game:GetService("SoundService")
+		sfx:Play()
+		game.Debris:AddItem(sfx, 2)
+	end
+end
+
+local function PlayFeedbackSound(soundName, volume)
+	local sfxFolder = ReplicatedStorage:FindFirstChild("SFX") or ReplicatedStorage:FindFirstChild("Sounds")
+	if sfxFolder then
+		local s = sfxFolder:FindFirstChild(soundName)
+		if s then
+			local sfx = s:Clone()
+			sfx.Volume = volume or 0.5
+			sfx.Parent = game:GetService("SoundService")
+			sfx:Play()
+			game.Debris:AddItem(sfx, 3)
+		end
+	end
+end
+
+local lastErrorTime = tick()
+local function PlayErrorFeedback(targetButton)
+	if tick() - lastErrorTime < 0.25 then return end
+	lastErrorTime = tick()
+	local sfxFolder = ReplicatedStorage:FindFirstChild("Sounds") or ReplicatedStorage:FindFirstChild("SFX")
+	if sfxFolder and sfxFolder:FindFirstChild("ErrorBuzz") then
+		local sfx = sfxFolder.ErrorBuzz:Clone()
+		sfx.Volume = 0.5
+		sfx.Parent = workspace
+		sfx:Play()
+		game.Debris:AddItem(sfx, 2)
+	end
+	if targetButton and targetButton.Parent then
+		local origPos    = targetButton.Position
+		local wobbleInfo = TweenInfo.new(0.04, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, 3, true)
+		TweenService:Create(targetButton, wobbleInfo, { Position = origPos + UDim2.new(0, 4, 0, 0) }):Play()
+	end
+end
+
+local function FormatNumber(n) return Formatter.Format(n) end
+local function PlayUI(id) if shared.PlayUISound then shared.PlayUISound(id) end end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ✨ SHOP BUTTON
+-- ─────────────────────────────────────────────────────────────────────────────
+local ShopButton = Instance.new("ImageButton")
+ShopButton.Name              = "ShopButton"
+ShopButton.BackgroundColor3  = T.buttonSecondary
+ShopButton.BorderSizePixel   = 0
+ShopButton.AutoButtonColor   = false
+ShopButton.ZIndex            = 15
+
+local Faded2 = mainHUD:FindFirstChild("Faded2")
+if Faded2 then
+	ShopButton.Parent = Faded2
+	ShopButton.Size = UDim2.new(0.85, 0, 0.85, 0)
+	local aspect = Instance.new("UIAspectRatioConstraint", ShopButton)
+	aspect.AspectRatio = 1.0
+
+	local layout = Faded2:FindFirstChildOfClass("UIListLayout")
+	if not layout then
+		layout = Instance.new("UIListLayout", Faded2)
+		layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+		layout.VerticalAlignment = Enum.VerticalAlignment.Center
+		layout.Padding = UDim.new(0, 15)
+		layout.SortOrder = Enum.SortOrder.LayoutOrder
+	end
+	ShopButton.LayoutOrder = 2 
+else
+	ShopButton.Size = UDim2.new(0, 60, 0, 60)
+	ShopButton.AnchorPoint = Vector2.new(0, 0.5)
+	ShopButton.Position = UDim2.new(0, 15, 0.5, 0)
+	ShopButton.Parent = mainHUD
+end
+
+CollectionService:AddTag(ShopButton, "Tutorial_ShopButton")
+Instance.new("UICorner", ShopButton).CornerRadius = UDim.new(0.5, 0)
+
+local shopStroke = Instance.new("UIStroke", ShopButton)
+shopStroke.Color     = Color3.fromRGB(255, 255, 255)
+shopStroke.Thickness = 2
+
+local shopIcon = Instance.new("ImageLabel", ShopButton)
+shopIcon.Size               = UDim2.new(0.6, 0, 0.6, 0)
+shopIcon.Position           = UDim2.new(0.2, 0, 0.2, 0)
+shopIcon.BackgroundTransparency = 1
+shopIcon.ScaleType          = Enum.ScaleType.Fit
+shopIcon.Image              = UIConfig.Icons.ShopButton or "rbxassetid://14916846070"
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ✨ SHOP PANEL (Scaled cleanly for all devices)
+-- ─────────────────────────────────────────────────────────────────────────────
+local PANEL_MAX_W = UIConfig.Panels.UpgradeShopW or 400
+local PANEL_MAX_H = UIConfig.Panels.UpgradeShopH or 550
+local HEADER_H = 42
+
+local ShopPanel = Instance.new("Frame")
+ShopPanel.Name              = "ShopPanel"
+ShopPanel.Size              = UDim2.new(1, -120, 0.85, 0)
+ShopPanel.AnchorPoint       = Vector2.new(0, 0.5) 
+ShopPanel.Position          = UDim2.new(0, -500, 0.5, 0) 
+ShopPanel.BackgroundColor3  = T.panelBG
+ShopPanel.BorderSizePixel   = 0
+ShopPanel.Visible           = false
+ShopPanel.ZIndex            = 10
+ShopPanel.ClipsDescendants  = true
+ShopPanel.Parent            = mainHUD
+CollectionService:AddTag(ShopPanel, "Tutorial_ShopPanel") 
+Instance.new("UICorner", ShopPanel).CornerRadius = UDim.new(0, 10)
+
+local sizeConstraint = Instance.new("UISizeConstraint")
+sizeConstraint.MaxSize = Vector2.new(PANEL_MAX_W, PANEL_MAX_H)
+sizeConstraint.MinSize = Vector2.new(250, 350)
+sizeConstraint.Parent  = ShopPanel
+
+local panelStroke = Instance.new("UIStroke")
+panelStroke.Color     = T.panelStroke
+panelStroke.Thickness = 2
+panelStroke.Parent    = ShopPanel
+
+local TitleBar = Instance.new("Frame")
+TitleBar.Name                 = "TitleBar"
+TitleBar.Size                 = UDim2.new(1, 0, 0, HEADER_H)
+TitleBar.BackgroundColor3     = T.headerBG
+TitleBar.BorderSizePixel      = 0
+TitleBar.ZIndex               = 11
+TitleBar.ClipsDescendants     = true
+TitleBar.BackgroundTransparency = 1
+TitleBar.Parent               = ShopPanel
+Instance.new("UICorner", TitleBar).CornerRadius = UDim.new(0, 10)
+
+local TitleLabel = Instance.new("TextLabel")
+TitleLabel.Size               = UDim2.new(1, -50, 1, 0)
+TitleLabel.Position           = UDim2.new(0, 15, 0, 0)
+TitleLabel.BackgroundTransparency = 1
+TitleLabel.Text               = "RESEARCH"
+TitleLabel.TextColor3         = T.headerText
+TitleLabel.TextScaled         = true
+TitleLabel.Font               = T.font
+TitleLabel.TextXAlignment     = Enum.TextXAlignment.Left
+TitleLabel.ZIndex             = 12
+TitleLabel.Parent             = TitleBar
+
+local CloseButton = Instance.new("TextButton")
+CloseButton.Size             = UDim2.new(0, 30, 0, 30)
+CloseButton.Position         = UDim2.new(1, -35, 0, 6)
+CloseButton.BackgroundColor3 = T.buttonRed
+CloseButton.BorderSizePixel  = 0
+CloseButton.Text             = "X"
+CloseButton.TextColor3       = T.bodyText
+CloseButton.TextScaled       = true
+CloseButton.Font             = T.font
+CloseButton.ZIndex           = 9999
+CloseButton.Parent           = TitleBar
+CollectionService:AddTag(CloseButton, "Tutorial_ShopCloseBtn") 
+Instance.new("UICorner", CloseButton).CornerRadius = UDim.new(0, 6)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- INFO POPUP
+-- ─────────────────────────────────────────────────────────────────────────────
+local InfoPopup = Instance.new("Frame")
+InfoPopup.Name                 = "InfoPopup"
+InfoPopup.Size                 = UDim2.new(0.85, 0, 0.6, 0)
+InfoPopup.Position             = UDim2.new(0.5, 0, 0.5, 0)
+InfoPopup.AnchorPoint          = Vector2.new(0.5, 0.5)
+InfoPopup.BackgroundColor3     = T.cardBG
+InfoPopup.BackgroundTransparency = 0
+InfoPopup.ZIndex               = 50
+InfoPopup.Visible              = false
+InfoPopup.Parent               = ShopPanel
+Instance.new("UICorner", InfoPopup).CornerRadius = UDim.new(0, 12)
+
+local AspectConstraint = Instance.new("UIAspectRatioConstraint", InfoPopup)
+AspectConstraint.AspectRatio = 1.0
+local InfoScale = Instance.new("UIScale", InfoPopup)
+InfoScale.Scale = 1
+
+local InfoTitle = Instance.new("TextLabel", InfoPopup)
+InfoTitle.Size                 = UDim2.new(1, -20, 0, 35)
+InfoTitle.Position             = UDim2.new(0, 10, 0, 10)
+InfoTitle.BackgroundTransparency = 1
+InfoTitle.Text                 = ""
+InfoTitle.TextColor3           = T.headerText
+InfoTitle.TextScaled           = true
+InfoTitle.Font                 = Enum.Font.GothamBold
+InfoTitle.ZIndex               = 51
+
+local InfoDesc = Instance.new("TextLabel", InfoPopup)
+InfoDesc.Size                  = UDim2.new(1, -20, 1, -110)
+InfoDesc.Position              = UDim2.new(0, 10, 0, 55)
+InfoDesc.BackgroundTransparency = 1
+InfoDesc.Text                  = ""
+InfoDesc.TextColor3            = T.bodyText
+InfoDesc.TextWrapped           = true
+InfoDesc.TextScaled            = true
+InfoDesc.Font                  = T.font
+InfoDesc.TextYAlignment        = Enum.TextYAlignment.Top
+InfoDesc.ZIndex                = 51
+
+local InfoClose = Instance.new("TextButton", InfoPopup)
+InfoClose.Size             = UDim2.new(0.6, 0, 0, 40)
+InfoClose.Position         = UDim2.new(0.2, 0, 1, -50)
+InfoClose.BackgroundColor3 = T.buttonPrimary
+InfoClose.BorderSizePixel  = 0
+InfoClose.Text             = "Close"
+InfoClose.TextColor3       = T.headerText
+InfoClose.TextScaled       = true
+InfoClose.Font             = T.font
+InfoClose.ZIndex           = 51
+Instance.new("UICorner", InfoClose).CornerRadius = UDim.new(0, 8)
+
+local function ShowInfo(title, desc)
+	if shared.PlayUISound then shared.PlayUISound(SoundConfig.UIClick or "") end
+	InfoTitle.Text = title
+	InfoDesc.Text  = desc
+	InfoPopup.BackgroundTransparency = 0
+	InfoScale.Scale  = 0.5
+	InfoPopup.Visible = true
+	TweenService:Create(InfoScale, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1 }):Play()
+end
+
+InfoClose.MouseButton1Down:Connect(function()
+	if shared.PlayUISound then shared.PlayUISound(SoundConfig.UIClick or "") end
+	local tween = TweenService:Create(InfoScale, TweenInfo.new(0.2, Enum.EasingStyle.Back, Enum.EasingDirection.In), { Scale = 0.5 })
+	tween:Play(); tween.Completed:Once(function() InfoPopup.Visible = false end)
 end)
 
-local baselineCubes = 0
-local baselineShipped = 0
-local baselineGoldenAuras = 0
-local baselineBoostsBought = {}
-local baselineBoostsUsed = {}
+-- ─────────────────────────────────────────────────────────────────────────────
+-- MAIN TAB BAR
+-- ─────────────────────────────────────────────────────────────────────────────
+local activeShopTabText = "Regular Upgrades"
 
-local function GetStepCubes() return math.max(0, liveStats.totalCubesProduced - baselineCubes) end
-local function GetStepShipped() return math.max(0, liveStats.totalPlatformsShipped - baselineShipped) end
-local function GetStepBoostsBought(id) return math.max(0, (liveStats.boostsBought[id] or 0) - (baselineBoostsBought[id] or 0)) end
-local function GetStepBoostsUsed(id) return math.max(0, (liveStats.boostsUsed[id] or 0) - (baselineBoostsUsed[id] or 0)) end
+local MainTabBar = Instance.new("Frame")
+MainTabBar.Size                 = UDim2.new(1, -20, 0, 85)
+MainTabBar.Position             = UDim2.new(0, 10, 0, HEADER_H + 4)
+MainTabBar.BackgroundTransparency = 1
+MainTabBar.ZIndex               = 11
+MainTabBar.Parent               = ShopPanel
 
-local function GetStepGoldenAuras() 
-	local current = player:GetAttribute("LiveGoldenAuras") or liveStats.goldenAuras
-	return math.max(0, current - baselineGoldenAuras) 
+local ShopHoverLabel = Instance.new("TextLabel", MainTabBar)
+ShopHoverLabel.Size                 = UDim2.new(1, 0, 0, 20)
+ShopHoverLabel.Position             = UDim2.new(0, 0, 0, 0)
+ShopHoverLabel.BackgroundTransparency = 1
+ShopHoverLabel.TextColor3           = T.bodyText
+ShopHoverLabel.TextScaled           = true
+ShopHoverLabel.Font                 = T.font
+ShopHoverLabel.Text                 = activeShopTabText
+
+local TabBtnFrame = Instance.new("Frame", MainTabBar)
+TabBtnFrame.Size                 = UDim2.new(1, 0, 1, -25)
+TabBtnFrame.Position             = UDim2.new(0, 0, 0, 25)
+TabBtnFrame.BackgroundTransparency = 1
+
+local TabListLayout = Instance.new("UIListLayout", TabBtnFrame)
+TabListLayout.FillDirection       = Enum.FillDirection.Horizontal
+TabListLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+TabListLayout.VerticalAlignment   = Enum.VerticalAlignment.Center
+TabListLayout.Padding             = UDim.new(0, 25)
+
+local TAB_COLOR_BASE   = T.buttonSecondary
+local TAB_COLOR_HOVER  = T.buttonPrimary
+local TAB_COLOR_ACTIVE = Color3.fromRGB(143, 78, 217)
+
+local mainTabButtons = {}
+local function MakeMainTab(name, hoverText, iconId)
+	local btn = Instance.new("ImageButton", TabBtnFrame)
+	btn.Name             = "MainTab_" .. name
+	btn.Size             = UDim2.new(0, 48, 0, 48)
+	btn.BackgroundColor3 = TAB_COLOR_BASE
+	btn.AutoButtonColor  = false
+	btn.ZIndex           = 12
+	Instance.new("UICorner", btn).CornerRadius = UDim.new(0.5, 0)
+	local stroke = Instance.new("UIStroke", btn)
+	stroke.Color     = T.panelStroke
+	stroke.Thickness = 2
+	local icon = Instance.new("ImageLabel", btn)
+	icon.Size               = UDim2.new(0.6, 0, 0.6, 0)
+	icon.Position           = UDim2.new(0.2, 0, 0.2, 0)
+	icon.BackgroundTransparency = 1
+	icon.ScaleType          = Enum.ScaleType.Fit
+	icon.Image              = iconId
+
+	btn.MouseEnter:Connect(function()
+		ShopHoverLabel.Text = hoverText
+		if activeMainTab ~= name then btn.BackgroundColor3 = TAB_COLOR_HOVER end
+	end)
+	btn.MouseLeave:Connect(function()
+		ShopHoverLabel.Text = activeShopTabText
+		if activeMainTab ~= name then btn.BackgroundColor3 = TAB_COLOR_BASE end
+	end)
+
+	mainTabButtons[name] = { btn = btn, stroke = stroke }
+	return btn
 end
 
-local lockedAura = nil
+local tabEpic     = MakeMainTab("Epic",     "Epic Research",     UIConfig.Icons.ShopTabEpic or "rbxassetid://14916846070")
+local tabUpgrades = MakeMainTab("Upgrades", "Regular Upgrades",  UIConfig.Icons.ShopTabRegular or "rbxassetid://14916846070")
 
-local function GetActiveAura()
-	if lockedAura and lockedAura.Parent and lockedAura.Parent.Name == "AuraHolder" and lockedAura:GetAttribute("AuraCube") then 
-		return lockedAura 
-	end
-	local auraHolder = Workspace:FindFirstChild("AuraHolder")
-	if auraHolder then
-		local children = auraHolder:GetChildren()
-		for i = #children, 1, -1 do
-			local child = children[i]
-			if child:GetAttribute("AuraCube") then lockedAura = child; return child end
-		end
-	end
-	return nil
+-- ─────────────────────────────────────────────────────────────────────────────
+-- CURRENCY LABEL
+-- ─────────────────────────────────────────────────────────────────────────────
+local CURRENCY_H = 0
+local CurrencyLabel = Instance.new("TextLabel")
+CurrencyLabel.Name              = "ShopCurrencyLabel"
+CurrencyLabel.Size              = UDim2.new(1, -24, 0, CURRENCY_H)
+CurrencyLabel.BackgroundTransparency = 1
+CurrencyLabel.Text              = "$0"
+CurrencyLabel.TextColor3        = T.currencyColor
+CurrencyLabel.TextScaled        = true
+CurrencyLabel.Font              = T.font
+CurrencyLabel.TextXAlignment    = Enum.TextXAlignment.Right
+CurrencyLabel.ZIndex            = 11
+CurrencyLabel.Parent            = ShopPanel
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SCROLL FRAMES
+-- ─────────────────────────────────────────────────────────────────────────────
+local function MakeScroll(name, yTop)
+	local sf = Instance.new("ScrollingFrame")
+	sf.Name                 = name
+	sf.Size                 = UDim2.new(1, -20, 1, -(yTop + 10))
+	sf.Position             = UDim2.new(0, 10, 0, yTop)
+	sf.BackgroundTransparency = 1
+	sf.BorderSizePixel      = 0
+	sf.ScrollBarThickness   = 4
+	sf.ScrollBarImageColor3 = T.subText
+	sf.CanvasSize           = UDim2.new(0, 0, 0, 0)
+	sf.ZIndex               = 11
+	sf.Visible              = false
+	sf.ClipsDescendants     = true
+	sf.Parent               = ShopPanel
+
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 8)
+	layout.Parent  = sf
+	layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+		sf.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + 10)
+	end)
+	return sf
 end
 
-local currentTrackedPhysicsAura = nil
+local REGULAR_SCROLL_TOP = HEADER_H + 95
+local RegularScroll      = MakeScroll("RegularScroll", REGULAR_SCROLL_TOP)
+local EPIC_SCROLL_TOP    = HEADER_H + 95
+local EpicScroll         = MakeScroll("EpicScroll", EPIC_SCROLL_TOP)
 
-local function GetActivePhysicsAura()
-	if currentTrackedPhysicsAura and currentTrackedPhysicsAura.Parent and not currentTrackedPhysicsAura:GetAttribute("Landed") then
-		return currentTrackedPhysicsAura
-	end
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ✨ CARD BUILDER
+-- ─────────────────────────────────────────────────────────────────────────────
+local function BuildCard(parent, upgradeId, cfg, isEpic, cardRefsTable)
+	local card = Instance.new("Frame")
+	card.Name             = "Card_" .. upgradeId
+	card.Size             = UDim2.new(1, 0, 0, 100)
+	card.BackgroundColor3 = T.cardBG
+	card.BorderSizePixel  = 0
+	card.Parent           = parent
+	Instance.new("UICorner", card).CornerRadius = UDim.new(0, 12)
 
-	local auras = CollectionService:GetTagged("PhysicsAura")
-	for _, aura in ipairs(auras) do
-		if aura and aura.Parent and not aura:GetAttribute("Landed") then
-			currentTrackedPhysicsAura = aura
-			return aura
-		end
-	end
+	local icon = Instance.new("ImageLabel", card)
+	icon.Size               = UDim2.new(0, 44, 0, 44)
+	icon.Position           = UDim2.new(0, 10, 0.5, -22)
+	icon.BackgroundTransparency = 1
+	icon.Image              = cfg.iconId or "rbxassetid://0"
 
-	currentTrackedPhysicsAura = nil
-	return nil
-end
+	local infoBtn = Instance.new("TextButton", card)
+	infoBtn.Size             = UDim2.new(0, 22, 0, 22)
+	infoBtn.Position         = UDim2.new(0, 58, 0, 10)
+	infoBtn.BackgroundColor3 = T.buttonSecondary
+	infoBtn.Text             = "i"
+	infoBtn.TextColor3       = T.bodyText
+	infoBtn.Font             = Enum.Font.GothamBlack
+	infoBtn.TextSize         = 14
+	Instance.new("UICorner", infoBtn).CornerRadius = UDim.new(1, 0)
+	infoBtn.MouseButton1Click:Connect(function() ShowInfo(cfg.displayName, cfg.description) end)
 
-shared.TutorialRecordAuraSpawned = function() liveStats.totalCubesProduced += 1 end
-shared.TutorialRecordShipSent = function() task.delay(4, function() liveStats.totalPlatformsShipped += 1 end) end
-shared.TutorialRecordBoostBought = function(id) liveStats.boostsBought[id] = (liveStats.boostsBought[id] or 0) + 1 end
-shared.TutorialRecordBoostUsed = function(id) liveStats.boostsUsed[id] = (liveStats.boostsUsed[id] or 0) + 1 end
+	-- Tighter text bounds to accommodate dynamic scaling
+	local nameLabel = Instance.new("TextLabel", card)
+	nameLabel.Size              = UDim2.new(1, -145, 0, 20)
+	nameLabel.Position          = UDim2.new(0, 84, 0, 11)
+	nameLabel.BackgroundTransparency = 1
+	nameLabel.Text              = string.upper(cfg.displayName)
+	nameLabel.TextColor3        = T.bodyText
+	nameLabel.TextScaled        = true
+	nameLabel.Font              = Enum.Font.FredokaOne
+	nameLabel.TextXAlignment    = Enum.TextXAlignment.Left
 
-local tutorialGui = nil
-local activePointer = nil
-local activeHighlight = nil
-local questBanner = nil
-local trackingConnection = nil
+	local descLabel = Instance.new("TextLabel", card)
+	descLabel.Size              = UDim2.new(1, -140, 0, 36)
+	descLabel.Position          = UDim2.new(0, 58, 0, 34)
+	descLabel.BackgroundTransparency = 1
+	descLabel.Text              = cfg.description
+	descLabel.TextColor3        = T.subText
+	descLabel.TextWrapped       = true
+	descLabel.TextScaled        = true
+	descLabel.Font              = Enum.Font.GothamMedium
+	descLabel.TextXAlignment    = Enum.TextXAlignment.Left
+	descLabel.TextYAlignment    = Enum.TextYAlignment.Top
 
--- ✨ PANEL AWARENESS
-local PANELS_TO_CHECK = {
-	"Tutorial_AchievePanel",
-	"Tutorial_ShopPanel",
-	"Tutorial_PrestigePanel",
-	"Tutorial_TravelPanel",
-	"Tutorial_BoostShopPanel"
-}
+	local levelLabel = Instance.new("TextLabel", card)
+	levelLabel.Size             = UDim2.new(1, -140, 0, 16)
+	levelLabel.Position         = UDim2.new(0, 58, 0, 74)
+	levelLabel.BackgroundTransparency = 1
+	levelLabel.Text             = "Lv. 0 / " .. cfg.maxLevel
+	levelLabel.TextColor3       = T.accentGreen
+	levelLabel.TextScaled       = true
+	levelLabel.Font             = Enum.Font.FredokaOne
+	levelLabel.TextXAlignment   = Enum.TextXAlignment.Left
 
-local HUD_DIRECTIONS = {
-	Tutorial_ClickButton    = "TOP_HIGH",  
-	Tutorial_ToggleShipBtn  = "TOP",
-	Tutorial_SendShipBtn    = "TOP",
-	Tutorial_TravelButton   = "TOP",
-	Tutorial_PrestigeButton = "RIGHT", 
-	Tutorial_ShopButton     = "RIGHT", 
-	Tutorial_BoostMenuBtn   = "RIGHT", 
-	Tutorial_AchieveMenuBtn = "RIGHT", 
-	Tutorial_LbTab_Top10    = "LEFT",  
-	Tutorial_LbTab_AurasGenerated = "LEFT",
-	Tutorial_LbTab_MostMoneyMade = "LEFT",
-}
+	local buyButton = Instance.new("TextButton", card)
+	buyButton.Name             = "PurchaseButton"
+	buyButton.Size             = UDim2.new(0, 72, 0, 40)
+	buyButton.AnchorPoint      = Vector2.new(1, 0.5)
+	buyButton.Position         = UDim2.new(1, -8, 0.5, 0)
+	buyButton.BackgroundColor3 = isEpic and T.accentPurple or T.buttonGreen
+	buyButton.BorderSizePixel  = 0
+	buyButton.TextColor3       = T.bodyText
+	buyButton.TextScaled       = true
+	buyButton.Font             = Enum.Font.FredokaOne
+	CollectionService:AddTag(buyButton, "Tutorial_Buy_" .. upgradeId) 
+	Instance.new("UICorner", buyButton).CornerRadius = UDim.new(0, 8)
 
----------------------------------------------------------------
--- VISIBILITY & GATING EVALUATION
----------------------------------------------------------------
-local function IsVisibleOnScreen(guiObject)
-	local current = guiObject
-	while current and current ~= game do
-		if current:IsA("GuiObject") and not current.Visible then return false
-		elseif current:IsA("LayerCollector") and not current.Enabled then return false end
-		current = current.Parent
-	end
-	return true
-end
+	cardRefsTable[upgradeId] = {
+		frame      = card,
+		levelLabel = levelLabel,
+		buyButton  = buyButton,
+		isEpic     = isEpic,
+		tab        = cfg.category,
+	}
 
-local function GetActivePanel()
-	for _, tag in ipairs(PANELS_TO_CHECK) do
-		local panel = CollectionService:GetTagged(tag)[1]
-		if panel and IsVisibleOnScreen(panel) then return panel end
-	end
-	return nil
-end
+	local holdingBuy    = false
+	local buyGeneration = 0
 
-local function MeetsStrictGates(step)
-	if not step then return false end
+	local function TryBuy()
+		if isLoadingData then return false end
+		if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_BuyUpgrade") then return false end
 
-	local currentCash = player:GetAttribute("LiveCurrency") or liveStats.currency
-	local currentGoldenAuras = player:GetAttribute("LiveGoldenAuras") or liveStats.goldenAuras
+		if isEpic then
+			local state = epicUpgradeState[upgradeId]
+			if not state or state.maxed then return false end
 
-	if step.requireHabitatFull and liveStats.pendingAuras < liveStats.habitatCapacity then return false end
-	if step.requireRateZero and liveStats.rate > 0.1 then return false end
-	if step.reachMultiplier and liveStats.currentMultiplier < step.reachMultiplier then return false end
-	if step.requireCubesProduced and GetStepCubes() < step.requireCubesProduced then return false end
-	if step.requirePlatformsShipped and GetStepShipped() < step.requirePlatformsShipped then return false end
-	if step.requireBoostBought and GetStepBoostsBought(step.requireBoostBought.id) < step.requireBoostBought.count then return false end
-	if step.requireBoostUsed and GetStepBoostsUsed(step.requireBoostUsed.id) < step.requireBoostUsed.count then return false end
-	if step.requireGoldenAuras and currentGoldenAuras < step.requireGoldenAuras then return false end
-	if step.requireStepGoldenAuras and GetStepGoldenAuras() < step.requireStepGoldenAuras then return false end
-	if step.requireCurrency and currentCash < step.requireCurrency then return false end
-	if step.requireFarmEval and liveStats.farmEvaluation < step.requireFarmEval then return false end
-	if step.requireSoulAuras and liveStats.soulAuras < step.requireSoulAuras then return false end
-	if step.requirePrestigeCount and liveStats.prestigeCount < step.requirePrestigeCount then return false end
-	if step.requireArea and liveStats.currentArea < step.requireArea then return false end
-	if step.requireLegendaryCubes and liveStats.totalLegendaryCubes < step.requireLegendaryCubes then return false end
-	if step.requirePiggyBankValue and liveStats.piggyBank < step.requirePiggyBankValue then return false end
+			local currentAuras = player:GetAttribute("LiveGoldenAuras") or 0
+			local currentAuraSpend = player:GetAttribute("LocalAuraSpend") or 0
+			local actualAuras = currentAuras - currentAuraSpend
 
-	return true
-end
+			if actualAuras < state.cost then PlayErrorFeedback(buyButton); return false end
 
----------------------------------------------------------------
--- LOGIC-LEVEL GATING (The Soft Lock)
----------------------------------------------------------------
-shared.TutorialCanPerform = function(requestedAction)
-	actionMatchedForAdvance = false 
+			local wasMaxedLocally = state.maxed
+			player:SetAttribute("LocalAuraSpend", currentAuraSpend + state.cost)
 
-	if tutorialComplete or not tutorialActive then return true end
+			state.level += 1
+			state.maxed  = (state.level >= state.maxLevel)
+			state.cost   = state.maxed and 0 or EpicUpgradeConfig.CalculateCost(upgradeId, state.level)
 
-	local activeStep = activeFallbackStep or TutorialConfig.GetStepByIndex(currentStepIndex)
-	if not activeStep then return true end
-
-	if activeStep.action == "Action_Wait" and not activeStep.allowClicking then
-		if activeStep.duration and activeStep.duration > 0 then
-			if shared.PlayUISound then shared.PlayUISound(SoundConfig.ErrorBuzz or "") end
-			return false
-		end
-		if requestedAction == "Action_ClickRedButton" then
-			if shared.PlayUISound then shared.PlayUISound(SoundConfig.ErrorBuzz or "") end
-			return false
-		end
-	end
-
-	if not activeStep.action then return true end
-	if activeStep.action == requestedAction then actionMatchedForAdvance = true; return true end
-
-	local isPermanentlyUnlocked = false
-	for i = 1, currentStepIndex do
-		local pastStep = TutorialConfig.GetStepByIndex(i)
-		if pastStep then
-			if i < currentStepIndex and pastStep.action == requestedAction then
-				isPermanentlyUnlocked = true; break
-			end
-			if pastStep.unlockActions then
-				for _, act in ipairs(pastStep.unlockActions) do
-					if act == requestedAction then isPermanentlyUnlocked = true; break end
-				end
-			end
-		end
-	end
-	if isPermanentlyUnlocked then return true end
-
-	if requestedAction == "Action_ClickRedButton" and not MeetsStrictGates(activeStep) then return true end
-	if shared.PlayUISound then shared.PlayUISound(SoundConfig.ErrorBuzz or "") end
-	return false
-end
-
----------------------------------------------------------------
--- INITIALIZATION & UI
----------------------------------------------------------------
-local function InitTutorialUI()
-	tutorialGui = Instance.new("ScreenGui"); tutorialGui.Name = "TutorialOverlays"; tutorialGui.DisplayOrder = 1000 
-	tutorialGui.IgnoreGuiInset = false 
-	tutorialGui.ResetOnSpawn = false; tutorialGui.Parent = playerGui
-
-	activeHighlight = Instance.new("Frame"); activeHighlight.Name = "TutorialHighlight"
-	activeHighlight.AnchorPoint = Vector2.new(0.5, 0.5) 
-	activeHighlight.BackgroundColor3 = Color3.new(1, 1, 1); activeHighlight.BackgroundTransparency = 1 
-	activeHighlight.Interactable = false; activeHighlight.Active = false; activeHighlight.Visible = false
-	activeHighlight.ZIndex = 99; activeHighlight.Parent = tutorialGui
-
-	local highlightStroke = Instance.new("UIStroke", activeHighlight)
-	highlightStroke.Color = TutorialConfig.DefaultColor; highlightStroke.Thickness = 3; highlightStroke.Transparency = 0.2
-	Instance.new("UICorner", activeHighlight).CornerRadius = UDim.new(0, 8)
-	TweenService:Create(highlightStroke, TweenInfo.new(0.6, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {Transparency = 0.8}):Play()
-
-	activePointer = Instance.new("ImageLabel"); activePointer.Name = "GhostHand"
-	activePointer.Size = TutorialConfig.PointerSize; activePointer.BackgroundTransparency = 1
-	activePointer.Image = TutorialConfig.PointerImage; activePointer.AnchorPoint = Vector2.new(0.5, 0.5)
-	activePointer.Visible = false; activePointer.Active = false; activePointer.ZIndex = 100; activePointer.Parent = tutorialGui
-
-	-- ✨ DYNAMICALLY SCALING BANNER
-	questBanner = Instance.new("Frame"); questBanner.Name = "QuestBanner"
-	questBanner.Size = UDim2.new(0, 650, 0, 100) -- Starts at 100, grows downward automatically
-	questBanner.AutomaticSize = Enum.AutomaticSize.Y -- ✨ The Magic Property
-	questBanner.AnchorPoint = Vector2.new(0.5, 0)
-	questBanner.Position = UDim2.new(0.5, 0, 0, -250); questBanner.BackgroundColor3 = T.panelBG or Color3.fromRGB(20, 20, 30)
-	questBanner.BorderSizePixel = 0; questBanner.Visible = false; questBanner.Active = false; questBanner.Parent = tutorialGui
-	Instance.new("UICorner", questBanner).CornerRadius = UDim.new(0, 12)
-
-	local bannerPadding = Instance.new("UIPadding", questBanner)
-	bannerPadding.PaddingBottom = UDim.new(0, 16) -- Prevents text from hugging the bottom edge when it expands
-
-	local sizeConstraint = Instance.new("UISizeConstraint", questBanner)
-	sizeConstraint.MaxSize = Vector2.new(650, 800) -- Allow a huge vertical expansion if needed
-	sizeConstraint.MinSize = Vector2.new(280, 100)
-	Instance.new("UIScale", questBanner)
-
-	local bgGrad = Instance.new("UIGradient", questBanner)
-	bgGrad.Rotation = 90
-	bgGrad.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.3), NumberSequenceKeypoint.new(1, 0.95) })
-
-	local stroke = Instance.new("UIStroke", questBanner); stroke.Name = "BannerStroke"
-	stroke.Color = TutorialConfig.DefaultColor; stroke.Thickness = 2.5; stroke.Transparency = 0.1
-	local strokeGrad = Instance.new("UIGradient", stroke); strokeGrad.Name = "StrokeGradient"; strokeGrad.Rotation = 45
-
-	-- Fixed Icon anchoring so it stays glued to the top-left regardless of Banner expansion
-	local iconFrame = Instance.new("Frame", questBanner); iconFrame.Name = "IconFrame"
-	iconFrame.Size = UDim2.new(0, 72, 0, 72); iconFrame.AnchorPoint = Vector2.new(0, 0)
-	iconFrame.Position = UDim2.new(0, 16, 0, 14); iconFrame.BackgroundColor3 = TutorialConfig.DefaultColor
-	iconFrame.BackgroundTransparency = 0.85; iconFrame.Active = false
-	Instance.new("UICorner", iconFrame).CornerRadius = UDim.new(0, 12)
-	Instance.new("UIStroke", iconFrame).Color = TutorialConfig.DefaultColor
-
-	local icon = Instance.new("ImageLabel", iconFrame); icon.Name = "IconImage"
-	icon.Size = UDim2.new(0.65, 0, 0.65, 0); icon.Position = UDim2.new(0.175, 0, 0.175, 0)
-	icon.BackgroundTransparency = 1; icon.Image = TutorialConfig.DefaultIcon
-	icon.ScaleType = Enum.ScaleType.Fit; icon.Active = false
-
-	-- ✨ TEXT CONTAINER (Organizes growing text elements natively)
-	local textContainer = Instance.new("Frame", questBanner)
-	textContainer.Name = "TextContainer"
-	textContainer.Size = UDim2.new(1, -114, 0, 0)
-	textContainer.Position = UDim2.new(0, 104, 0, 14)
-	textContainer.BackgroundTransparency = 1
-	textContainer.AutomaticSize = Enum.AutomaticSize.Y
-
-	local txtLayout = Instance.new("UIListLayout", textContainer)
-	txtLayout.SortOrder = Enum.SortOrder.LayoutOrder
-	txtLayout.Padding = UDim.new(0, 4)
-
-	local title = Instance.new("TextLabel", textContainer); title.Name = "Title"
-	title.Size = UDim2.new(1, 0, 0, 32)
-	title.BackgroundTransparency = 1; title.TextColor3 = TutorialConfig.DefaultColor
-	title.TextScaled = false; title.TextSize = 30; title.Font = Enum.Font.FredokaOne -- Massive and Crisp
-	title.TextXAlignment = Enum.TextXAlignment.Left; title.Active = false
-	title.LayoutOrder = 1
-
-	local titleStrokeObj = Instance.new("UIStroke", title)
-	titleStrokeObj.Color = Color3.new(0, 0, 0); titleStrokeObj.Thickness = 2; titleStrokeObj.Transparency = 0.3
-
-	local body = Instance.new("TextLabel", textContainer); body.Name = "Body"
-	body.Size = UDim2.new(1, 0, 0, 0)
-	body.AutomaticSize = Enum.AutomaticSize.Y -- Allows Body to stretch infinitely downwards!
-	body.BackgroundTransparency = 1; body.TextColor3 = T.bodyText or Color3.fromRGB(230, 230, 240)
-	body.TextWrapped = true; body.TextScaled = false; body.TextSize = 20 -- Massive and Crisp
-	body.RichText = true; body.Font = Enum.Font.GothamMedium
-	body.TextXAlignment = Enum.TextXAlignment.Left; body.TextYAlignment = Enum.TextYAlignment.Top
-	body.Active = false; body.LineHeight = 1.2; body.LayoutOrder = 2 -- 1.2 Line height adds beautiful breathing room
-
-	local bodyStrokeObj = Instance.new("UIStroke", body)
-	bodyStrokeObj.Color = Color3.new(0, 0, 0); bodyStrokeObj.Thickness = 1; bodyStrokeObj.Transparency = 0.5
-end
-
-local function AutoScrollToTarget(target)
-	local scrollFrame = target:FindFirstAncestorOfClass("ScrollingFrame")
-	if scrollFrame then
-		local relativeY = (target.AbsolutePosition.Y - scrollFrame.AbsolutePosition.Y) + scrollFrame.CanvasPosition.Y
-		local targetCanvasY = relativeY - (scrollFrame.AbsoluteSize.Y / 2) + (target.AbsoluteSize.Y / 2)
-		local maxScroll = math.max(0, scrollFrame.AbsoluteCanvasSize.Y - scrollFrame.AbsoluteSize.Y)
-		TweenService:Create(scrollFrame, TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-			CanvasPosition = Vector2.new(scrollFrame.CanvasPosition.X, math.clamp(targetCanvasY, 0, maxScroll))
-		}):Play()
-	end
-end
-
-local function HideBanner()
-	if not questBanner or not questBanner.Visible then return end
-	TweenService:Create(questBanner, TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Position = UDim2.new(0.5, 0, 0, -250) }):Play()
-	task.delay(0.4, function() if lastDisplayedStepId == nil then questBanner.Visible = false end end)
-end
-
-local function GetBannerTarget()
-	local activePanel = GetActivePanel()
-	local screenW = camera.ViewportSize.X
-	local screenH = camera.ViewportSize.Y
-
-	local isMobile   = screenW <= 850 or screenH <= 600
-	local isPortrait = screenH > screenW * 1.1   
-
-	local leftHudWidth  = isPortrait and 70  or 100
-	local rightHudWidth = isPortrait and 160 or 270
-	local availableCenterWidth = math.max(200, screenW - leftHudWidth - rightHudWidth)
-
-	local baseBannerWidth = 650
-	local targetScale = 1.0
-	if availableCenterWidth < baseBannerWidth then
-		targetScale = math.clamp(availableCenterWidth / baseBannerWidth, 0.42, 0.9)
-	end
-
-	if activePanel then
-		local panelName = activePanel.Name
-		local bannerW = baseBannerWidth * targetScale
-
-		if panelName == "ShopPanel" then
-			if isMobile then
-				return UDim2.new(0.5, 60, 1, -340), (targetScale * 0.8)
+			if state.maxed and not wasMaxedLocally then
+				PlayFeedbackSound("MaxOut", 0.6); PlayUIBurst(buyButton, 20)
 			else
-				local panelRightEdge = activePanel.AbsolutePosition.X + activePanel.AbsoluteSize.X
-				local targetPixelX = panelRightEdge + 35 + (bannerW / 2)
-				targetPixelX = math.min(targetPixelX, screenW - (bannerW / 2) - 10)
-				return UDim2.new(0, targetPixelX, 0, math.max(15, activePanel.AbsolutePosition.Y)), targetScale
+				PlayPurchaseSound()
 			end
-
-		elseif panelName == "BoostShopPanel" then
-			return UDim2.new(0.5, 0, 0, isMobile and -15 or -5), targetScale
-
-		elseif panelName == "TravelPanel" or panelName == "PrestigePanel" then
-			return UDim2.new(0.5, 0, 0, isMobile and -15 or 25), targetScale
-
-		elseif panelName == "AchievementPanel" then
-			if screenH < 850 then
-				return UDim2.new(0.5, 0, 1, -110), targetScale
-			else
-				return UDim2.new(0.5, 0, 1, -300), targetScale
-			end
-
+			UpdateEpicCard(upgradeId)
+			PurchaseEpicUpgrade:FireServer(upgradeId)
+			if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
+			return true
 		else
-			return UDim2.new(0.5, 0, 0, isMobile and -15 or -5), targetScale
+			local state = upgradeState[upgradeId]
+			if not state or state.maxed then return false end
+
+			local currentCash = player:GetAttribute("LiveCurrency") or 0
+			local currentSpend = player:GetAttribute("LocalSpend") or 0
+			local actualCash = currentCash - currentSpend
+
+			if actualCash < state.cost then PlayErrorFeedback(buyButton); return false end
+
+			local wasMaxedLocally = state.maxed
+			player:SetAttribute("LocalSpend", currentSpend + state.cost)
+
+			state.level += 1
+			state.maxed  = (state.level >= state.maxLevel)
+			state.cost   = state.maxed and 0 or UpgradeConfig.CalculateCost(upgradeId, state.level)
+
+			if state.maxed and not wasMaxedLocally then
+				PlayFeedbackSound("MaxOut", 0.6); PlayUIBurst(buyButton, 20)
+			else
+				PlayPurchaseSound()
+			end
+			UpdateRegularCard(upgradeId)
+			UpdateLockedTierProgress()
+			PurchaseUpgrade:FireServer(upgradeId)
+			if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
+			return true
 		end
+	end
+
+	local pulseTween = nil
+
+	buyButton.MouseButton1Down:Connect(function()
+		if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_BuyUpgrade") then return end
+
+		globalHoldGeneration += 1
+		local myGlobalGen = globalHoldGeneration
+
+		buyGeneration += 1
+		local myGen   = buyGeneration
+		holdingBuy    = true
+		globalHoldActive = true
+
+		local scale = buyButton:FindFirstChildOfClass("UIScale")
+		if not scale then
+			scale = Instance.new("UIScale")
+			scale.Parent = buyButton
+		end
+
+		pulseTween = TweenService:Create(scale, TweenInfo.new(0.12, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), { Scale = 0.88 })
+		pulseTween:Play()
+
+		TryBuy()
+		task.wait(0.3)
+		local holdStart = tick()
+
+		local UserInputService = game:GetService("UserInputService")
+		local epicHoldSpeedLevel   = (epicUpgradeState["epicHoldSpeed"] and epicUpgradeState["epicHoldSpeed"].level) or 0
+		local holdSpeedMultiplier  = 1 + (epicHoldSpeedLevel * 0.3)
+
+		while holdingBuy and buyGeneration == myGen and globalHoldGeneration == myGlobalGen do
+			if not UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
+				holdingBuy = false; globalHoldActive = false; break
+			end
+			local success = TryBuy()
+			if not success then holdingBuy = false; globalHoldActive = false; break end
+			task.wait(math.max(0.02, (0.15 - ((tick() - holdStart) * 0.05)) / holdSpeedMultiplier))
+		end
+
+		globalHoldActive = false
+		if pulseTween then pulseTween:Cancel() end
+		if scale then TweenService:Create(scale, TweenInfo.new(0.2, Enum.EasingStyle.Bounce), { Scale = 1 }):Play() end
+	end)
+
+	local function StopHold()
+		holdingBuy = false
+		globalHoldActive = false
+		if pulseTween then pulseTween:Cancel() end
+		local scale = buyButton:FindFirstChildOfClass("UIScale")
+		if scale then TweenService:Create(scale, TweenInfo.new(0.2, Enum.EasingStyle.Bounce), { Scale = 1 }):Play() end
+	end
+
+	buyButton.MouseButton1Up:Connect(StopHold)
+	buyButton.MouseLeave:Connect(StopHold)
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- BUILD EPIC CARDS
+-- ─────────────────────────────────────────────────────────────────────────────
+local epicOrderIndex = 1
+for _, tierData in ipairs(EpicUpgradeConfig.Tiers) do
+	for upgradeId, cfg in pairs(tierData.upgrades) do
+		BuildCard(EpicScroll, upgradeId, cfg, true, epicCardRefs)
+		local ref = epicCardRefs[upgradeId]
+		if ref and ref.frame then
+			ref.baseOrder      = epicOrderIndex
+			ref.frame.LayoutOrder = epicOrderIndex
+			epicOrderIndex    += 1
+			ref.frame.Visible  = false
+			ref.frame.Parent   = EpicScroll
+			if UITheme and UITheme.Apply then UITheme.Apply(ref.frame, "ShopCard") end
+		end
+	end
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- CARD UPDATE FUNCTIONS
+-- ─────────────────────────────────────────────────────────────────────────────
+function UpdateRegularCard(upgradeId)
+	local ref   = regularCardRefs[upgradeId]
+	local state = upgradeState[upgradeId]
+	if not ref or not state then return end
+	if UITheme and UITheme.Apply then UITheme.Apply(ref.frame, "ShopCard") end
+
+	ref.levelLabel.Text = "Lv. " .. state.level .. " / " .. state.maxLevel
+
+	local currentCash   = player:GetAttribute("LiveCurrency") or 0
+	local currentSpend  = player:GetAttribute("LocalSpend") or 0
+	local actualCash    = currentCash - currentSpend
+
+	if state.level >= state.maxLevel then
+		ref.frame.LayoutOrder        = (ref.baseOrder or 0) + 100000
+		ref.levelLabel.TextColor3    = Color3.fromRGB(255, 215, 0)
+		ref.buyButton.Text           = "MAX"
+		ref.buyButton.TextColor3     = Color3.fromRGB(255, 255, 255)
+		ref.buyButton.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
 	else
-		if isPortrait then
-			return UDim2.new(0.5, 0, 0, -25), targetScale
-		elseif isMobile then
-			return UDim2.new(0.5, 0, 0, -25), targetScale
-		else
-			return UDim2.new(0.5, 0, 0, -10), targetScale
-		end
+		ref.frame.LayoutOrder      = ref.baseOrder or 0
+		ref.buyButton.Text         = "$" .. FormatNumber(state.cost)
+		ref.buyButton.TextColor3   = (actualCash < state.cost) and Color3.fromRGB(255, 100, 100) or Color3.fromRGB(255, 255, 255)
+		ref.buyButton.BackgroundColor3 = Color3.fromRGB(60, 170, 80)
 	end
 end
 
-local function ShowBanner(step)
-	local stepColor = step.color or TutorialConfig.DefaultColor
+function UpdateEpicCard(upgradeId)
+	local ref   = epicCardRefs[upgradeId]
+	local state = epicUpgradeState[upgradeId]
+	if not ref or not state then return end
+	if UITheme and UITheme.Apply then UITheme.Apply(ref.frame, "ShopCard") end
 
-	-- ✨ Updated targets to correctly map to the new TextContainer wrapper
-	questBanner.TextContainer.Title.Text = step.bannerTitle; 
-	questBanner.TextContainer.Body.Text = step.bannerBody
-	questBanner.TextContainer.Title.TextColor3 = stepColor; 
-	questBanner.IconFrame.BackgroundColor3 = stepColor; 
-	questBanner.IconFrame.UIStroke.Color = stepColor
-	questBanner.IconFrame.IconImage.Image = step.icon or TutorialConfig.DefaultIcon
+	ref.levelLabel.Text = "Lv. " .. state.level .. " / " .. state.maxLevel
 
-	if activeHighlight then
-		local stroke = activeHighlight:FindFirstChildOfClass("UIStroke")
-		if stroke then stroke.Color = stepColor end
-	end
+	local currentAuras  = player:GetAttribute("LiveGoldenAuras") or 0
+	local currentAuraSpend = player:GetAttribute("LocalAuraSpend") or 0
+	local actualAuras   = currentAuras - currentAuraSpend
 
-	local strokeGrad = questBanner.BannerStroke:FindFirstChild("StrokeGradient")
-	if strokeGrad then
-		strokeGrad.Color = ColorSequence.new({ ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1)), ColorSequenceKeypoint.new(1, stepColor) })
-	end
-
-	local targetPos, targetScale = GetBannerTarget()
-
-	if not questBanner.Visible then
-		questBanner.Position = UDim2.new(0.5, 0, 0, -250); questBanner.Visible = true
-		TweenService:Create(questBanner, TweenInfo.new(0.6, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Position = targetPos }):Play()
+	if state.level >= state.maxLevel then
+		ref.frame.LayoutOrder        = (ref.baseOrder or 0) + 100000
+		ref.levelLabel.TextColor3    = Color3.fromRGB(255, 215, 0)
+		ref.buyButton.Text           = "MAX"
+		ref.buyButton.TextColor3     = Color3.fromRGB(255, 255, 255)
+		ref.buyButton.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
 	else
-		TweenService:Create(questBanner, TweenInfo.new(0.4, Enum.EasingStyle.Sine), { Position = targetPos }):Play()
+		ref.frame.LayoutOrder      = ref.baseOrder or 0
+		ref.buyButton.Text         = "✦ " .. FormatNumber(state.cost)
+		ref.buyButton.TextColor3   = (actualAuras < state.cost) and Color3.fromRGB(255, 100, 100) or Color3.fromRGB(255, 255, 255)
+		ref.buyButton.BackgroundColor3 = Color3.fromRGB(150, 80, 255)
 	end
-
-	local scaleObj = questBanner:FindFirstChildOfClass("UIScale")
-	if scaleObj then
-		TweenService:Create(scaleObj, TweenInfo.new(0.4, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = targetScale }):Play()
-	end
-
-	if shared.PlayUISound then shared.PlayUISound(SoundConfig.TutorialHint or "6895079853") end
 end
 
--- Corrects AbsolutePosition to TutorialOverlays screen space (IgnoreGuiInset=true)
-local function GetScreenPos(guiObject)
-	local pos  = guiObject.AbsolutePosition
-	local sGui = guiObject:FindFirstAncestorOfClass("ScreenGui")
-	if sGui and not sGui.IgnoreGuiInset then
-		local inset = GuiService:GetGuiInset()
-		return Vector2.new(pos.X + inset.X, pos.Y + inset.Y)
+function UpdateCurrencyDisplay()
+	if activeMainTab == "Upgrades" then
+		local currentCash = player:GetAttribute("LiveCurrency") or 0
+		local currentSpend = player:GetAttribute("LocalSpend") or 0
+		local actualCash = currentCash - currentSpend
+
+		CurrencyLabel.Text       = "$" .. FormatNumber(actualCash)
+		CurrencyLabel.TextColor3 = T.currencyColor
+		CurrencyLabel.Position   = UDim2.new(0, 12, 0, HEADER_H + 34 + 8)
 	end
-	return pos
 end
 
----------------------------------------------------------------
--- CORE LOOP (RenderStepped)
----------------------------------------------------------------
-local function StartTrackingLoop()
-	if trackingConnection then trackingConnection:Disconnect() end
+local function UpdateAllRegularCards() for id in pairs(regularCardRefs) do UpdateRegularCard(id) end end
+local function UpdateAllEpicCards()   for id in pairs(epicCardRefs)    do UpdateEpicCard(id)    end end
 
-	local bounceTime = 0
-	local isAutoScrolling = false
+UpdateLockedTierProgress = function()
+	local totalUpgradesBought = 0
+	for _, state in pairs(upgradeState) do
+		totalUpgradesBought = totalUpgradesBought + (state.level or 0)
+	end
 
-	trackingConnection = RunService.RenderStepped:Connect(function(dt)
-		local allLockedTags = {}; local currentUnlockedTags = {}
+	local lockedHeader = nil
+	local required = 0
 
-		for i, stp in ipairs(TutorialConfig.Steps) do
-			if stp.unlockTags then
-				for _, tag in ipairs(stp.unlockTags) do
-					allLockedTags[tag] = true
-					if tutorialComplete or i <= currentStepIndex then currentUnlockedTags[tag] = true end
-				end
-			end
-		end
-
-		for tag, _ in pairs(allLockedTags) do
-			local isUnlocked = currentUnlockedTags[tag] or tutorialComplete
-			local elements = CollectionService:GetTagged(tag)
-			for _, el in ipairs(elements) do
-				local overlay = el:FindFirstChild("TutorialLockOverlay")
-				if not isUnlocked then
-					if not overlay then
-						overlay = Instance.new("TextButton"); overlay.Name = "TutorialLockOverlay"; overlay.Size = UDim2.new(1, 0, 1, 0)
-						overlay.Position = UDim2.new(0, 0, 0, 0); overlay.AnchorPoint = Vector2.new(0, 0)
-						overlay.BackgroundColor3 = Color3.fromRGB(15, 15, 20); overlay.BackgroundTransparency = 0.5
-						overlay.ZIndex = 99998; overlay.Text = ""; overlay.AutoButtonColor = false
-
-						local corner = el:FindFirstChildOfClass("UICorner")
-						if corner then corner:Clone().Parent = overlay end
-
-						local icon = Instance.new("ImageLabel"); icon.Name = "PadlockIcon"; icon.Size = UDim2.new(0, 24, 0, 24)
-						icon.AnchorPoint = Vector2.new(0.5, 0.5); icon.Position = UDim2.new(0.5, 0, 0.5, 0)
-						icon.BackgroundTransparency = 1; icon.Image = "rbxassetid://14921768814"; icon.ImageColor3 = Color3.fromRGB(255, 255, 255)
-						icon.ScaleType = Enum.ScaleType.Fit; icon.ZIndex = 99999; icon.Parent = overlay
-
-						overlay.Parent = el
-					end
+	for _, child in ipairs(RegularScroll:GetChildren()) do
+		if child.Name == "TierHeader_Locked" then
+			lockedHeader = child
+			required = child:GetAttribute("Required") or 0
+			local progressLabel = child:FindFirstChild("ProgressLabel")
+			if progressLabel then
+				progressLabel.Text = totalUpgradesBought .. " / " .. required .. " Upgrades Needed"
+				local progress = totalUpgradesBought / required
+				if progress >= 1 then
+					progressLabel.TextColor3 = Color3.fromRGB(100, 255, 100) 
+				elseif progress >= 0.75 then
+					progressLabel.TextColor3 = Color3.fromRGB(255, 200, 100) 
 				else
-					if overlay then overlay:Destroy() end
+					progressLabel.TextColor3 = Color3.fromRGB(255, 100, 100) 
 				end
 			end
+			break
 		end
+	end
 
-		if tutorialComplete then 
-			if activePointer then activePointer.Visible = false end
-			if activeHighlight then activeHighlight.Visible = false end
-			HideBanner()
-			if trackingConnection then trackingConnection:Disconnect() end
-			return 
+	if lockedHeader and totalUpgradesBought >= required then
+		PlayFeedbackSound("MaxOut", 0.8)
+		PlayUIBurst(ShopPanel, 30, Color3.fromRGB(100, 255, 100))
+		local scroll = ShopPanel:FindFirstChild("RegularScroll")
+		local savedScroll = scroll and scroll.CanvasPosition or Vector2.new(0, 0)
+		RebuildRegularShop()
+		if scroll then scroll.CanvasPosition = savedScroll end
+	end
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- TIER HEADERS
+-- ─────────────────────────────────────────────────────────────────────────────
+local function CreateTierHeader(tierName)
+	local header = Instance.new("Frame")
+	header.Name                 = "TierHeader"
+	header.Size                 = UDim2.new(1, 0, 0, 30)
+	header.BackgroundTransparency = 1
+
+	local label = Instance.new("TextLabel")
+	label.Size                  = UDim2.new(1, 0, 1, -5)
+	label.BackgroundTransparency = 1
+	label.Text                  = string.upper(tierName)
+	label.TextColor3            = Color3.fromRGB(220, 220, 220)
+	label.TextSize              = 16
+	label.Font                  = Enum.Font.GothamBlack
+	label.TextXAlignment        = Enum.TextXAlignment.Left
+	label.Parent                = header
+
+	local line = Instance.new("Frame")
+	line.Size             = UDim2.new(1, 0, 0, 2)
+	line.Position         = UDim2.new(0, 0, 1, -2)
+	line.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+	line.BorderSizePixel  = 0
+	line.Parent           = header
+	return header
+end
+
+local function CreateLockedTierHeader(tierName, current, required)
+	local header = Instance.new("Frame")
+	header.Name                 = "TierHeader_Locked"
+	header.Size                 = UDim2.new(1, 0, 0, 45)
+	header.BackgroundTransparency = 1
+	header:SetAttribute("Required", required)
+
+	local label = Instance.new("TextLabel")
+	label.Size                  = UDim2.new(1, 0, 0.5, 0)
+	label.BackgroundTransparency = 1
+	label.Text                  = string.upper(tierName) .. " (LOCKED)"
+	label.TextColor3            = Color3.fromRGB(150, 150, 150)
+	label.TextSize              = 16
+	label.Font                  = Enum.Font.GothamBlack
+	label.TextXAlignment        = Enum.TextXAlignment.Left
+	label.Parent                = header
+
+	local progress = Instance.new("TextLabel")
+	progress.Name               = "ProgressLabel"
+	progress.Size               = UDim2.new(1, 0, 0.4, 0)
+	progress.Position           = UDim2.new(0, 0, 0.6, 0)
+	progress.BackgroundTransparency = 1
+	progress.Text               = current .. " / " .. required .. " Upgrades Needed"
+	progress.TextColor3         = Color3.fromRGB(255, 100, 100)
+	progress.TextSize           = 12
+	progress.Font               = Enum.Font.GothamBold
+	progress.TextXAlignment     = Enum.TextXAlignment.Left
+	progress.Parent             = header
+
+	local line = Instance.new("Frame")
+	line.Size             = UDim2.new(1, 0, 0, 2)
+	line.Position         = UDim2.new(0, 0, 1, -2)
+	line.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
+	line.BorderSizePixel  = 0
+	line.Parent           = header
+	return header
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- REBUILD REGULAR SHOP
+-- ─────────────────────────────────────────────────────────────────────────────
+RebuildRegularShop = function()
+	for _, child in ipairs(RegularScroll:GetChildren()) do
+		if child:IsA("Frame") and child.Name ~= "CardTemplate" then
+			child:Destroy()
 		end
+	end
+	regularCardRefs = {}
 
-		bounceTime += dt * 5
+	local totalUpgradesBought = 0
+	for _, state in pairs(upgradeState) do
+		totalUpgradesBought = totalUpgradesBought + (state.level or 0)
+	end
 
-		local screenW = camera.ViewportSize.X
-		local screenH = camera.ViewportSize.Y
+	local listOrder = 1
 
-		local refSize        = math.max(screenW, screenH)          
-		local pointerScaleFactor = math.clamp(refSize / 1080, 0.45, 1.3)
+	for tierNum, tierData in ipairs(UpgradeConfig.Tiers) do
+		if totalUpgradesBought >= tierData.unlockRequirement then
+			local header = CreateTierHeader(tierData.tierName or "Tier " .. tierNum)
+			header.LayoutOrder = listOrder
+			listOrder += 1
+			header.Parent = RegularScroll
 
-		local basePointerSize    = TutorialConfig.PointerSize or UDim2.new(0, 80, 0, 80)
-		local scaledPointerW     = basePointerSize.X.Offset * pointerScaleFactor
-		local scaledPointerH     = basePointerSize.Y.Offset * pointerScaleFactor
+			for upgradeId, cfg in pairs(tierData.upgrades) do
+				BuildCard(RegularScroll, upgradeId, cfg, false, regularCardRefs)
+				local ref = regularCardRefs[upgradeId]
 
-		activePointer.Size = UDim2.new(
-			basePointerSize.X.Scale, scaledPointerW,
-			basePointerSize.Y.Scale, scaledPointerH
-		)
-
-		local bounceAmp    = screenH * 0.022
-		local bounceOffset = math.abs(math.sin(bounceTime)) * bounceAmp
-
-		local isMobileView = screenW <= 850 or screenH <= 600
-
-		local step = activeFallbackStep or TutorialConfig.GetStepByIndex(currentStepIndex)
-		if not step then return end
-
-		if not activeFallbackStep then
-			if not MeetsStrictGates(step) then
-				if step.fallbackStepId then
-					local foundFallback = TutorialConfig.GetStepById(step.fallbackStepId)
-					if foundFallback then activeFallbackStep = foundFallback; step = activeFallbackStep end
-				end
-			end
-		else
-			local originalStep = TutorialConfig.GetStepByIndex(currentStepIndex)
-			if originalStep and MeetsStrictGates(originalStep) then
-				activeFallbackStep = nil; step = originalStep
-			end
-		end
-
-		if not step then return end 
-
-		if step.bannerTitle then
-			if lastDisplayedStepId ~= step.id then
-				lastDisplayedStepId = step.id
-				ShowBanner(step)
-				if step.cameraTarget or step.cameraTrackMode then ForceCloseUI:Fire() end
-			end
-
-			if questBanner and questBanner.Visible then
-				local targetPos, targetScale = GetBannerTarget()
-				questBanner.Position = questBanner.Position:Lerp(targetPos, 0.15)
-				local scaleObj = questBanner:FindFirstChildOfClass("UIScale")
-				if scaleObj then
-					scaleObj.Scale = scaleObj.Scale + ((targetScale - scaleObj.Scale) * 0.15)
-				end
-			end
-
-			local progressText = ""
-			local checkStep = activeFallbackStep and TutorialConfig.GetStepByIndex(currentStepIndex) or step
-
-			if checkStep.requireCubesProduced then
-				local capCubes = math.min(GetStepCubes(), checkStep.requireCubesProduced)
-				progressText = "\n<b><font color='rgb(100, 255, 100)'>Progress: " .. capCubes .. " / " .. checkStep.requireCubesProduced .. "</font></b>"
-			elseif checkStep.requirePlatformsShipped then
-				local capShipped = math.min(GetStepShipped(), checkStep.requirePlatformsShipped)
-				progressText = "\n<b><font color='rgb(100, 255, 100)'>Progress: " .. capShipped .. " / " .. checkStep.requirePlatformsShipped .. "</font></b>"
-			elseif checkStep.requireCurrency then
-				local currentCash = player:GetAttribute("LiveCurrency") or liveStats.currency
-				local capCash = math.min(math.floor(currentCash), checkStep.requireCurrency)
-				progressText = "\n<b><font color='rgb(100, 255, 100)'>Progress: $" .. capCash .. " / $" .. checkStep.requireCurrency .. "</font></b>"
-			elseif checkStep.reachMultiplier then
-				local currentMult = liveStats.currentMultiplier or 1
-				local capMult = math.min(currentMult, checkStep.reachMultiplier)
-				progressText = "\n<b><font color='rgb(255, 255, 50)'>Progress: " .. string.format("%.1f", capMult) .. "x / " .. string.format("%.1f", checkStep.reachMultiplier) .. "x</font></b>"
-			elseif checkStep.requireStepGoldenAuras then
-				local capGA = math.min(GetStepGoldenAuras(), checkStep.requireStepGoldenAuras)
-				progressText = "\n<b><font color='rgb(255, 215, 0)'>Progress: " .. capGA .. " / " .. checkStep.requireStepGoldenAuras .. " GA</font></b>"
-			elseif checkStep.requireFarmEval then
-				local capFE = math.min(math.floor(liveStats.farmEvaluation), checkStep.requireFarmEval)
-				progressText = "\n<b><font color='rgb(100, 255, 100)'>Progress: $" .. Formatter.Format(capFE) .. " / $" .. Formatter.Format(checkStep.requireFarmEval) .. "</font></b>"
-			elseif checkStep.requireBoostBought then
-				local cap = math.min(GetStepBoostsBought(checkStep.requireBoostBought.id), checkStep.requireBoostBought.count)
-				progressText = "\n<b><font color='rgb(100, 255, 100)'>Progress: " .. cap .. " / " .. checkStep.requireBoostBought.count .. "</font></b>"
-			elseif checkStep.requireBoostUsed then
-				local cap = math.min(GetStepBoostsUsed(checkStep.requireBoostUsed.id), checkStep.requireBoostUsed.count)
-				progressText = "\n<b><font color='rgb(100, 255, 100)'>Progress: " .. cap .. " / " .. checkStep.requireBoostUsed.count .. "</font></b>"
-			end
-
-			-- ✨ Write to the new TextContainer wrapper
-			questBanner.TextContainer.Body.Text = step.bannerBody .. progressText
-
-		else
-			if lastDisplayedStepId ~= nil then lastDisplayedStepId = nil; HideBanner() end
-		end
-
-		local targetToTrack2D = nil
-		local targetToTrack3D = nil
-
-		if step.target3D then
-			if string.find(string.lower(step.target3D), "aura") then
-				local aura = GetActiveAura()
-				if aura then targetToTrack3D = aura:IsA("Model") and aura:GetPivot().Position or aura.Position end
-			else
-				local obj = CollectionService:GetTagged(step.target3D)[1]
-				if obj then targetToTrack3D = obj:IsA("Model") and obj:GetPivot().Position or obj.Position end
-			end
-		elseif step.targetTag then
-			if step.menuTag and step.menuOpenBtnTag then
-				local menuInstances = CollectionService:GetTagged(step.menuTag)
-				local menuIsOpen = false
-				for _, menu in ipairs(menuInstances) do
-					if IsVisibleOnScreen(menu) then menuIsOpen = true; break end
-				end
-				targetToTrack2D = menuIsOpen and CollectionService:GetTagged(step.targetTag)[1] or CollectionService:GetTagged(step.menuOpenBtnTag)[1]
-			else
-				targetToTrack2D = CollectionService:GetTagged(step.targetTag)[1]
-			end
-		end
-
-		if targetToTrack3D then
-			local screenPos, onScreen = camera:WorldToViewportPoint(targetToTrack3D)
-			if onScreen and screenPos.Z > 0 then
-				activePointer.Visible = true; activeHighlight.Visible = false 
-				activePointer.Rotation = 0
-				activePointer.Position = UDim2.new(0, screenPos.X, 0, screenPos.Y - (activePointer.Size.Y.Offset / 2) - bounceOffset)
-			else
-				activePointer.Visible = false; activeHighlight.Visible = false
-			end
-
-		elseif targetToTrack2D and targetToTrack2D:IsA("GuiObject") then
-
-			local function ResolveButton(obj)
-				if obj:IsA("GuiButton") and obj.AbsoluteSize.Magnitude > 1 then return obj end
-				local b = obj:FindFirstChildWhichIsA("TextButton", true)
-					or obj:FindFirstChildWhichIsA("ImageButton", true)
-				if b and b.AbsoluteSize.Magnitude > 1 then return b end
-				if obj.Parent and obj.Parent:IsA("GuiObject") then
-					b = obj.Parent:FindFirstChildWhichIsA("TextButton", true)
-						or obj.Parent:FindFirstChildWhichIsA("ImageButton", true)
-					if b and b.AbsoluteSize.Magnitude > 1 then return b end
-				end
-				return obj  
-			end
-
-			targetToTrack2D = ResolveButton(targetToTrack2D)
-
-			if targetToTrack2D.AbsoluteSize.Magnitude <= 1 or not IsVisibleOnScreen(targetToTrack2D) then
-				activePointer.Visible = false
-				activeHighlight.Visible = false
-			else
-				activePointer.Visible   = true
-				activeHighlight.Visible = true
-
-				local tgtW = targetToTrack2D.AbsoluteSize.X
-				local tgtH = targetToTrack2D.AbsoluteSize.Y
-				local corrected = GetScreenPos(targetToTrack2D)
-
-				local tgtX = targetToTrack2D.AbsolutePosition.X
-				local tgtY = targetToTrack2D.AbsolutePosition.Y
-
-				local scaleObj = targetToTrack2D:FindFirstChildOfClass("UIScale")
-				if scaleObj and scaleObj.Scale ~= 1 then
-					local s      = scaleObj.Scale
-					local anchor = targetToTrack2D.AnchorPoint
-					local anchorPxX = tgtX + (tgtW * anchor.X)
-					local anchorPxY = tgtY + (tgtH * anchor.Y)
-					tgtW = tgtW * s;  tgtH = tgtH * s
-					tgtX = anchorPxX - (tgtW * anchor.X)
-					tgtY = anchorPxY - (tgtH * anchor.Y)
-				end
-
-				local centerX = tgtX + (tgtW / 2)
-				local centerY = tgtY + (tgtH / 2)
-
-				local padding      = screenH * 0.018   
-				local topHighExtra = screenH * 0.065   
-
-				local pointerW = scaledPointerW
-				local pointerH = scaledPointerH
-
-				local pX, pY, rot
-				local dir = "BOTTOM"
-				local tagCheck = step.targetTag or ""
-
-				if HUD_DIRECTIONS[tagCheck] then
-					dir = HUD_DIRECTIONS[tagCheck]
-				elseif tagCheck:match("Tutorial_AchieveRow") or tagCheck:match("Tutorial_BuyBoost") or tagCheck:match("Tutorial_UseBoost") then
-					dir = "RIGHT"
-				else
-					if centerX < screenW * 0.3 then        dir = "RIGHT"
-					elseif centerX > screenW * 0.7 then    dir = "LEFT"
-					elseif centerY > screenH * 0.5 then    dir = "TOP"
-					else                                   dir = "BOTTOM" end
-				end
-
-				if dir == "RIGHT" then
-					pX = centerX + (tgtW / 2) + (pointerW / 2) + padding + bounceOffset
-					pY = centerY;  rot = 90
-				elseif dir == "LEFT" then
-					pX = centerX - (tgtW / 2) - (pointerW / 2) - padding - bounceOffset
-					pY = centerY;  rot = -90
-				elseif dir == "TOP_HIGH" then
-					pX = centerX
-					pY = centerY - (tgtH / 2) - (pointerH / 2) - topHighExtra - bounceOffset
-					rot = 0
-				elseif dir == "TOP" then
-					pX = centerX
-					pY = centerY - (tgtH / 2) - (pointerH / 2) - padding - bounceOffset
-					rot = 0
-				elseif dir == "BOTTOM" then
-					pX = (tgtW > screenW * 0.18) and (centerX + (tgtW / 2) - tgtW * 0.08) or centerX
-					pY = centerY + (tgtH / 2) + (pointerH / 2) + padding * 0.15 + bounceOffset
-					rot = 180
-				end
-
-				pX = math.clamp(pX, pointerW / 2 + 4, screenW - pointerW / 2 - 4)
-				pY = math.clamp(pY, pointerH / 2 + 4, screenH - pointerH / 2 - 4)
-
-				activePointer.Position = activePointer.Position:Lerp(UDim2.new(0, pX, 0, pY), 0.3)
-				activePointer.Rotation = rot
-
-				local highlightPad = math.max(6, screenH * 0.010)
-				activeHighlight.Position = activeHighlight.Position:Lerp(UDim2.new(0, centerX, 0, centerY), 0.4)
-				activeHighlight.Size     = activeHighlight.Size:Lerp(
-					UDim2.new(0, tgtW + highlightPad * 2, 0, tgtH + highlightPad * 2), 0.4)
-
-				local targetCorner    = targetToTrack2D:FindFirstChildOfClass("UICorner")
-				local highlightCorner = activeHighlight:FindFirstChildOfClass("UICorner")
-				if targetCorner and highlightCorner then
-					highlightCorner.CornerRadius = targetCorner.CornerRadius
-				end
-
-				local scrollFrame = targetToTrack2D:FindFirstAncestorOfClass("ScrollingFrame")
-				if scrollFrame and not isAutoScrolling then
-					local targetY2   = targetToTrack2D.AbsolutePosition.Y
-					local scrollY    = scrollFrame.AbsolutePosition.Y
-					local scrollBot  = scrollY + scrollFrame.AbsoluteSize.Y
-					if (targetY2 + tgtH < scrollY) or (targetY2 > scrollBot) then
-						isAutoScrolling = true
-						AutoScrollToTarget(targetToTrack2D)
-						task.delay(0.5, function() isAutoScrolling = false end)
+				if ref and ref.frame then
+					if ref.buyButton then
+						ref.buyButton.Name = "Buy_" .. upgradeId
 					end
+					ref.baseOrder          = listOrder
+					ref.frame.LayoutOrder  = listOrder
+					listOrder             += 1
+					ref.frame.Visible      = true
+					ref.frame.Parent       = RegularScroll
+					if UITheme and UITheme.Apply then UITheme.Apply(ref.frame, "ShopCard") end
+					local myColor = Color3.fromRGB(45, 30, 55)
+					ref.frame:SetAttribute("TierColor", myColor)
+					ref.frame.BackgroundColor3 = myColor
 				end
-			end  
-		else
-			activePointer.Visible = false; activeHighlight.Visible = false
-		end
-
-		if step.cameraTrackMode == "FollowAura" then
-			local aura = GetActiveAura()
-			if aura then
-				if camera.CameraType ~= Enum.CameraType.Scriptable then camera.CameraType = Enum.CameraType.Scriptable end
-				local targetPos = aura:IsA("Model") and aura:GetPivot().Position or aura.Position
-				local offset = step.cameraOffset or Vector3.new(0, 8, 10) 
-				camera.CFrame = camera.CFrame:Lerp(CFrame.new(targetPos + offset, targetPos), 0.025) 
-			else
-				local fallbackCam = CollectionService:GetTagged("Tutorial_AuraHolderCam")[1]
-				if fallbackCam then
-					if camera.CameraType ~= Enum.CameraType.Scriptable then camera.CameraType = Enum.CameraType.Scriptable end
-					local desiredCFrame = fallbackCam:IsA("Model") and fallbackCam:GetPivot() or fallbackCam.CFrame
-					camera.CFrame = camera.CFrame:Lerp(desiredCFrame, 0.025)
-				end
-			end
-
-		elseif step.cameraTrackMode == "FollowPhysicsAura" then
-			local physicsAura = GetActivePhysicsAura()
-
-			local cameraTimeExpired = false
-			if step.cameraDuration then
-				if not step._cameraStartTime then step._cameraStartTime = tick() end
-				if tick() - step._cameraStartTime >= step.cameraDuration then
-					cameraTimeExpired = true
-				end
-			end
-
-			if physicsAura and not cameraTimeExpired then
-				step._returningToPlayer = nil 
-				if camera.CameraType ~= Enum.CameraType.Scriptable then camera.CameraType = Enum.CameraType.Scriptable end
-				local targetPos = physicsAura:IsA("Model") and physicsAura:GetPivot().Position or physicsAura.Position
-				local offset = step.cameraOffset or Vector3.new(0, 15, 25) 
-				camera.CFrame = camera.CFrame:Lerp(CFrame.new(targetPos + offset, targetPos), 0.05) 
-			else
-				if camera.CameraType == Enum.CameraType.Scriptable then
-					if not step._returningToPlayer then
-						step._returningToPlayer = true
-						local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
-						if hrp then
-							local targetCF = CFrame.new(hrp.Position + Vector3.new(0, 8, 12), hrp.Position)
-							local tween = TweenService:Create(camera, TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {CFrame = targetCF})
-							tween:Play()
-							tween.Completed:Once(function()
-								if step._returningToPlayer then
-									camera.CameraType = Enum.CameraType.Custom
-									camera.CameraSubject = player.Character:FindFirstChild("Humanoid")
-								end
-							end)
-						else
-							camera.CameraType = Enum.CameraType.Custom
-						end
-					end
-				end
-			end
-
-		elseif step.cameraTarget then
-			local camTarget = CollectionService:GetTagged(step.cameraTarget)[1]
-			if not camTarget or not camTarget.Parent then
-				if camera.CameraType ~= Enum.CameraType.Custom then
-					camera.CameraType = Enum.CameraType.Custom
-					if player.Character and player.Character:FindFirstChild("Humanoid") then
-						camera.CameraSubject = player.Character:FindFirstChild("Humanoid")
-					end
-				end
-			else
-				if camera.CameraType ~= Enum.CameraType.Scriptable then camera.CameraType = Enum.CameraType.Scriptable end
-				local desiredCFrame = camTarget:IsA("Model") and camTarget:GetPivot() or camTarget.CFrame
-				camera.CFrame = camera.CFrame:Lerp(desiredCFrame, 0.03)
 			end
 		else
-			if camera.CameraType ~= Enum.CameraType.Custom then
-				camera.CameraType = Enum.CameraType.Custom
-				if player.Character and player.Character:FindFirstChild("Humanoid") then
-					camera.CameraSubject = player.Character:FindFirstChild("Humanoid")
-				end
-			end
+			local lockedHeader = CreateLockedTierHeader(tierData.tierName or "Tier " .. tierNum, totalUpgradesBought, tierData.unlockRequirement)
+			lockedHeader.LayoutOrder = listOrder
+			lockedHeader.Parent      = RegularScroll
+			break
 		end
+	end
+	UpdateAllRegularCards()
+end
 
-		if not step._startTime then step._startTime = tick() end
+RebuildRegularShop()
 
-		if step.duration and step.duration > 0 then
-			if tick() - step._startTime >= step.duration then shared.AdvanceTutorialStep(true) end
-		elseif step.duration == 0 then
-			if MeetsStrictGates(step) and not activeFallbackStep then shared.AdvanceTutorialStep(true) 
-			elseif step.failsafeDuration and (tick() - step._startTime >= step.failsafeDuration) then shared.AdvanceTutorialStep(true) end
+task.delay(5, function() isLoadingData = false end)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- TAB SWITCHING
+-- ─────────────────────────────────────────────────────────────────────────────
+local function SwitchToMainTab(tabName)
+	if shared.PlayUISound then shared.PlayUISound(SoundConfig.UIClick or "") end
+	activeMainTab     = tabName
+	activeShopTabText = (tabName == "Epic") and "Epic Research" or "Regular Upgrades"
+	ShopHoverLabel.Text = activeShopTabText
+
+	for name, data in pairs(mainTabButtons) do
+		data.btn.BackgroundColor3 = (name == tabName) and TAB_COLOR_ACTIVE or TAB_COLOR_BASE
+		data.stroke.Color         = (name == tabName) and T.bodyText or T.panelStroke
+	end
+
+	RegularScroll.Visible = (tabName == "Upgrades")
+	EpicScroll.Visible    = (tabName == "Epic")
+
+	if tabName == "Epic" then
+		for _, ref in pairs(epicCardRefs) do
+			if ref and ref.frame then ref.frame.Visible = true end
+		end
+		if EpicScroll then EpicScroll.CanvasPosition = Vector2.new(0, 0) end
+	end
+end
+
+tabUpgrades.MouseButton1Down:Connect(function() PlayUI(SoundConfig.UIClick); SwitchToMainTab("Upgrades") end)
+tabEpic.MouseButton1Down:Connect(function()     PlayUI(SoundConfig.UIClick); SwitchToMainTab("Epic")     end)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ✨ OPEN / CLOSE 
+-- ─────────────────────────────────────────────────────────────────────────────
+local function OpenShop()
+	-- ✨ FIRE MUTUAL EXCLUSION SIGNAL
+	ForceCloseUI:Fire("ShopPanel")
+
+	shopOpen = true
+	ShopPanel.Visible = true
+	SwitchToMainTab(activeMainTab)
+
+	TweenService:Create(ShopPanel, TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Position = UDim2.new(0, 95, 0.5, 0) }):Play()
+	ShopButton.BackgroundColor3 = T.buttonSecondary
+end
+
+local function CloseShop()
+	shopOpen = false
+	PlayUI(SoundConfig.UIClose)
+
+	local tween = TweenService:Create(ShopPanel, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Position = UDim2.new(0, -500, 0.5, 0) })
+	tween:Play()
+	tween.Completed:Once(function() if not shopOpen then ShopPanel.Visible = false end end)
+	ShopButton.BackgroundColor3 = T.buttonSecondary
+end
+
+ShopButton.MouseButton1Down:Connect(function()
+	if shopOpen then
+		if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_CloseShop") then return end
+		CloseShop()
+		if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
+	else
+		if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_OpenShop") then return end
+		OpenShop()
+		if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
+	end
+end)
+
+CloseButton.MouseButton1Down:Connect(function()
+	if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_CloseShop") then return end
+	CloseShop()
+	if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
+end)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- LIVE UPDATE LOOP
+-- ─────────────────────────────────────────────────────────────────────────────
+local lastCardUpdate = 0
+RunService.Heartbeat:Connect(function()
+	if not shopOpen then return end
+	local now = tick()
+	if now - lastCardUpdate > 0.1 then
+		lastCardUpdate = now
+		if activeMainTab == "Upgrades" then UpdateAllRegularCards() else UpdateAllEpicCards() end
+		UpdateCurrencyDisplay()
+	end
+end)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SERVER EVENTS
+-- ─────────────────────────────────────────────────────────────────────────────
+if UpgradeUpdated then
+	UpgradeUpdated.OnClientEvent:Connect(function(info)
+		if info.type == "fullState" then
+			isLoadingData = false
+			upgradeState   = info.upgrades
+			currentCurrency = info.currency
+			RebuildRegularShop()
+			UpdateCurrencyDisplay()
+
+		elseif info.type == "purchased" then
+			player:SetAttribute("LastServerPurchaseTick", tick())
+			player:SetAttribute("LocalSpend", 0)
+			player:SetAttribute("ForceSyncCurrency", info.currency)
+
+			local current = upgradeState[info.upgradeId]
+			if not current or info.level >= current.level then
+				upgradeState[info.upgradeId] = {
+					level    = info.level,
+					maxLevel = info.maxLevel,
+					cost     = info.cost,
+					maxed    = info.maxed,
+				}
+			end
+			currentCurrency = info.currency
+
+			UpdateRegularCard(info.upgradeId)
+			UpdateLockedTierProgress()
+			UpdateCurrencyDisplay()
 		end
 	end)
 end
 
----------------------------------------------------------------
--- EXTERNAL ADVANCEMENT (Server or Local UI)
----------------------------------------------------------------
-shared.AdvanceTutorialStep = function(forceAdvance)
-	if isAdvancing then return end 
-	if tutorialComplete then return end
-	if activeFallbackStep then return end
+if EpicUpgradeUpdated then
+	EpicUpgradeUpdated.OnClientEvent:Connect(function(info)
+		if info.type == "fullState" then
+			isLoadingData = false
+			epicUpgradeState = info.upgrades
+			liveGoldenAuras  = info.goldenAuras or liveGoldenAuras
+			UpdateAllEpicCards()
+			UpdateCurrencyDisplay()
 
-	local currentStepData = TutorialConfig.GetStepByIndex(currentStepIndex)
-	if currentStepData and currentStepData.duration ~= 0 and not forceAdvance then
-		if not actionMatchedForAdvance then return end
-	end
+		elseif info.type == "purchased" then
+			player:SetAttribute("LastServerPurchaseTick", tick())
+			player:SetAttribute("LocalAuraSpend", 0)
 
-	actionMatchedForAdvance = false; lockedAura = nil 
-
-	if currentStepData and currentStepData.duration == 0 and not forceAdvance then
-		if not MeetsStrictGates(currentStepData) then return end
-	end
-
-	isAdvancing = true 
-
-	if currentStepData then TutorialStepComplete:FireServer(currentStepData.id) end
-	currentStepIndex += 1
-
-	baselineCubes = liveStats.totalCubesProduced
-	baselineShipped = liveStats.totalPlatformsShipped
-	baselineGoldenAuras = player:GetAttribute("LiveGoldenAuras") or liveStats.goldenAuras
-	for k, v in pairs(liveStats.boostsBought) do baselineBoostsBought[k] = v end
-	for k, v in pairs(liveStats.boostsUsed) do baselineBoostsUsed[k] = v end
-
-	local nextStep = TutorialConfig.GetStepByIndex(currentStepIndex)
-
-	if not nextStep then
-		tutorialComplete = true
-		if activePointer then activePointer.Visible = false end
-		if activeHighlight then activeHighlight.Visible = false end
-		HideBanner()
-		if trackingConnection then trackingConnection:Disconnect() end
-
-		camera.CameraType = Enum.CameraType.Custom
-		if player.Character and player.Character:FindFirstChild("Humanoid") then
-			camera.CameraSubject = player.Character:FindFirstChild("Humanoid")
-		end
-
-		TutorialStepComplete:FireServer("__tutorialComplete__")
-
-		local successSound = Instance.new("Sound")
-		successSound.SoundId = "rbxassetid://4612385808"; successSound.Volume = 0.6
-		successSound.Parent = game:GetService("SoundService"); successSound:Play()
-		game:GetService("Debris"):AddItem(successSound, 4)
-	end
-
-	task.delay(0.1, function() isAdvancing = false end)
-end
-
----------------------------------------------------------------
--- STATE RECONCILIATION & DATA SYNC
----------------------------------------------------------------
-UpdateHUDBridge:Connect(function(stats)
-	if stats.currency ~= nil then liveStats.currency = stats.currency end
-	if stats.totalEarned ~= nil then liveStats.totalEarned = stats.totalEarned end
-	if stats.farmEvaluation ~= nil then liveStats.farmEvaluation = stats.farmEvaluation end
-	if stats.soulAuras ~= nil then liveStats.soulAuras = stats.soulAuras end
-	if stats.goldenAuras ~= nil then liveStats.goldenAuras = stats.goldenAuras end
-	if stats.prestigeCount ~= nil then liveStats.prestigeCount = stats.prestigeCount end
-	if stats.currentArea ~= nil then liveStats.currentArea = stats.currentArea end
-
-	if stats.pendingAuras ~= nil then liveStats.pendingAuras = stats.pendingAuras end
-	if stats.habitatCapacity ~= nil then liveStats.habitatCapacity = stats.habitatCapacity end
-	if stats.rate ~= nil then liveStats.rate = stats.rate end
-
-	if stats.totalCubesProduced ~= nil then liveStats.totalCubesProduced = math.max(liveStats.totalCubesProduced, stats.totalCubesProduced) end
-	if stats.totalPlatformsShipped ~= nil then liveStats.totalPlatformsShipped = math.max(liveStats.totalPlatformsShipped, stats.totalPlatformsShipped) end
-	if stats.totalLegendaryCubes ~= nil then liveStats.totalLegendaryCubes = math.max(liveStats.totalLegendaryCubes, stats.totalLegendaryCubes) end
-	if stats.piggyBank ~= nil then liveStats.piggyBank = stats.piggyBank end
-
-	if stats.tutorialComplete ~= nil then tutorialComplete = stats.tutorialComplete end
-
-	if stats.tutorialProgress and not tutorialComplete then
-		local highestCompletedIndex = 0
-
-		for index, stepData in ipairs(TutorialConfig.Steps) do
-			if stats.tutorialProgress[stepData.id] then highestCompletedIndex = index end
-		end
-
-		if highestCompletedIndex >= currentStepIndex then
-			currentStepIndex = highestCompletedIndex + 1
-
-			baselineCubes = liveStats.totalCubesProduced
-			baselineShipped = liveStats.totalPlatformsShipped
-			baselineGoldenAuras = player:GetAttribute("LiveGoldenAuras") or liveStats.goldenAuras
-			for k, v in pairs(liveStats.boostsBought) do baselineBoostsBought[k] = v end
-			for k, v in pairs(liveStats.boostsUsed) do baselineBoostsUsed[k] = v end
-
-			if not TutorialConfig.GetStepByIndex(currentStepIndex) then
-				tutorialComplete = true
-				if trackingConnection then trackingConnection:Disconnect() end
-				if questBanner then HideBanner() end
-				if activePointer then activePointer.Visible = false end
-				if activeHighlight then activeHighlight.Visible = false end
+			local current = epicUpgradeState[info.upgradeId]
+			if not current or info.level >= current.level then
+				epicUpgradeState[info.upgradeId] = {
+					level    = info.level,
+					maxLevel = info.maxLevel,
+					cost     = info.cost,
+					maxed    = info.maxed,
+				}
 			end
+			UpdateEpicCard(info.upgradeId)
+			UpdateCurrencyDisplay()
+		end
+	end)
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- BUTTON JUICE & REFRESH LOOK
+-- ─────────────────────────────────────────────────────────────────────────────
+local function AddButtonJuice(btn)
+	if not btn then return end
+	local scale = btn:FindFirstChildOfClass("UIScale")
+	if not scale then scale = Instance.new("UIScale"); scale.Parent = btn end
+	btn.MouseEnter:Connect(function() TweenService:Create(scale, TweenInfo.new(0.15, Enum.EasingStyle.Sine), { Scale = 1.08 }):Play() end)
+	btn.MouseLeave:Connect(function() TweenService:Create(scale, TweenInfo.new(0.15, Enum.EasingStyle.Sine), { Scale = 1 }):Play() end)
+	btn.MouseButton1Down:Connect(function() TweenService:Create(scale, TweenInfo.new(0.1, Enum.EasingStyle.Sine), { Scale = 0.9 }):Play() end)
+	btn.MouseButton1Up:Connect(function() TweenService:Create(scale, TweenInfo.new(0.2, Enum.EasingStyle.Bounce), { Scale = 1.08 }):Play() end)
+end
+
+AddButtonJuice(ShopButton); AddButtonJuice(CloseButton); AddButtonJuice(tabUpgrades); AddButtonJuice(tabEpic)
+
+local shopShine    = nil
+local titleFlair   = nil
+local flairedExtra = false
+
+local function RefreshLook()
+	UITheme.Apply(ShopPanel, "Panel")
+	UITheme.Apply(ShopPanel, "TitleBar")
+
+	if not shopShine then
+		shopShine  = UITheme.ApplyShine(ShopPanel)
+		UITheme.ApplyShine(TitleBar)
+	end
+
+	if not titleFlair then titleFlair = UITheme.ApplyFlair(TitleLabel, "Ghost") end
+	if not flairedExtra then flairedExtra = true end
+
+	for _, scrollName in ipairs({ "RegularScroll", "EpicScroll" }) do
+		local scroll = ShopPanel:FindFirstChild(scrollName)
+		if scroll then
+			local layout = scroll:FindFirstChildOfClass("UIListLayout")
+			if layout then layout.SortOrder = Enum.SortOrder.LayoutOrder end
 		end
 	end
-end)
 
----------------------------------------------------------------
--- BOOT & MENU GATE
----------------------------------------------------------------
-task.spawn(function()
-	local menuGate = ReplicatedStorage:WaitForChild("MenuDismissed", 10)
-	if menuGate and not menuGate:GetAttribute("Fired") then menuGate.Event:Wait() end
-
-	local character = player.Character or player.CharacterAdded:Wait()
-	local humanoid = character:WaitForChild("Humanoid", 5)
-	camera.CameraType = Enum.CameraType.Custom
-	if humanoid then camera.CameraSubject = humanoid end
-
-	tutorialActive = true
-	InitTutorialUI()
-	StartTrackingLoop()
-end)
-
--- TutorialConfig
--- Location: ReplicatedStorage > Modules > TutorialConfig
-
-local TutorialConfig = {}
-
-TutorialConfig.TutorialEndArea = 5
-
--- The Ghost Hand / Pointer asset
-TutorialConfig.PointerImage = "rbxassetid://14914009728"
-TutorialConfig.PointerSize = UDim2.new(0, 75, 0, 75)
-
--- Default Styling
-TutorialConfig.DefaultColor = Color3.fromRGB(100, 200, 255)
-TutorialConfig.DefaultIcon  = "rbxassetid://14914018910"
-
--- THE FSM SEQUENCE
-TutorialConfig.Steps = {
-
-	-- ✨ STEP 1: Welcome & First Click
-	[1] = {
-		id           = "a1_welcome_click",
-		action       = "Action_ClickRedButton",
-		targetTag    = "Tutorial_ClickButton",
-
-		bannerTitle  = "Welcome to Aura Inc!",
-		bannerBody   = "Spam Click the Red Button below to produce your first Auras.",
-
-		icon         = "rbxassetid://14922082255", 
-		color        = Color3.fromRGB(143, 255, 131), 
-	},
-
-	-- ✨ STEP 2: Cinematic Camera Follow
-	[2] = {
-		id               = "a1_watch_aura",
-		action           = "Action_Wait",
-
-		cameraTrackMode  = "FollowAura", 
-		target3D         = "Aura",       
-		duration         = 5,          
-		allowClicking = true, 
-
-		bannerTitle  = "Generating Profit",
-		bannerBody   = "Each Aura generates cash every second based on its rarity.",
-
-		icon         = "rbxassetid://14949455379", --profit
-		color        = Color3.fromRGB(255, 255, 255), 
-	},
-
-	-- ✨ STEP 3: Produce Bulk
-	[3] = {
-		id           = "a1_produce_25",
-		action       = "Action_ClickRedButton",
-		targetTag    = "Tutorial_ClickButton",
-		cameraTarget = "Tutorial_AuraHolderCam",
-
-		requireCubesProduced = 25,
-		failsafeDuration = 35, 
-		bannerTitle  = "Producing Auras",
-		bannerBody   = "Keep clicking to produce 25 Auras! The more you make, the more money you earn.",
-		duration     = 0, 
-
-		icon         = "rbxassetid://14949472931", --produce
-		color        = Color3.fromRGB(130, 226, 255), 
-	},
-
-	-- ✨ STEP 4: Farm up Cash
-	[4] = {
-		id           = "a1_farm_150",
-		action       = "Action_ClickRedButton",
-
-		requireCurrency = 150,
-
-		bannerTitle  = "Stacking Cash",
-		bannerBody   = "Your Auras are passively generating income while on the Conveyer. Keep producing until you save up $150!",
-		duration     = 0,
-		failsafeDuration = 25, 
-		icon         = "rbxassetid://14957592517", --cash
-		color        = Color3.fromRGB(150, 255, 150), 
-	},
-
-	-- ✨ STEP 5: Unlock Shop
-	[5] = {
-		id           = "a1_open_shop",
-		action       = "Action_OpenShop",
-		targetTag    = "Tutorial_ShopButton",
-
-		unlockTags    = {"Tutorial_ShopButton"},
-		unlockActions = {"Action_OpenShop", "Action_CloseShop"},
-
-		bannerTitle  = "Open The Shop",
-		bannerBody   = "You have enough Money! Click the Shop icon to view your upgrades.",
-
-		icon         = "rbxassetid://14957358690", --unlock
-		color        = Color3.fromRGB(123, 216, 250),
-	},
-
-	-- ✨ STEP 6: First Upgrade
-	[6] = {
-		id             = "a1_buy_blockValue",
-		action         = "Action_BuyUpgrade",
-		targetTag      = "Tutorial_Buy_blockValue",
-
-		unlockTags     = {"Tutorial_Buy_blockValue"},
-
-		menuTag        = "Tutorial_ShopPanel",
-		menuOpenBtnTag = "Tutorial_ShopButton",
-
-		bannerTitle  = "Increase Value",
-		bannerBody   = "Buy the Value upgrade to increase the Value of your Auras by +10%",
-
-		icon         = "rbxassetid://14917130166",
-		color        = Color3.fromRGB(142, 206, 255), 
-	},
-
-	-- ✨ STEP 7: Habitat Fill
-	[7] = {
-		id           = "a1_fill_habitat",
-		action       = "Action_ClickRedButton",
-		targetTag    = "Tutorial_ClickButton",
-
-		requireHabitatFull = true,
-		duration           = 0, 
-
-		bannerTitle  = "Keep Producing",
-		bannerBody   = "Close the shop and keep Producing Auras. Spam Click or HOLD the red button To keep producing Auras.",
-
-		icon         = "rbxassetid://14958750319",
-		color        = Color3.fromRGB(130, 226, 255),
-	},
-
-	-- ✨ STEP 8: Watch Aura Die
-	[8] = {
-		id               = "a1_watch_aura_die",
-		action           = "Action_Wait",
-
-		cameraTrackMode  = "FollowAura",
-		cameraOffset     = Vector3.new(0, 22, 28), 
-
-		requireRateZero  = true, 
-		duration         = 0, 
-
-		bannerTitle  = "Incinerated!",
-		bannerBody   = "Since your habitat Got full, Auras get incinerated. Wait for your Rate to hit $0.",
-
-		icon         = "rbxassetid://14957307741",
-		color        = Color3.fromRGB(255, 0, 4), 
-	},
-
-	-- ✨ STEP 9: Pan to Habitat
-	[9] = {
-		id           = "a1_look_at_habitat",
-		action       = "Action_Wait",
-		cameraTarget = "Tutorial_HabitatCam",
-
-		duration     = 7, 
-
-		bannerTitle  = "Habitat is Full!",
-		bannerBody   = "Your storage is completely Full. You need to clear some Space.",
-
-		icon         = "rbxassetid://14950864016",
-		color        = Color3.fromRGB(255, 155, 155), 
-	},
-
-	-- ✨ STEP 10: Send Ship
-	[10] = {
-		id           = "a1_send_ship",
-		action       = "Action_SendShip",
-		targetTag    = "Tutorial_SendShipBtn",
-
-		unlockTags    = {"Tutorial_SendShipBtn"},
-		unlockActions = {"Action_SendShip"},
-
-		bannerTitle  = "Clear Space",
-		bannerBody   = "Click the newly unlocked SEND button to clear out your habitat of the Auras.",
-
-		icon         = "rbxassetid://14958914404",
-		color        = Color3.fromRGB(100, 255, 255), 
-	},
-
-	-- ✨ STEP 11: Watch Ship
-	[11] = {
-		id           = "a1_wait_for_ship",
-		action       = "Action_Wait",
-		cameraTarget = "Tutorial_ShippingCam",
-
-		requirePlatformsShipped = 2,
-
-		bannerTitle  = "Ship Delivery",
-		bannerBody   = "Ships collect all your Auras and pay out the cash directly to your wallet. Send 2 Ships Out.",
-		duration     = 0,
-
-		icon         = "rbxassetid://14949455379",
-		color        = Color3.fromRGB(150, 200, 255), 
-	},
-
-	-- ✨ STEP 12: Auto Ship
-	[12] = {
-		id           = "a1_toggle_auto",
-		action       = "Action_ToggleAutoShip",
-		targetTag    = "Tutorial_ToggleShipBtn",
-
-		unlockTags    = {"Tutorial_ToggleShipBtn"},
-		unlockActions = {"Action_ToggleAutoShip"},
-
-		bannerTitle  = "Automate Ships",
-		bannerBody   = "Click the new unlocked Toggle Button to automate your shipments!",
-
-		icon         = "rbxassetid://14923526147",
-		color        = Color3.fromRGB(50, 150, 50), 
-	},
-
-	-- ✨ STEP 13: Business as usual
-	[13] = {
-		id           = "a1_farm_500",
-		action       = "Action_ClickRedButton",
-
-		requireCurrency = 500,
-
-		bannerTitle  = "More Upgrades!",
-		bannerBody   = "Make $500 to afford your next upgrade.",
-		duration     = 0,
-
-		icon         = "rbxassetid://14949455379",
-		color        = Color3.fromRGB(150, 255, 150),
-	},
-
-	[14] = {
-		id             = "a1_buy_auraExpansion",
-		action         = "Action_BuyUpgrade",
-		targetTag      = "Tutorial_Buy_hatcheryCapacity",
-
-		unlockTags     = {"Tutorial_Buy_hatcheryCapacity"},
-
-		menuTag        = "Tutorial_ShopPanel",
-		menuOpenBtnTag = "Tutorial_ShopButton",
-
-		bannerTitle  = "More Hatchery",
-		bannerBody   = "Buy the Aura Expansion upgrade to increase your Hatchery space!",
-
-		icon         = "rbxassetid://14950910139",
-		color        = Color3.fromRGB(105, 255, 250), 
-	},
-
-	[15] = {
-		id           = "a1_farm_1500",
-		action       = "Action_ClickRedButton",
-
-		requireCurrency = 1500,
-
-		bannerTitle  = "Growing the Factory",
-		bannerBody   = "Make $1500 to afford the Habitat upgrade, allowing you to store more auras! Buy the aura value upgrade if you feel stuck.",
-		duration     = 0,
-
-		icon         = "rbxassetid://14949455379",
-		color        = Color3.fromRGB(87, 255, 98),
-	},
-
-	[16] = {
-		id             = "a1_buy_habitatCapacity",
-		action         = "Action_BuyUpgrade",
-		targetTag      = "Tutorial_Buy_habitatCapacity",
-
-		unlockTags     = {"Tutorial_Buy_habitatCapacity"},
-
-		menuTag        = "Tutorial_ShopPanel",
-		menuOpenBtnTag = "Tutorial_ShopButton",
-
-		bannerTitle  = "More Habitat Space",
-		bannerBody   = "Buy the Habitat Reservoir Upgrade to store more Auras before they get Incinirated!",
-
-		icon         = "rbxassetid://14950912147",
-		color        = Color3.fromRGB(120, 248, 255),
-	},
-
-	[17] = {
-		id           = "a1_multiply",
-		action       = "Action_ClickRedButton",
-
-		reachMultiplier = 5,
-
-		bannerTitle  = "Hatchery Multipliers",
-		bannerBody   = "Hold the Red button to reach the legendary multiplier! Make sure you have enough Hatchery and Space",
-		duration     = 0,
-
-		icon         = "rbxassetid://14949158172",
-		color        = Color3.fromRGB(255, 255, 0), 
-	},
-
-	[18] = {
-		id           = "a1_farm_25000",
-		action       = "Action_ClickRedButton",
-
-		requireCurrency = 5000,
-
-		bannerTitle  = "Mythic Multiplier",
-		bannerBody   = "Multipliers Increase Ship and Aura Value. Save up $5,000 to afford the Mythic Multiplier! Upgrade Aura Value If Stuck.",
-		duration     = 0,
-
-		icon         = "rbxassetid://14949455379",
-		color        = Color3.fromRGB(137, 255, 110), 
-	},
-
-	[19] = {
-		id             = "a1_buy_mythicMult",
-		action         = "Action_BuyUpgrade",
-		targetTag      = "Tutorial_Buy_unlockMythicMult", 
-
-		unlockTags     = {"Tutorial_Buy_unlockMythicMult"},
-
-		menuTag        = "Tutorial_ShopPanel",
-		menuOpenBtnTag = "Tutorial_ShopButton",
-
-		bannerTitle  = "Mythic Multiplier",
-		bannerBody   = "Buy the Mythic Multiplier to hold past the legendary multiplier limit!",
-
-		icon         = "rbxassetid://14921959974",
-		color        = Color3.fromRGB(80, 246, 255),
-	},
-
-	[20] = {
-		id           = "a1_multiply",
-		action       = "Action_ClickRedButton",
-
-		reachMultiplier = 10,
-
-		bannerTitle  = "Hatchery Multipliers",
-		bannerBody   = "Hold the Red button to reach the Mythic multiplier! Make sure to have plenty of Hatchery and Space",
-		duration     = 0,
-
-		icon         = "rbxassetid://14949158172",
-		color        = Color3.fromRGB(134, 24, 161), 
-	},
-
-	[21] = {
-		id           = "a1_open_prestige",
-		action       = "Action_OpenPrestige",
-		targetTag    = "Tutorial_PrestigeButton",
-
-		unlockTags    = {"Tutorial_PrestigeButton", "Tutorial_PrestigeCloseBtn"},
-		unlockActions = {"Action_OpenPrestige", "Action_ClosePrestige"},
-
-		bannerTitle  = "How to Prestige",
-		bannerBody   = "Click the Prestige button to restart with a massive permanent earnings multiplier.",
-
-		icon         = "rbxassetid://14959712404",
-		color        = Color3.fromRGB(180, 100, 255),
-	},
-
-	[22] = {
-		id             = "a1_confirm_prestige",
-		action         = "Action_PrestigeConfirm",
-		targetTag      = "Tutorial_PrestigeConfirm",
-
-		unlockTags     = {"Tutorial_PrestigeConfirm"},
-		unlockActions  = {"Action_PrestigeConfirm"},
-
-		menuTag        = "Tutorial_PrestigePanel",
-		menuOpenBtnTag = "Tutorial_PrestigeButton",
-
-		bannerTitle  = "Confirm Prestige",
-		bannerBody   = "Click 'Prestige Now' to get your Soul Auras and increase your earnings permentantly.",
-
-		icon         = "rbxassetid://14959709038",
-		color        = Color3.fromRGB(215, 121, 255),
-	},
-	[23] = {
-		id           = "a1_post_prestige_pan",
-		action       = "Action_Wait", 
-		duration     = 0,             
-		allowClicking = true, 
-		cameraTrackMode = "FollowPhysicsAura", 
-		cameraOffset    = Vector3.new(0, 15, 25), 
-
-		requireStepGoldenAuras = 5, 
-
-		bannerTitle  = "Golden Auras",
-		bannerBody   = "Collect Auras that spawn from the Producer OR claim your mailbox rewards!",
-
-		icon         = "rbxassetid://14949477468",
-		color        = Color3.fromRGB(255, 215, 0),
-	},
-
-	-- ✨ STEP 24: Farm for the next area
-	[24] = {
-		id           = "a1_farm_area2",
-		action       = "Action_Wait", 
-		duration     = 0,             
-		allowClicking = true, 
-		requireFarmEval = 50000, 
-		unlockTags    = {"Tutorial_TravelButton", "Tutorial_TravelCloseBtn"},
-		unlockActions = {"Action_OpenTravel", "Action_CloseTravel"},
-		bannerTitle  = "Reaching More Areas",
-		bannerBody   = "Open the travel menu to unlock the next Area. Your farm evaluation is based on the total amount of money made in that area.",
-
-		icon         = "rbxassetid://14949455379",
-		color        = Color3.fromRGB(126, 255, 212),
-	},
-
-	-- ✨ STEP 25: Open Area Travel
-	[25] = {
-		id           = "a1_open_travel",
-		action       = "Action_OpenTravel",
-		targetTag    = "Tutorial_TravelButton",
-
-		bannerTitle  = "New Area Unlocked!",
-		bannerBody   = "Click the Area Travel button to open the travel menu.",
-
-		icon         = "rbxassetid://14951953206",
-		color        = Color3.fromRGB(100, 200, 255),
-	},
-
-	-- ✨ STEP 26: Browse to Area 2
-	[26] = {
-		id             = "a1_travel_arrow",
-		action         = "Action_ClickRightArrow",
-		targetTag      = "Tutorial_RightArrow",
-
-		unlockTags     = {"Tutorial_RightArrow"},
-		unlockActions  = {"Action_ClickRightArrow", "Action_ClickLeftArrow"},
-
-		menuTag        = "Tutorial_TravelPanel",
-		menuOpenBtnTag = "Tutorial_TravelButton",
-		fallbackStepId = "a1_open_travel", 
-
-		bannerTitle  = "Browse Areas",
-		bannerBody   = "Click the Arrows to view the newly unlocked area and other areas.",
-
-		icon         = "rbxassetid://14951953206",
-		color        = Color3.fromRGB(150, 200, 255),
-	},
-
-	-- ✨ STEP 27: Confirm Travel
-	[27] = {
-		id             = "a1_confirm_travel",
-		action         = "Action_TravelConfirm",
-		targetTag      = "Tutorial_TravelConfirm",
-
-		unlockTags     = {"Tutorial_TravelConfirm"},
-		unlockActions  = {"Action_TravelConfirm"},
-
-		menuTag        = "Tutorial_TravelPanel",
-		menuOpenBtnTag = "Tutorial_TravelButton",
-		fallbackStepId = "a1_open_travel",
-
-		bannerTitle  = "Travel Now",
-		bannerBody   = "Click TRAVEL to jump to the new Area!",
-
-		icon         = "rbxassetid://14957414873",
-		color        = Color3.fromRGB(107, 255, 161),
-	},
-
-	-- ✨ STEP 28: Open Boost Shop
-	[28] = {
-		id           = "a1_open_boosts",
-		action       = "Action_OpenBoostShop",
-		targetTag    = "Tutorial_BoostMenuBtn",
-
-		unlockTags    = {"Tutorial_BoostMenuBtn", "Tutorial_BoostShopClose", "Tutorial_BoostTab_Shop", "Tutorial_BoostTab_Inventory"},
-		unlockActions = {"Action_OpenBoostShop", "Action_CloseBoostShop", "Action_BoostTab_Shop", "Action_BoostTab_Inventory"},
-
-		bannerTitle  = "Area Boosts and Multipliers",
-		bannerBody   = "Auras in this area have much higher base values! Open the new Boosts menu.",
-
-		icon         = "rbxassetid://14950005878",
-		color        = Color3.fromRGB(75, 255, 174),
-	},
-
-	-- ✨ STEP 29: Buy Aura Spawner Boost
-	[29] = {
-		id           = "a1_buy_boost1",
-		action       = "Action_BuyBoost_AuraRush",
-		targetTag    = "Tutorial_BuyBoost_AuraRush",
-
-		unlockTags    = {"Tutorial_BuyBoost_AuraRush"},
-		unlockActions = {"Action_BuyBoost_AuraRush"},
-
-		menuTag        = "Tutorial_BoostShopPanel",
-		menuOpenBtnTag = "Tutorial_BoostMenuBtn",
-
-		requireBoostBought = { id = "AuraRush", count = 1 },
-
-		bannerTitle  = "Buy a Boost",
-		bannerBody   = "Buy the Aura Rush Boost using your Golden Auras.",
-
-		icon         = "rbxassetid://14915278241",
-		color        = Color3.fromRGB(114, 213, 255),
-	},
-
-	-- ✨ STEP 30: Switch to Inventory Tab
-	[30] = {
-		id           = "a1_click_inv_tab",
-		action       = "Action_BoostTab_Inventory",
-		targetTag    = "Tutorial_BoostTab_Inventory",
-
-		menuTag        = "Tutorial_BoostShopPanel",
-		menuOpenBtnTag = "Tutorial_BoostMenuBtn",
-
-		bannerTitle  = "Check Inventory",
-		bannerBody   = "Click the INVENTORY tab at the top of the menu to view the boosts you own.",
-
-		icon         = "rbxassetid://14951953206",
-		color        = Color3.fromRGB(82, 76, 255),
-	},
-
-	-- ✨ STEP 31: Use Aura Spawner Boost
-	[31] = {
-		id           = "a1_use_boost1",
-		action       = "Action_UseBoost_AuraRush",
-		targetTag    = "Tutorial_UseBoost_AuraRush",
-
-		unlockTags    = {"Tutorial_UseBoost_AuraRush"},
-		unlockActions = {"Action_UseBoost_AuraRush"},
-
-		menuTag        = "Tutorial_BoostShopPanel",
-		menuOpenBtnTag = "Tutorial_BoostMenuBtn",
-
-		requireBoostUsed = { id = "AuraRush", count = 1 },
-
-		bannerTitle  = "Activate the Boost",
-		bannerBody   = "Click ACTIVATE to use your new Aura Rush boost!",
-
-		icon         = "rbxassetid://14951953206",
-		color        = Color3.fromRGB(103, 111, 255),
-	},
-
-	-- ✨ STEP 32: Spawn 30 Auras
-	[32] = {
-		id           = "a1_spawn_30",
-		action       = "Action_Wait", 
-		targetTag    = "Tutorial_ClickButton",
-		allowClicking = true, 
-
-		requireCubesProduced = 30,
-		duration     = 0,
-
-		bannerTitle  = "Double Spawn Speed",
-		bannerBody   = "Your boost is now active. Produce 30 Auras with the increased spawn speed.",
-
-		icon         = "rbxassetid://14915278241",
-		color        = Color3.fromRGB(105, 255, 200),
-	},
-
-	-- ✨ STEP 33: Open Boost Shop Again
-	[33] = {
-		id           = "a1_open_boosts2",
-		action       = "Action_OpenBoostShop",
-		targetTag    = "Tutorial_BoostMenuBtn",
-
-		bannerTitle  = "Buy More Boosts",
-		bannerBody   = "Open up the boosts menu again to buy more boosts.",
-
-		icon         = "rbxassetid://14951953206",
-		color        = Color3.fromRGB(106, 255, 188),
-	},
-
-	-- ✨ STEP 34: Switch back to Shop Tab
-	[34] = {
-		id           = "a1_click_shop_tab",
-		action       = "Action_BoostTab_Shop",
-		targetTag    = "Tutorial_BoostTab_Shop",
-
-		menuTag        = "Tutorial_BoostShopPanel",
-		menuOpenBtnTag = "Tutorial_BoostMenuBtn",
-
-		bannerTitle  = "Return to Shop",
-		bannerBody   = "Click the SHOP tab to view the boosts available for purchase.",
-
-		icon         = "rbxassetid://14951953206",
-		color        = Color3.fromRGB(114, 213, 255),
-	},
-
-	-- ✨ STEP 35: Buy 5 Aura Spawners
-	[35] = {
-		id           = "a1_buy_boost3",
-		action       = "Action_BuyBoost_AuraRush",
-		targetTag    = "Tutorial_BuyBoost_AuraRush",
-
-		menuTag        = "Tutorial_BoostShopPanel",
-		menuOpenBtnTag = "Tutorial_BoostMenuBtn",
-		duration = 0,
-		requireBoostBought = { id = "AuraRush", count = 5 },
-
-		bannerTitle  = "Buy More Aura Rush Boosts",
-		bannerBody   = "Buy 5 more Aura Rush Boosts. Note Boosts can stack for even faster production and MONEY.",
-
-		icon         = "rbxassetid://14951953206",
-		color        = Color3.fromRGB(99, 122, 255),
-	},
-
-	-- ✨ STEP 36: Mass Produce 150 Auras
-	[36] = {
-		id           = "a1_spawn_150",
-		action       = "Action_Wait",
-		targetTag    = "Tutorial_ClickButton",
-		allowClicking = true, 
-
-		requireCubesProduced = 150,
-		duration     = 0,
-
-		bannerTitle  = "Mass Production",
-		bannerBody   = "Produce 150 Auras. Don't forget you can use those boosts you just bought!",
-
-		icon         = "rbxassetid://14958750319",
-		color        = Color3.fromRGB(130, 226, 255),
-	},
-
-	-- ✨ STEP 37: Open Achievements
-	[37] = {
-		id           = "a1_open_achievements",
-		action       = "Action_OpenAchievements",
-		targetTag    = "Tutorial_AchieveMenuBtn",
-
-		unlockTags    = {"Tutorial_AchieveMenuBtn", "Tutorial_AchieveCloseBtn", "Tutorial_AchieveTab_Challenges"},
-		unlockActions = {"Action_OpenAchievements", "Action_CloseAchievements", "Action_ClickAchieveTab_Challenges"},
-
-		bannerTitle  = "Achievements Unlocked!",
-		bannerBody   = "You've hit a huge milestone! Click the new Achievements button to view your Progression.",
-
-		icon         = "rbxassetid://14915547975",
-		color        = Color3.fromRGB(255, 255, 130),
-	},
-
-	-- ✨ STEP 38: Claim Boost Challenge (Target fixed to Aura Tycoon!)
-	[38] = {
-		id           = "a1_claim_boost_chal",
-		action       = "Action_ClaimChallenge_unlock_fastrefill",
-		targetTag    = "Tutorial_AchieveRow_Chal_unlock_fastrefill",
-
-		unlockTags    = {"Tutorial_AchieveRow_Chal_unlock_fastrefill"},
-		unlockActions = {"Action_ClaimChallenge_unlock_fastrefill"},
-
-		menuTag        = "Tutorial_AchievePanel",
-		menuOpenBtnTag = "Tutorial_AchieveMenuBtn",
-
-		bannerTitle  = "Claim Your Rewards",
-		bannerBody   = "Claim the Explorer Challenge which will unlock the Value Boost(Boost)",
-	
-		icon         = "rbxassetid://14922140529",
-		color        = Color3.fromRGB(146, 73, 255),
-	},
-
-	-- ✨ STEP 39: Click Index Tab
-	[39] = {
-		id           = "a1_click_index_tab",
-		action       = "Action_ClickAchieveTab_Index",
-		targetTag    = "Tutorial_AchieveTab_Index",
-
-		unlockTags    = {"Tutorial_AchieveTab_Index"},
-		unlockActions = {"Action_ClickAchieveTab_Index"},
-
-		menuTag        = "Tutorial_AchievePanel",
-		menuOpenBtnTag = "Tutorial_AchieveMenuBtn",
-
-		bannerTitle  = "The Aura Index",
-		bannerBody   = "Click the Auras tab. Here you can track every single Aura you have discovered across all Areas!",
-
-		icon         = "rbxassetid://14916698520",
-		color        = Color3.fromRGB(255, 232, 99),
-	},
-
-	-- ✨ STEP 40: Claim Aura Index Reward
-	[40] = {
-		id           = "a1_claim_index_reward",
-		action       = "Action_ClaimAura_1_Common",
-		targetTag    = "Tutorial_AchieveRow_Index_1",
-
-		unlockTags    = {"Tutorial_AchieveRow_Index_1"},
-		unlockActions = {"Action_ClaimAura_1_Common"},
-
-		menuTag        = "Tutorial_AchievePanel",
-		menuOpenBtnTag = "Tutorial_AchieveMenuBtn",
-
-		bannerTitle  = "Discovery Bonus",
-		bannerBody   = "Click on the Area 1 Gear Aura to claim a Golden Aura bonus for discovering it!",
-
-		icon         = "rbxassetid://14916698520",
-		color        = Color3.fromRGB(255, 246, 125),
-	},
-
-	-- ✨ STEP 41: Click Badges Tab
-	[41] = {
-		id           = "a1_click_badges_tab",
-		action       = "Action_ClickAchieveTab_Badges",
-		targetTag    = "Tutorial_AchieveTab_Badges",
-
-		unlockTags    = {"Tutorial_AchieveTab_Badges"},
-		unlockActions = {"Action_ClickAchieveTab_Badges"},
-
-		menuTag        = "Tutorial_AchievePanel",
-		menuOpenBtnTag = "Tutorial_AchieveMenuBtn",
-
-		bannerTitle  = "Roblox Badges",
-		bannerBody   = "Click the Badges tab. You can officially earn Roblox Badges for reaching massive milestones.",
-
-		icon         = "rbxassetid://14923411730",
-		color        = Color3.fromRGB(255, 243, 149),
-	},
-
-	-- ✨ STEP 42: Claim Badge
-	[42] = {
-		id           = "a1_claim_badge_1",
-		action       = "Action_ClaimBadge_1", 
-		targetTag    = "Tutorial_AchieveRow_Badge_1",
-
-		unlockTags    = {"Tutorial_AchieveRow_Badge_1"},
-		unlockActions = {"Action_ClaimBadge_1"},
-
-		menuTag        = "Tutorial_AchievePanel",
-		menuOpenBtnTag = "Tutorial_AchieveMenuBtn",
-
-		bannerTitle  = "Claim Badge",
-		bannerBody   = "Click the First Prestige badge to officially unlock it on your Roblox profile!",
-
-		icon         = "rbxassetid://14923411730",
-		color        = Color3.fromRGB(255, 232, 115),
-	},
-
-	-- ✨ STEP 43: Click Leaderboard Tab
-	[43] = {
-		id           = "a1_click_leaderboard",
-		action       = "Action_ClickAchieveTab_Leaderboard",
-		targetTag    = "Tutorial_AchieveTab_Leaderboard",
-
-		unlockTags    = {"Tutorial_AchieveTab_Leaderboard", "Tutorial_LbTab_Top10", "Tutorial_LbTab_AurasGenerated", "Tutorial_LbTab_MostMoneyMade"},
-		unlockActions = {"Action_ClickAchieveTab_Leaderboard", "Action_ClickLbTab_Top10", "Action_ClickLbTab_AurasGenerated", "Action_ClickLbTab_MostMoneyMade"},
-
-		menuTag        = "Tutorial_AchievePanel",
-		menuOpenBtnTag = "Tutorial_AchieveMenuBtn",
-
-		bannerTitle  = "Global Rankings",
-		bannerBody   = "Click the Leaderboard tab to view the best players!",
-
-		icon         = "rbxassetid://14917051047",
-		color        = Color3.fromRGB(235, 255, 103),
-	},
-
-	-- ✨ STEP 44: Click the Top 10 Sub-Tab (NEW STEP!)
-	[44] = {
-		id           = "a1_click_top10",
-		action       = "Action_ClickLbTab_Top10",
-		targetTag    = "Tutorial_LbTab_Top10",
-
-		menuTag        = "Tutorial_AchievePanel",
-		menuOpenBtnTag = "Tutorial_AchieveMenuBtn",
-
-		bannerTitle  = "Top 10 Players",
-		bannerBody   = "Click the Top 10 button to view the most Soul Auras in the game!",
-
-		icon         = "rbxassetid://14959709038",
-		color        = Color3.fromRGB(253, 255, 119),
-	},
-
-	-- ✨ STEP 45: Click Settings Tab
-	[45] = {
-		id           = "a1_click_settings",
-		action       = "Action_ClickAchieveTab_Settings",
-		targetTag    = "Tutorial_AchieveTab_Settings",
-
-		unlockTags    = {"Tutorial_AchieveTab_Settings"},
-		unlockActions = {"Action_ClickAchieveTab_Settings"},
-
-		menuTag        = "Tutorial_AchievePanel",
-		menuOpenBtnTag = "Tutorial_AchieveMenuBtn",
-
-		bannerTitle  = "Customize Your Farm",
-		bannerBody   = "Finally, click the Settings tab.",
-
-		icon         = "rbxassetid://14958964040",
-		color        = Color3.fromRGB(245, 255, 133),
-	},
-
-	-- ✨ STEP 46: Toggle Jumping
-	[46] = {
-		id           = "a1_toggle_jump",
-		action       = "Action_ToggleSetting_jump",
-		targetTag    = "Tutorial_SettingToggle_jump",
-
-		unlockTags    = {"Tutorial_SettingToggle_jump"},
-		unlockActions = {"Action_ToggleSetting_jump"},
-
-		menuTag        = "Tutorial_AchievePanel",
-		menuOpenBtnTag = "Tutorial_AchieveMenuBtn",
-
-		bannerTitle  = "Disable Jumping",
-		bannerBody   = "Click to disable Jumping. (You can also quick toggle jumping at any time by pressing 'T' on your keyboard)",
-
-		icon         = "rbxassetid://14949400330",
-		color        = Color3.fromRGB(255, 188, 157),
-	},
-
-	-- ✨ STEP 47: Open Area Travel
-	[47] = {
-		id           = "a1_final_travel",
-		action       = "Action_OpenTravel",
-		targetTag    = "Tutorial_TravelButton",
-
-		bannerTitle  = "Check the Next Area",
-		bannerBody   = "Good job learning the basic mechanics! Open the Area Panel",
-
-		icon         = "rbxassetid://14951953206",
-		color        = Color3.fromRGB(164, 226, 255),
-	},
-
-	-- ✨ STEP 48: Browse to Area 3
-	[48] = {
-		id             = "a1_travel_arrow_3",
-		action         = "Action_ClickRightArrow",
-		targetTag      = "Tutorial_RightArrow",
-
-		menuTag        = "Tutorial_TravelPanel",
-		menuOpenBtnTag = "Tutorial_TravelButton",
-		fallbackStepId = "a1_final_travel", 
-
-		bannerTitle  = "Browse Areas",
-		bannerBody   = "Click the Arrows to view more areas",
-
-		icon         = "rbxassetid://14951953206",
-		color        = Color3.fromRGB(150, 200, 255),
-	},
-
-	-- ✨ STEP 49: Confirm Travel to Area 3 (End of Area 2)
-	[49] = {
-		id             = "a1_confirm_travel_3",
-		action         = "Action_TravelConfirm",
-		targetTag      = "Tutorial_TravelConfirm",
-
-		menuTag        = "Tutorial_TravelPanel",
-		menuOpenBtnTag = "Tutorial_TravelButton",
-		fallbackStepId = "a1_final_travel",
-
-		bannerTitle  = "Head to Area 3",
-		bannerBody   = "Once you have enough farm evaluation head to the next area to Unlock your first Aurmer",
-
-		icon         = "rbxassetid://14951953206",
-		color        = Color3.fromRGB(120, 255, 129),
-	},
-}
-
-function TutorialConfig.GetStepByIndex(index)
-	return TutorialConfig.Steps[index]
+	local outerStroke = ShopPanel:FindFirstChildWhichIsA("UIStroke")
+	if outerStroke then outerStroke.Color = Color3.fromRGB(255, 255, 255) end
 end
 
-function TutorialConfig.GetStepById(id)
-	for _, step in ipairs(TutorialConfig.Steps) do
-		if step.id == id then return step end
+task.wait(2)
+RefreshLook()
+
+ForceCloseUI.Event:Connect(function(exceptionPanel)
+	if exceptionPanel ~= "ShopPanel" and shopOpen then
+		CloseShop()
 	end
-	return nil
-end
-
-return TutorialConfig
+end)
