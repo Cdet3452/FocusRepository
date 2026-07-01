@@ -159,6 +159,8 @@ local function SpawnAuraInstance(tierName, color, glow, position, currentArea)
 		if primary then
 			primary.Anchored = false
 			primary.CanCollide = true
+			primary.CanTouch = true
+			primary.CanQuery = true
 			primary.CollisionGroup = "Auras"
 			primary.CastShadow = false
 		end
@@ -176,6 +178,8 @@ local function SpawnAuraInstance(tierName, color, glow, position, currentArea)
 		auraModel.Position = position
 		auraModel.Anchored = false
 		auraModel.CanCollide = true
+		auraModel.CanTouch = true
+		auraModel.CanQuery = true
 		auraModel.CollisionGroup = "Auras"
 		auraModel.CastShadow = false
 		auraModel.Color = color
@@ -552,7 +556,6 @@ local function HookHabitatModel(model)
 								local dropOffset = Vector3.new(-10, 4, math.random(-4, 4))
 								auraObj:PivotTo(CFrame.new(storage.Position + dropOffset))
 
-								-- OPTIMIZATION: Anchor the part and remove collision/query data
 								if auraObj:IsA("Model") then
 									for _, desc in ipairs(auraObj:GetDescendants()) do
 										if desc:IsA("BasePart") then
@@ -778,7 +781,6 @@ UpdateHUDBridge:Connect(function(stats)
 		latestPendingAuras = stats.pendingAuras
 	end
 
-	-- FIX: Securely fetch from valid data payloads
 	if stats.habitatCapacity ~= nil and stats.habitatCapacity > 0 then
 		latestHabitatCapacity = stats.habitatCapacity
 	end
@@ -909,6 +911,8 @@ CubeMutatedBatchBridge:Connect(function(batchData)
 				if primary then
 					primary.Anchored = false
 					primary.CanCollide = true
+					primary.CanTouch = true
+					primary.CanQuery = true
 					primary.CollisionGroup = "Auras"
 					primary.CastShadow = false
 				end
@@ -926,6 +930,8 @@ CubeMutatedBatchBridge:Connect(function(batchData)
 				newAura.Position = position
 				newAura.Anchored = false
 				newAura.CanCollide = true
+				newAura.CanTouch = true
+				newAura.CanQuery = true
 				newAura.CollisionGroup = "Auras"
 				newAura.CastShadow = false
 				newAura.Color = info.newColor
@@ -1038,96 +1044,1450 @@ PrestigeComplete.OnClientEvent:Connect(function(info)
 	UpdateMultiplier:Fire(1.0)
 end)
 
--- PassiveIncome
--- Location: ServerScriptService > PassiveIncome
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+local AdminConfig = require(ReplicatedStorage.Modules.AdminConfig)
+local Formatter = require(ReplicatedStorage.Modules.NumberFormatter) 
+local PoolManager = require(ReplicatedStorage.Modules:WaitForChild("PoolManager"))
+local UpdateMultiplier = ReplicatedStorage:WaitForChild("UpdateMultiplier")
+local HabitatFullEvent = ReplicatedStorage:WaitForChild("HabitatFullEvent")
 
-local Players             = game:GetService("Players")
-local ReplicatedStorage   = game:GetService("ReplicatedStorage")
-local ServerScriptService = game:GetService("ServerScriptService")
-
-local AdminConfig    = require(ReplicatedStorage.Modules.AdminConfig)
-local UpgradeConfig  = require(ReplicatedStorage.Modules.UpgradeConfig)
-local GameManager    = require(ServerScriptService.GameManager)
-local BoostManager   = require(ServerScriptService.BoostManager)
+local AreaChanged = ReplicatedStorage.RemoteEvents:WaitForChild("AreaChanged")
+local AreaUpdated = ReplicatedStorage.RemoteEvents:WaitForChild("AreaUpdated")
 
 local BridgeNet2      = require(ReplicatedStorage.Modules:WaitForChild("BridgeNet2"))
-local UpdateHUDBridge = BridgeNet2.ServerBridge("UpdateHUD")
+local ShipAurasBridge = BridgeNet2.ClientBridge("ShipAuras")
 
-if script:GetAttribute("Running") then script:Destroy(); return end
-script:SetAttribute("Running", true)
+local HabitatHolder = workspace:WaitForChild("HabitatHolder") 
 
-local lastSentCurrency   = {}  
-local lastSentStored     = {}
+local Camera = workspace.CurrentCamera
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local mainHUD = playerGui:WaitForChild("MainHUD")
+local currLabel = mainHUD:WaitForChild("CurrencyLabel")
+local gaurasLabel = mainHUD:WaitForChild("GoldenAurasLabel")
 
-Players.PlayerAdded:Connect(function(p)
-	lastSentCurrency[p.UserId] = 0
-	lastSentStored[p.UserId]   = 0
+local function GetHabitatPos()
+	local posPart = HabitatHolder:FindFirstChild("Position", true)
+	if posPart and posPart:IsA("BasePart") then
+		return posPart.Position
+	end
+	return HabitatHolder:GetPivot().Position
+end
+
+local currentMultiplier = 1.0
+local currentAreaIndex = 1
+local platformQueue = {}
+local processingPlatform = false
+
+local MultiplierColors = {
+	[1.0] = Color3.fromRGB(255, 255, 255),
+	[1.5] = Color3.fromRGB(100, 200, 255),
+	[2.0] = Color3.fromRGB(80, 255, 120),
+	[3.0] = Color3.fromRGB(180, 60, 255),
+	[5.0] = Color3.fromRGB(255, 200, 0),
+}
+
+local MultiplierNames = {
+	[1.0] = "No Bonus",
+	[1.5] = "1.5x Bonus",
+	[2.0] = "2x Bonus",
+	[3.0] = "3x Bonus",
+	[5.0] = "5x Bonus",
+}
+
+UpdateMultiplier.Event:Connect(function(mult)
+	currentMultiplier = mult
 end)
 
-Players.PlayerRemoving:Connect(function(p)
-	lastSentCurrency[p.UserId] = nil
-	lastSentStored[p.UserId]   = nil
+AreaUpdated.OnClientEvent:Connect(function(info)
+	if info.currentArea then currentAreaIndex = info.currentArea end
 end)
 
-while true do
-	-- ✨ BLAZING FAST 20Hz LOOP (Matches your FocusScript!)
-	local dt = task.wait(0.05)
+AreaChanged.OnClientEvent:Connect(function(info)
+	if info.newArea then currentAreaIndex = info.newArea end
+	player:SetAttribute("HabitatVisualOffset", 0)
+end)
 
-	for _, player in ipairs(Players:GetPlayers()) do
-		if player:GetAttribute("TutorialFrozen") then continue end
+local PrestigeComplete = ReplicatedStorage.RemoteEvents:FindFirstChild("PrestigeComplete")
+if PrestigeComplete then
+	PrestigeComplete.OnClientEvent:Connect(function()
+		player:SetAttribute("HabitatVisualOffset", 0)
+	end)
+end
 
-		local uid     = player.UserId
-		local data    = GameManager.GetData(uid)
-		local runtime = GameManager.GetRuntime(uid)
-		if not data or not runtime then continue end
-
-		local activeValue = runtime.activeMutatedValue or 0
-		local storedCount = runtime.storedCubeCount or 0
-
-		local interval = UpgradeConfig.GetPassiveInterval(data)
-		if interval <= 0 then interval = 1 end
-
-		local boostMult = BoostManager.GetValueMultiplier(uid) * BoostManager.GetSpawnRateMultiplier(uid)
-
-		-- Calculate the exact microscopic fraction earned in this 0.05s window
-		local fullTickEarned   = activeValue * boostMult
-		local fractionalEarned = fullTickEarned * (dt / interval)
-
-		if fractionalEarned > 0 then
-			data.currency       = (data.currency       or 0) + fractionalEarned
-			data.totalEarned    = (data.totalEarned     or 0) + fractionalEarned
-			data.farmEvaluation = (data.farmEvaluation  or 0) + fractionalEarned
-		end
-
-		-- Only fire the BridgeNet update if they are actively making money or the habitat changed
-		local shouldFire = false
-		if not lastSentCurrency[uid] or math.abs(data.currency - lastSentCurrency[uid]) > 0.001 then
-			shouldFire = true
-		end
-		if storedCount ~= lastSentStored[uid] then
-			shouldFire = true
-		end
-
-		if shouldFire then
-			lastSentCurrency[uid] = data.currency
-			lastSentStored[uid]   = storedCount
-
-			local habCap = UpgradeConfig.GetHabitatCapacity(data)
-
-			UpdateHUDBridge:Fire(player, {
-				currency        = data.currency, 
-				pendingAuras    = storedCount, 
-				habitatCapacity = habCap,
-				rate            = math.floor(fullTickEarned),
-				passiveInterval = interval,
-				totalEarned     = math.floor(data.totalEarned or 0),
-				soulAuras       = data.soulAuras      or 0,
-				farmEvaluation  = math.floor(data.farmEvaluation or 0),
-				boostMultiplier = boostMult -- ✨ THE FIX: Sync to HUD so labels scale!
-			})
-		end
+local function FormatCurrency(n)
+	local num = tonumber(n) or 0
+	if num < 1000 then
+		return string.format("%.2f", num)
+	else
+		return Formatter.Format(num)
 	end
 end
+
+local function FormatNumber(n)
+	return Formatter.Format(math.floor(tonumber(n) or 0))
+end
+
+local function PlayJuiceEffect(exactAmount, currencyType)
+	local isAura = (currencyType == "Auras")
+	local targetLabel = isAura and gaurasLabel or currLabel
+
+	local pendingKey = isAura and "LocalPendingAuras" or "LocalPendingPayout"
+	local addKey = isAura and "VisualAurasToAdd" or "VisualCashToAdd"
+
+	local currentPending = player:GetAttribute(pendingKey) or 0
+	player:SetAttribute(pendingKey, currentPending + exactAmount)
+
+	local targetPos = targetLabel.AbsolutePosition
+	local targetSize = targetLabel.AbsoluteSize
+
+	local popupWidth = 250
+	local popupHeight = 70
+	local startX = targetPos.X - popupWidth - 40 
+	local startY = targetPos.Y + (targetSize.Y / 2) - (popupHeight / 2) 
+
+	local endPos2D = targetPos + (targetSize / 2)
+
+	local effectGui = Instance.new("ScreenGui")
+	effectGui.Name = "JuiceGui_" .. currencyType
+	effectGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	effectGui.Parent = playerGui
+
+	local popupText = Instance.new("TextLabel")
+	popupText.Text = (isAura and "+" or "+$") .. FormatCurrency(exactAmount)
+	popupText.Font = Enum.Font.FredokaOne
+	popupText.TextScaled = true
+	popupText.TextColor3 = isAura and Color3.fromRGB(255, 215, 0) or Color3.fromRGB(85, 255, 127)
+	popupText.BackgroundTransparency = 1
+	popupText.TextXAlignment = Enum.TextXAlignment.Right 
+	popupText.Size = UDim2.new(0, popupWidth, 0, popupHeight)
+	popupText.Position = UDim2.new(0, startX, 0, startY)
+	popupText.ZIndex = 100
+	popupText.Parent = effectGui
+
+	local textStroke = Instance.new("UIStroke", popupText)
+	textStroke.Color = isAura and Color3.fromRGB(80, 50, 0) or Color3.fromRGB(0, 50, 0)
+	textStroke.Thickness = 3
+
+	local textScale = Instance.new("UIScale", popupText)
+	textScale.Scale = 0
+
+	TweenService:Create(textScale, TweenInfo.new(0.4, Enum.EasingStyle.Bounce, Enum.EasingDirection.Out), {Scale = 1.2}):Play()
+
+	task.delay(0.6, function()
+		TweenService:Create(popupText, TweenInfo.new(0.8, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {
+			Position = UDim2.new(0, startX - 120, 0, startY),
+			TextTransparency = 1
+		}):Play()
+		TweenService:Create(textStroke, TweenInfo.new(0.8), {Transparency = 1}):Play()
+	end)
+
+	local sfxFolder = ReplicatedStorage:FindFirstChild("SFX") or ReplicatedStorage:FindFirstChild("Sounds")
+	if sfxFolder and sfxFolder:FindFirstChild("CashRegister") then
+		local sfx = sfxFolder.CashRegister:Clone()
+		if isAura then sfx.Pitch = 1.3 end 
+		sfx.Parent = game:GetService("SoundService")
+		sfx:Play()
+		Debris:AddItem(sfx, 2)
+	end
+
+	local iconCount = 10
+	local iconSize = 40
+	local iconId = "rbxassetid://14916846070" 
+
+	if isAura then
+		iconId = "rbxassetid://4483362458" 
+		if exactAmount < 100 then
+			iconCount = math.min(exactAmount, 30)
+			iconSize = 35 
+		elseif exactAmount < 1000 then
+			iconCount = math.min(math.ceil(exactAmount / 10), 30)
+			iconSize = 55 
+		else
+			iconCount = math.min(math.ceil(exactAmount / 100), 30)
+			iconSize = 80 
+		end
+	end
+
+	local chunkAmount = exactAmount / iconCount
+	local coinsHit = 0
+
+	for i = 1, iconCount do
+		local coin = Instance.new("ImageLabel")
+		coin.Image = iconId
+		if isAura then coin.ImageColor3 = Color3.fromRGB(255, 215, 0) end 
+		coin.BackgroundTransparency = 1
+		coin.Size = UDim2.new(0, iconSize, 0, iconSize)
+
+		local coinStartX = startX + popupWidth - (iconSize * 1.5)
+		local coinStartY = startY + (popupHeight / 2) - (iconSize / 2)
+
+		coin.Position = UDim2.new(0, coinStartX, 0, coinStartY)
+		coin.ZIndex = 90
+		coin.Parent = effectGui
+
+		local randomOffsetX = math.random(-80, 80)
+		local randomOffsetY = math.random(-80, 80)
+		local burstPos = UDim2.new(0, coinStartX + randomOffsetX, 0, coinStartY + randomOffsetY)
+
+		local burstTween = TweenService:Create(coin, TweenInfo.new(0.3, Enum.EasingStyle.Cubic, Enum.EasingDirection.Out), {
+			Position = burstPos,
+			Rotation = math.random(-180, 180)
+		})
+		burstTween:Play()
+
+		burstTween.Completed:Connect(function()
+			local flyTween = TweenService:Create(coin, TweenInfo.new(0.4 + (i * 0.02), Enum.EasingStyle.Back, Enum.EasingDirection.In), {
+				Position = UDim2.new(0, endPos2D.X - (iconSize/2), 0, endPos2D.Y - (iconSize/2)),
+				Size = UDim2.new(0, iconSize/2, 0, iconSize/2),
+				ImageTransparency = 0.3
+			})
+			flyTween:Play()
+
+			flyTween.Completed:Connect(function()
+				if coin.Parent then coin:Destroy() end
+				coinsHit += 1
+
+				player:SetAttribute(addKey, chunkAmount)
+
+				local pending = player:GetAttribute(pendingKey) or 0
+				player:SetAttribute(pendingKey, math.max(0, pending - chunkAmount))
+
+				if sfxFolder and sfxFolder:FindFirstChild("CoinTick") then
+					local sfx = sfxFolder.CoinTick:Clone()
+					sfx.Pitch = (isAura and 1.8 or 1.5) + (math.random()*0.2)
+					sfx.Parent = game:GetService("SoundService")
+					sfx:Play()
+					Debris:AddItem(sfx, 1)
+				end
+
+				local ts = targetLabel:FindFirstChildOfClass("UIScale") or Instance.new("UIScale", targetLabel)
+				ts.Scale = 1.1
+				TweenService:Create(ts, TweenInfo.new(0.1, Enum.EasingStyle.Sine), {Scale = 1}):Play()
+			end)
+		end)
+	end
+
+	task.delay(3, function()
+		if effectGui.Parent then effectGui:Destroy() end
+		if coinsHit < iconCount then
+			local remaining = (iconCount - coinsHit) * chunkAmount
+			player:SetAttribute(addKey, remaining)
+			player:SetAttribute(pendingKey, 0)
+		end
+	end)
+end
+
+local function CreatePlatform(spawnCFrame, multiplierColor)
+	local areaFolder = ReplicatedStorage:FindFirstChild("AreaAssets") and ReplicatedStorage.AreaAssets:FindFirstChild("Area" .. currentAreaIndex)
+	local template = areaFolder and areaFolder:FindFirstChild("PlatformModel")
+
+	if not template then
+		template = ReplicatedStorage:FindFirstChild("PlatformModel")
+	end
+
+	local platform
+
+	if template and template:IsA("Model") then
+		platform = template:Clone()
+		platform:PivotTo(spawnCFrame)
+
+		for _, part in ipairs(platform:GetDescendants()) do
+			if part:IsA("BasePart") and (part.Name == "Glow" or part.Material == Enum.Material.Neon) then
+				part.Color = multiplierColor
+			end
+		end
+	else
+		platform = Instance.new("Part")
+		platform.Name = "HoverPlatform"
+		platform.Size = Vector3.new(8, 0.5, 8)
+		platform.Anchored = true
+		platform.CastShadow = false
+		platform.Material = Enum.Material.Neon
+		platform.Color = multiplierColor
+		platform.CFrame = spawnCFrame
+
+		local light = Instance.new("PointLight")
+		light.Brightness = 2
+		light.Range = 12
+		light.Color = multiplierColor
+		light.Parent = platform
+	end
+
+	platform.Parent = workspace
+	return platform
+end
+
+local function AttachLabels(platformRoot, payout, multiplier)
+	if not platformRoot then return end
+
+	local payoutBB = Instance.new("BillboardGui")
+	payoutBB.Size = UDim2.new(8, 0, 2.5, 0) 
+	payoutBB.StudsOffset = Vector3.new(0, 5, 0)
+	payoutBB.AlwaysOnTop = false
+	payoutBB.Adornee = platformRoot
+	payoutBB.Parent = platformRoot
+
+	local payoutLabel = Instance.new("TextLabel")
+	payoutLabel.Size = UDim2.new(1, 0, 1, 0)
+	payoutLabel.BackgroundTransparency = 1
+	payoutLabel.Text = "$" .. FormatCurrency(payout)
+	payoutLabel.TextColor3 = Color3.fromRGB(100, 255, 100)
+	payoutLabel.TextScaled = true
+	payoutLabel.Font = Enum.Font.GothamBold
+	payoutLabel.TextStrokeTransparency = 1
+	payoutLabel.TextTransparency = 1
+	payoutLabel.Parent = payoutBB
+
+	local payoutStroke = Instance.new("UIStroke", payoutLabel)
+	payoutStroke.Thickness = 3
+	payoutStroke.Color = Color3.fromRGB(0, 40, 0)
+
+	local multBB = Instance.new("BillboardGui")
+	multBB.Size = UDim2.new(6, 0, 1.5, 0) 
+	multBB.StudsOffset = Vector3.new(0, 2.5, 0)
+	multBB.AlwaysOnTop = false
+	multBB.Adornee = platformRoot
+	multBB.Parent = platformRoot
+
+	local multLabel = Instance.new("TextLabel")
+	multLabel.Size = UDim2.new(1, 0, 1, 0)
+	multLabel.BackgroundTransparency = 1
+	multLabel.Text = MultiplierNames[multiplier] or "No Bonus"
+	multLabel.TextColor3 = MultiplierColors[multiplier] or Color3.fromRGB(255, 255, 255)
+	multLabel.TextScaled = true
+	multLabel.Font = Enum.Font.Gotham
+	multLabel.TextStrokeTransparency = 1
+	multLabel.TextTransparency = 1
+	multLabel.Parent = multBB
+
+	local multStroke = Instance.new("UIStroke", multLabel)
+	multStroke.Thickness = 2.5
+	multStroke.Color = Color3.fromRGB(0, 0, 0)
+
+	TweenService:Create(payoutLabel, TweenInfo.new(0.3), { TextTransparency = 0 }):Play()
+	TweenService:Create(multLabel, TweenInfo.new(0.3), { TextTransparency = 0 }):Play()
+end
+
+local function PayoutPopup(position, payout, multiplier)
+	local anchor = Instance.new("Part")
+	anchor.Size = Vector3.new(0.1, 0.1, 0.1)
+	anchor.Anchored = true
+	anchor.Transparency = 1
+	anchor.CanCollide = false
+	anchor.Position = position
+	anchor.Parent = workspace
+
+	local bb = Instance.new("BillboardGui")
+	bb.Size = UDim2.new(10, 0, 2.5, 0) 
+	bb.StudsOffset = Vector3.new(0, 7, 0)
+	bb.AlwaysOnTop = false
+	bb.Adornee = anchor
+	bb.Parent = anchor
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(1, 0, 1, 0)
+	label.BackgroundTransparency = 1
+	label.Text = "+ $" .. FormatCurrency(payout)
+	label.TextColor3 = MultiplierColors[multiplier] or Color3.fromRGB(100, 255, 100)
+	label.TextScaled = true
+	label.Font = Enum.Font.GothamBold
+	label.TextStrokeTransparency = 1
+	label.TextTransparency = 0
+	label.Parent = bb
+
+	local lStroke = Instance.new("UIStroke", label)
+	lStroke.Thickness = 3
+	lStroke.Color = Color3.fromRGB(0, 0, 0)
+
+	TweenService:Create(bb, TweenInfo.new(1.8, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), { StudsOffset = Vector3.new(0, 18, 0) }):Play()
+	task.delay(0.6, function()
+		TweenService:Create(label, TweenInfo.new(1.0, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { TextTransparency = 1 }):Play()
+		TweenService:Create(lStroke, TweenInfo.new(1.0, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Transparency = 1 }):Play()
+	end)
+	Debris:AddItem(anchor, 2.5)
+end
+
+local function GetAuraBlocksNearHabitat()
+	local blocks = {}
+	local habitatPos = GetHabitatPos()  
+
+	for _, obj in ipairs(workspace:GetChildren()) do
+		if obj.Name == "HoverPlatform" or obj == HabitatHolder then
+			continue
+		end
+
+		local rootPart = nil
+		local isCube = false
+
+		if obj:GetAttribute("AuraCube") then
+			isCube = true
+			if obj:IsA("Model") then
+				rootPart = obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart")
+			elseif obj:IsA("BasePart") then
+				rootPart = obj
+			end
+		elseif obj:IsA("Part") and obj.Material == Enum.Material.Neon then
+			isCube = true
+			rootPart = obj
+		end
+
+		if isCube and rootPart then
+			local dist = (rootPart.Position - habitatPos).Magnitude  
+			if dist < 20 then
+				table.insert(blocks, { instance = obj, rootPart = rootPart })
+			end
+		end
+	end
+	return blocks
+end
+
+local function MagnetBlocks(platformRoot, blocks, count)
+	if not platformRoot then return end
+	local collected = math.min(#blocks, count)
+	if collected == 0 then return end
+
+	local tweensDone = 0
+	local tweensStarted = 0
+
+	for i = 1, collected do
+		local block = blocks[i]
+		if not block or not block.rootPart or not block.rootPart.Parent then continue end
+
+		local rootPart = block.rootPart
+		local instance = block.instance
+
+		rootPart.Anchored = true
+
+		local tweenProps = { Position = platformRoot.Position }
+		if instance:IsA("BasePart") then
+			tweenProps.Size = Vector3.new(0.1, 0.1, 0.1)
+		end
+
+		local tween = TweenService:Create(rootPart,
+			TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+			tweenProps
+		)
+
+		tweensStarted += 1
+		tween.Completed:Connect(function()
+			PoolManager.ReturnAura(instance)
+			tweensDone += 1
+
+			local currentOffset = player:GetAttribute("HabitatVisualOffset") or 0
+			player:SetAttribute("HabitatVisualOffset", math.max(0, currentOffset - 1))
+		end)
+		tween:Play()
+		task.wait(0.05)
+	end
+
+	local timeout = tick() + 3
+	while tweensDone < tweensStarted and tick() < timeout do
+		task.wait(0.05)
+	end
+end
+
+local function ProcessPlatform(info)
+	if info.collected == 0 then return end
+
+	local myPayout     = info.payout
+	local myMultiplier = currentMultiplier
+	local myDispatchId = info.dispatchId
+	local multColor    = MultiplierColors[myMultiplier] or Color3.fromRGB(255, 255, 255)
+
+	local activeSpawn = workspace:FindFirstChild("TruckSpawn", true)
+	local activeDest  = workspace:FindFirstChild("TruckDestination", true)
+
+	if not activeSpawn or not activeDest then
+		warn("TruckSpawn or TruckDestination not found! Ensure they exist in the current Area model.")
+		return
+	end
+
+	local spawnCF = activeSpawn:IsA("Model") and activeSpawn:GetPivot() or activeSpawn.CFrame
+	local destCF  = activeDest:IsA("Model") and activeDest:GetPivot() or activeDest.CFrame
+
+	spawnCF = spawnCF + Vector3.new(0, AdminConfig.PlatformHoverHeight or 5, 0)
+	destCF  = destCF + Vector3.new(0, AdminConfig.PlatformHoverHeight or 5, 0)
+
+	local platform = CreatePlatform(spawnCF, multColor)
+	local platformRoot = platform:IsA("Model") and (platform.PrimaryPart or platform:FindFirstChildWhichIsA("BasePart")) or platform
+
+	local thrusterAtt = Instance.new("Attachment")
+	thrusterAtt.Position = Vector3.new(0, -1, 0)
+	thrusterAtt.Parent = platformRoot
+
+	local thrusterVFX = Instance.new("ParticleEmitter")
+	thrusterVFX.Color = ColorSequence.new(multColor)
+
+	thrusterVFX.Size = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0),
+		NumberSequenceKeypoint.new(0.5, 0),
+		NumberSequenceKeypoint.new(1, 1)
+	})
+
+	thrusterVFX.Lifetime = NumberRange.new(0.3, 0.6)
+	thrusterVFX.Rate = 50
+	thrusterVFX.Speed = NumberRange.new(5, 10)
+	thrusterVFX.EmissionDirection = Enum.NormalId.Bottom
+	thrusterVFX.Parent = thrusterAtt
+
+	local habitatPos = GetHabitatPos()
+	local midCF = CFrame.new(habitatPos + Vector3.new(0, AdminConfig.PlatformHoverHeight or 5, 0))
+
+	midCF = CFrame.new(midCF.Position) * spawnCF.Rotation 
+	destCF = CFrame.new(destCF.Position) * spawnCF.Rotation
+
+	local cframeProxy = Instance.new("CFrameValue")
+	cframeProxy.Value = spawnCF
+	cframeProxy.Changed:Connect(function(val)
+		if platform:IsA("Model") then
+			platform:PivotTo(val)
+		else
+			platform.CFrame = val
+		end
+	end)
+
+	local distIn = (spawnCF.Position - midCF.Position).Magnitude
+	local tweenIn = TweenService:Create(cframeProxy,
+		TweenInfo.new(math.max(0.1, distIn / (AdminConfig.PlatformSpeed or 20)), Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{ Value = midCF }
+	)
+	tweenIn:Play()
+	tweenIn.Completed:Wait()
+
+	AttachLabels(platformRoot, myPayout, myMultiplier)
+	PayoutPopup(platformRoot.Position, myPayout, myMultiplier)
+
+	local blocks = GetAuraBlocksNearHabitat()
+	MagnetBlocks(platformRoot, blocks, info.collected)
+
+	task.wait(0.5)
+	HabitatFullEvent:Fire(false)
+
+	local distOut = (midCF.Position - destCF.Position).Magnitude
+	local tweenOut = TweenService:Create(cframeProxy,
+		TweenInfo.new(math.max(0.1, distOut / (AdminConfig.PlatformSpeed or 20)), Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+		{ Value = destCF }
+	)
+	tweenOut:Play()
+	tweenOut.Completed:Wait()
+
+	cframeProxy:Destroy()
+	platform:Destroy()
+	ShipAurasBridge:Fire({ action = "payout", value = myDispatchId })
+end
+
+local function ProcessQueue()
+	if processingPlatform then return end
+	processingPlatform = true
+
+	while #platformQueue > 0 do
+		local nextInfo = table.remove(platformQueue, 1)
+		ProcessPlatform(nextInfo)
+	end
+
+	processingPlatform = false
+end
+
+ShipAurasBridge:Connect(function(info)
+	if type(info) ~= "table" then return end
+	if info.action == "payoutConfirmed" then
+		PlayJuiceEffect(info.amount, "Currency")
+	elseif info.action == "playJuice" then
+		PlayJuiceEffect(info.amount, info.currencyType)
+	else
+		table.insert(platformQueue, info)
+		task.spawn(ProcessQueue)
+	end
+end)
+
+local LocalJuiceEvent = ReplicatedStorage:FindFirstChild("LocalJuiceEvent")
+if not LocalJuiceEvent then
+	LocalJuiceEvent = Instance.new("BindableEvent")
+	LocalJuiceEvent.Name = "LocalJuiceEvent"
+	LocalJuiceEvent.Parent = ReplicatedStorage
+end
+LocalJuiceEvent.Event:Connect(function(exactAmount, currencyType)
+	PlayJuiceEffect(exactAmount, currencyType)
+end)
+
+local Players            = game:GetService("Players")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local TweenService       = game:GetService("TweenService")
+local Debris             = game:GetService("Debris")
+local UserInputService   = game:GetService("UserInputService")
+local CollectionService  = game:GetService("CollectionService")
+
+local AdminConfig        = require(ReplicatedStorage.Modules:WaitForChild("AdminConfig"))
+local Formatter          = require(ReplicatedStorage.Modules:WaitForChild("NumberFormatter"))
+local UITheme            = require(ReplicatedStorage.Modules:WaitForChild("UITheme"))
+
+local BridgeNet2             = require(ReplicatedStorage.Modules:WaitForChild("BridgeNet2"))
+local UpdateHUDBridge        = BridgeNet2.ClientBridge("UpdateHUD")
+local ShipAurasBridge        = BridgeNet2.ClientBridge("ShipAuras")
+local UpdateHatcheryBridge   = BridgeNet2.ClientBridge("UpdateHatchery")
+
+local player    = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local HabitatFull = ReplicatedStorage.RemoteEvents:WaitForChild("HabitatFull")
+local mainHUD   = playerGui:WaitForChild("MainHUD")
+
+local isAutoMode          = AdminConfig.AutoDispatch
+local HabitatHolder       = workspace:WaitForChild("HabitatHolder")
+
+local GoldenAurasLabel    = mainHUD:FindFirstChild("GoldenAurasLabel", true)
+local AurmerLabel         = mainHUD:FindFirstChild("AurmerLabel", true)
+
+local BANK_POPUP_OFFSET_X = 15
+local BANK_POPUP_OFFSET_Y = 45
+
+local function AddPaddingToLabel(label)
+	if label and not label:FindFirstChildOfClass("UIPadding") then
+		local pad = Instance.new("UIPadding", label)
+		pad.PaddingLeft = UDim.new(0, 35)
+	end
+end
+
+AddPaddingToLabel(GoldenAurasLabel)
+AddPaddingToLabel(AurmerLabel)
+
+if GoldenAurasLabel then
+	local scale = GoldenAurasLabel:FindFirstChildOfClass("UIScale") or Instance.new("UIScale", GoldenAurasLabel)
+	scale.Scale = 1.15
+end
+
+local displayedCurrency   = 0
+local liveGoldenAuras     = 0
+local liveAurmers         = 0
+local ratePerSecond       = 0
+local pendingAuras        = 0
+local habitatCapacity     = AdminConfig.BaseHabitatCapacity or 50
+local shipCapacity        = AdminConfig.BaseShipCapacity or 5
+local passiveInterval     = AdminConfig.PassiveInterval
+local currentCooldownTime = 15
+local isShipOnCooldown    = false
+local sharedCooldownEnd   = 0
+local manualCooldownLoopID = 0
+local autoLoopID          = 0
+local currentHatcheryLevel = AdminConfig.HatcheryMax or 150
+
+local localLastPiggyBank  = 0
+local isFirstBankLoad     = true
+
+local accumulatedBankDiff = 0
+local activeBankPopup = nil
+local activeBankTweens = {}
+
+local function FormatCurrency(n)
+	local num = tonumber(n) or 0
+	if num < 1000 then return string.format("%.2f", num)
+	else return Formatter.Format(num) end
+end
+
+local function FormatNumber(n) return Formatter.Format(math.floor(tonumber(n) or 0)) end
+
+local hud        = playerGui:WaitForChild("MainHUD")
+local curr       = hud:WaitForChild("CurrencyLabel")
+local rate       = hud:WaitForChild("RateLabel")
+local sendButton = hud:WaitForChild("SendButton")
+local modeToggle = hud:WaitForChild("ModeToggle")
+
+CollectionService:AddTag(sendButton, "Tutorial_SendShipBtn")
+CollectionService:AddTag(modeToggle, "Tutorial_ToggleShipBtn")
+
+local autoTimerLabel = Instance.new("TextLabel")
+autoTimerLabel.Name = "AutoTimerLabel"
+autoTimerLabel.Size = UDim2.new(0, 45, 1, 0)
+autoTimerLabel.Position = UDim2.new(1, 26, 0, 0)
+autoTimerLabel.BackgroundTransparency = 1
+autoTimerLabel.Text = ""
+autoTimerLabel.TextColor3 = Color3.fromRGB(0, 255, 128)
+autoTimerLabel.TextScaled = true
+autoTimerLabel.Font = Enum.Font.GothamBold
+autoTimerLabel.TextXAlignment = Enum.TextXAlignment.Left
+autoTimerLabel.Visible = false
+autoTimerLabel.Parent = modeToggle
+
+local autoHabitatLabel = Instance.new("TextLabel")
+autoHabitatLabel.Name = "AutoHabitatLabel"
+autoHabitatLabel.Size = sendButton.Size
+autoHabitatLabel.Position = sendButton.Position
+autoHabitatLabel.AnchorPoint = sendButton.AnchorPoint
+autoHabitatLabel.BackgroundTransparency = 1
+autoHabitatLabel.Font = Enum.Font.FredokaOne
+autoHabitatLabel.TextColor3 = Color3.fromRGB(160, 200, 255)
+autoHabitatLabel.TextScaled = true
+autoHabitatLabel.TextXAlignment = Enum.TextXAlignment.Center
+autoHabitatLabel.Visible = false
+autoHabitatLabel.Parent = sendButton.Parent
+
+local autoHabStroke = Instance.new("UIStroke", autoHabitatLabel)
+autoHabStroke.Thickness = 3
+autoHabStroke.Transparency = 0.1
+autoHabStroke.Color = Color3.new(0, 0, 0)
+
+local autoHabConstraint = Instance.new("UITextSizeConstraint", autoHabitatLabel)
+autoHabConstraint.MaxTextSize = 26
+
+local manualTimerLabel = Instance.new("TextLabel")
+manualTimerLabel.Name = "ManualTimerLabel"
+manualTimerLabel.Size = UDim2.new(0, 50, 1, 0)
+manualTimerLabel.AnchorPoint = Vector2.new(1, 0)
+manualTimerLabel.Position = UDim2.new(0, -10, 0, 0)
+manualTimerLabel.BackgroundTransparency = 1
+manualTimerLabel.Text = ""
+manualTimerLabel.TextColor3 = Color3.fromRGB(0, 180, 255)
+manualTimerLabel.TextScaled = true
+manualTimerLabel.Font = Enum.Font.GothamBold
+manualTimerLabel.TextXAlignment = Enum.TextXAlignment.Right
+manualTimerLabel.Visible = false
+manualTimerLabel.ZIndex = 50
+manualTimerLabel.Parent = sendButton
+
+local manualTimerStroke = Instance.new("UIStroke", manualTimerLabel)
+manualTimerStroke.Color = Color3.new(0, 0, 0)
+manualTimerStroke.Thickness = 2
+
+local function UpdateWalletVisual()
+	local pendingCash = player:GetAttribute("LocalPendingPayout") or 0
+	curr.Text = "Currency: $" .. FormatCurrency(math.max(0, displayedCurrency - pendingCash))
+end
+
+local function UpdateAuraVisual()
+	if not GoldenAurasLabel then return end
+	local pendingAurasVis = player:GetAttribute("LocalPendingAuras") or 0
+	GoldenAurasLabel.Text = FormatNumber(math.max(0, liveGoldenAuras - pendingAurasVis))
+end
+
+player:GetAttributeChangedSignal("LocalSpend"):Connect(function()
+	local spend = player:GetAttribute("LocalSpend") or 0
+	if spend > 0 then
+		displayedCurrency = math.max(0, displayedCurrency - spend)
+		UpdateWalletVisual()
+		player:SetAttribute("LocalSpend", 0)
+	end
+end)
+
+player:GetAttributeChangedSignal("LocalAuraSpend"):Connect(function()
+	local spend = player:GetAttribute("LocalAuraSpend") or 0
+	if spend > 0 then
+		liveGoldenAuras = math.max(0, liveGoldenAuras - spend)
+		UpdateAuraVisual()
+		player:SetAttribute("LocalAuraSpend", 0)
+	end
+end)
+
+player:GetAttributeChangedSignal("LocalPendingPayout"):Connect(UpdateWalletVisual)
+player:GetAttributeChangedSignal("LocalPendingAuras"):Connect(UpdateAuraVisual)
+
+player:GetAttributeChangedSignal("LivePiggyBank"):Connect(function()
+	local currentBank = player:GetAttribute("LivePiggyBank") or 0
+	local diff = currentBank - localLastPiggyBank
+
+	if isFirstBankLoad then
+		diff = 0
+		isFirstBankLoad = false
+	end
+
+	localLastPiggyBank = currentBank
+
+	if diff > 0 and GoldenAurasLabel then
+		accumulatedBankDiff = accumulatedBankDiff + diff
+
+		local targetPos = GoldenAurasLabel.AbsolutePosition
+		local targetSize = GoldenAurasLabel.AbsoluteSize
+
+		local startX = targetPos.X + (targetSize.X / 2) + BANK_POPUP_OFFSET_X
+		local startY = targetPos.Y + targetSize.Y + BANK_POPUP_OFFSET_Y 
+
+		if not activeBankPopup or not activeBankPopup.Parent then
+			activeBankPopup = Instance.new("TextLabel")
+			activeBankPopup.Font = Enum.Font.FredokaOne
+			activeBankPopup.TextScaled = true
+			activeBankPopup.TextColor3 = Color3.fromRGB(255, 210, 20)
+			activeBankPopup.BackgroundTransparency = 1
+			activeBankPopup.Size = UDim2.new(0, 120, 0, 20)
+			activeBankPopup.AnchorPoint = Vector2.new(0.5, 0)
+
+			local stroke = Instance.new("UIStroke", activeBankPopup)
+			stroke.Color = Color3.fromRGB(80, 40, 0)
+			stroke.Thickness = 3
+
+			local effectGui = playerGui:FindFirstChild("JuiceGui_PiggyBank")
+			if not effectGui then
+				effectGui = Instance.new("ScreenGui")
+				effectGui.Name = "JuiceGui_PiggyBank"
+				effectGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+				effectGui.DisplayOrder = 100 
+				effectGui.IgnoreGuiInset = true 
+				effectGui.Parent = playerGui
+			end
+			activeBankPopup.Parent = effectGui
+
+			local scale = Instance.new("UIScale", activeBankPopup)
+			scale.Scale = 1
+		end
+
+		for _, tw in ipairs(activeBankTweens) do
+			tw:Cancel()
+		end
+		activeBankTweens = {}
+
+		activeBankPopup.Text = "+" .. Formatter.Format(accumulatedBankDiff) .. " Banked!"
+		activeBankPopup.Position = UDim2.new(0, startX, 0, startY)
+		activeBankPopup.TextTransparency = 0
+
+		local stroke = activeBankPopup:FindFirstChildOfClass("UIStroke")
+		if stroke then stroke.Transparency = 0 end
+
+		local scale = activeBankPopup:FindFirstChildOfClass("UIScale")
+		if scale then
+			scale.Scale = 1.25
+			local popTween = TweenService:Create(scale, TweenInfo.new(0.15, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {Scale = 1})
+			popTween:Play()
+		end
+
+		local currentUpdateId = tick()
+		activeBankPopup:SetAttribute("UpdateId", currentUpdateId)
+
+		task.delay(0.8, function()
+			if activeBankPopup and activeBankPopup:GetAttribute("UpdateId") == currentUpdateId then
+
+				local driftTween = TweenService:Create(activeBankPopup, TweenInfo.new(0.4, Enum.EasingStyle.Sine, Enum.EasingDirection.In), {
+					Position = UDim2.new(0, startX, 0, startY + 25),
+					TextTransparency = 1
+				})
+
+				table.insert(activeBankTweens, driftTween)
+
+				if stroke then
+					local strokeTween = TweenService:Create(stroke, TweenInfo.new(0.4, Enum.EasingStyle.Sine, Enum.EasingDirection.In), {
+						Transparency = 1
+					})
+					table.insert(activeBankTweens, strokeTween)
+					strokeTween:Play()
+				end
+
+				driftTween:Play()
+
+				driftTween.Completed:Connect(function(playbackState)
+					if playbackState == Enum.PlaybackState.Completed then
+						if activeBankPopup and activeBankPopup:GetAttribute("UpdateId") == currentUpdateId then
+							accumulatedBankDiff = 0
+							activeBankPopup:Destroy()
+							activeBankPopup = nil
+						end
+					end
+				end)
+			end
+		end)
+	end
+
+
+end)
+
+local function FormatRate(perSecond)
+	if perSecond <= 0 then return "$0.00/sec" end
+	return "$" .. FormatCurrency(perSecond) .. "/sec"
+end
+
+local function GetRateColor(pending, capacity)
+	local ratio = math.clamp((pending or 0) / (capacity or 50), 0, 1)
+	if ratio >= 1        then return Color3.fromRGB(255, 60,  60)
+	elseif ratio >= 0.75 then return Color3.fromRGB(255, 200,  0)
+	elseif ratio >= 0.5  then return Color3.fromRGB(80,  255, 80)
+	else                      return Color3.fromRGB(80,  180, 80)
+	end
+end
+
+local function UpdateHabitatBar(actualPending, capacity)
+	local offset = player:GetAttribute("HabitatVisualOffset") or 0
+	local visualPending = math.max(0, actualPending + offset)
+
+	local capacityToUse = capacity > 0 and capacity or habitatCapacity
+	local ratio    = math.clamp(visualPending / capacityToUse, 0, 1)
+	local color    = GetRateColor(visualPending, capacityToUse)
+	local model    = HabitatHolder:FindFirstChild("HabitatModel")
+
+	if model then
+		local gui    = model:FindFirstChild("HabitatGui")
+		local barBg  = gui and gui:FindFirstChild("BarBackground")
+		local barFill = barBg and barBg:FindFirstChild("BarFill")
+
+		if barBg then
+			local oldLabel1 = barBg:FindFirstChild("CountLabel")
+			local oldLabel2 = barBg:FindFirstChild("AmountLabel")
+			if oldLabel1 then oldLabel1.Visible = false end
+			if oldLabel2 then oldLabel2.Visible = false end
+		end
+
+		if barFill then
+			TweenService:Create(barFill, TweenInfo.new(0.3), {
+				Size = UDim2.new(ratio, 0, 1, 0),
+				BackgroundColor3 = color,
+			}):Play()
+		end
+
+		if gui then
+			local textCap = gui:FindFirstChild("3DCapacityLabel")
+			if not textCap then
+				textCap = Instance.new("TextLabel")
+				textCap.Name = "3DCapacityLabel"
+				textCap.Size = UDim2.new(1, 0, 1, 0)
+				textCap.Position = UDim2.new(0, 0, 0, 0)
+				textCap.BackgroundTransparency = 1
+				textCap.Font = Enum.Font.GothamBlack 
+				textCap.TextScaled = true
+				textCap.TextColor3 = Color3.fromRGB(255, 255, 255)
+				textCap.Parent = gui
+
+				local stroke = Instance.new("UIStroke", textCap)
+				stroke.Thickness = 3
+				stroke.Color = Color3.fromRGB(0, 0, 0)
+			end
+
+			textCap.Text = FormatNumber(visualPending) .. " / " .. FormatNumber(capacityToUse)
+
+			local prevPending = textCap:GetAttribute("LastPending") or 0
+
+			if visualPending < prevPending then
+				textCap.TextColor3 = Color3.fromRGB(100, 255, 128) 
+				TweenService:Create(textCap, TweenInfo.new(0.6, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+					TextColor3 = Color3.fromRGB(255, 255, 255)
+				}):Play()
+			elseif visualPending >= capacityToUse and capacityToUse > 0 then
+				textCap.TextColor3 = Color3.fromRGB(255, 80, 80) 
+			elseif visualPending > prevPending then
+				if textCap.TextColor3 == Color3.fromRGB(255, 80, 80) then
+					textCap.TextColor3 = Color3.fromRGB(255, 255, 255)
+				end
+			end
+
+			textCap:SetAttribute("LastPending", visualPending)
+
+			local shipTextCap = gui:FindFirstChild("3DShipCapacityLabel")
+			if not shipTextCap then
+				shipTextCap = Instance.new("TextLabel")
+				shipTextCap.Name = "3DShipCapacityLabel"
+				shipTextCap.Size = UDim2.new(1, 0, 0.45, 0)
+				shipTextCap.Position = UDim2.new(0, 1, 1, 0)
+				shipTextCap.BackgroundTransparency = 1
+				shipTextCap.Font = Enum.Font.GothamBold 
+				shipTextCap.TextScaled = true
+				shipTextCap.TextColor3 = Color3.fromRGB(180, 220, 255)
+				shipTextCap.Parent = gui
+
+				local stroke = Instance.new("UIStroke", shipTextCap)
+				stroke.Thickness = 2
+				stroke.Color = Color3.fromRGB(0, 0, 0)
+			end
+
+			shipTextCap.Text = "Ship Capacity: " .. FormatNumber(shipCapacity)
+		end
+	end
+
+
+end
+
+local activeAlerts = {}
+
+local function ShowAlertPopup(alertType, text, iconColor)
+	if tick() - (activeAlerts[alertType] or 0) < 2.5 then return end
+	activeAlerts[alertType] = tick()
+
+	local ratePos = rate.AbsolutePosition
+	local rateSize = rate.AbsoluteSize
+
+	local alertW = 200
+	local alertH = 40
+	local padding = 15
+
+	local endX = ratePos.X - padding
+	local startX = endX + 40
+	local startY = ratePos.Y + (rateSize.Y / 2)
+
+	local effectGui = Instance.new("ScreenGui")
+	effectGui.Name = "AlertGui_" .. alertType
+	effectGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	effectGui.Parent = playerGui
+
+	local alertFrame = Instance.new("Frame")
+	alertFrame.Size = UDim2.new(0, alertW, 0, alertH)
+	alertFrame.AnchorPoint = Vector2.new(1, 0.5)
+	alertFrame.Position = UDim2.new(0, startX, 0, startY)
+	alertFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+	alertFrame.BorderSizePixel = 0
+	alertFrame.BackgroundTransparency = 1 
+	alertFrame.Parent = effectGui
+
+	local corner = Instance.new("UICorner", alertFrame)
+	corner.CornerRadius = UDim.new(0.5, 0)
+
+	local stroke = Instance.new("UIStroke", alertFrame)
+	stroke.Color = iconColor
+	stroke.Thickness = 2
+	stroke.Transparency = 1
+
+	local icon = Instance.new("ImageLabel", alertFrame)
+	icon.Size = UDim2.new(0, 20, 0, 20)
+	icon.Position = UDim2.new(0, 10, 0.5, -10)
+	icon.BackgroundTransparency = 1
+	icon.Image = "rbxassetid://7733658504" 
+	icon.ImageColor3 = iconColor
+	icon.ImageTransparency = 1
+
+	local msg = Instance.new("TextLabel", alertFrame)
+	msg.Size = UDim2.new(1, -40, 1, 0)
+	msg.Position = UDim2.new(0, 35, 0, 0)
+	msg.BackgroundTransparency = 1
+	msg.Text = text
+	msg.TextColor3 = iconColor
+	msg.Font = Enum.Font.GothamBold
+	msg.TextScaled = true
+	msg.TextTransparency = 1
+	msg.TextXAlignment = Enum.TextXAlignment.Left
+
+	local sfxFolder = ReplicatedStorage:FindFirstChild("SFX") or ReplicatedStorage:FindFirstChild("Sounds")
+	if sfxFolder and sfxFolder:FindFirstChild("ErrorBuzz") then
+		local sfx = sfxFolder.ErrorBuzz:Clone()
+		sfx.Parent = game:GetService("SoundService")
+		sfx.Volume = 0.5
+		sfx:Play()
+		Debris:AddItem(sfx, 2)
+	end
+
+	TweenService:Create(alertFrame, TweenInfo.new(0.4, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+		Position = UDim2.new(0, endX, 0, startY),
+		BackgroundTransparency = 0.1
+	}):Play()
+	TweenService:Create(stroke, TweenInfo.new(0.4), {Transparency = 0}):Play()
+	TweenService:Create(icon, TweenInfo.new(0.4), {ImageTransparency = 0}):Play()
+	TweenService:Create(msg, TweenInfo.new(0.4), {TextTransparency = 0}):Play()
+
+	task.delay(2, function()
+		if not alertFrame.Parent then return end
+		TweenService:Create(alertFrame, TweenInfo.new(0.3, Enum.EasingStyle.Sine, Enum.EasingDirection.In), {
+			Position = UDim2.new(0, startX, 0, startY),
+			BackgroundTransparency = 1
+		}):Play()
+		TweenService:Create(stroke, TweenInfo.new(0.3), {Transparency = 1}):Play()
+		TweenService:Create(icon, TweenInfo.new(0.3), {ImageTransparency = 1}):Play()
+		TweenService:Create(msg, TweenInfo.new(0.3), {TextTransparency = 1}):Play()
+		Debris:AddItem(effectGui, 0.4)
+	end)
+
+
+end
+
+HabitatFull.OnClientEvent:Connect(function()
+	ShowAlertPopup("HabitatFull", "HABITAT FULL!", Color3.fromRGB(255, 80, 80))
+end)
+
+UpdateHatcheryBridge:Connect(function(info)
+	currentHatcheryLevel = info.current
+	if info.current <= 0 then
+		ShowAlertPopup("HatcheryEmpty", "HATCHERY EMPTY!", Color3.fromRGB(255, 180, 50))
+	end
+end)
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+
+		local clickedMainButton = false
+		if gameProcessed then
+			local guis = playerGui:GetGuiObjectsAtPosition(input.Position.X, input.Position.Y)
+			for _, gui in ipairs(guis) do
+				if gui.Name == "ClickButton" then
+					clickedMainButton = true
+					break
+				end
+			end
+		end
+
+		if not clickedMainButton then return end
+
+		if currentHatcheryLevel <= 0.5 then
+			ShowAlertPopup("HatcheryEmpty", "HATCHERY EMPTY!", Color3.fromRGB(255, 180, 50))
+		elseif pendingAuras >= habitatCapacity then
+			ShowAlertPopup("HabitatFull", "HABITAT FULL!", Color3.fromRGB(255, 80, 80))
+		end
+	end
+
+
+end)
+
+local function SyncManualCooldownVisuals()
+	if isAutoMode then
+		manualTimerLabel.Visible = false
+		return
+	end
+
+	local progressContainer = sendButton:FindFirstChild("CooldownProgress")
+	local fillPart          = progressContainer and progressContainer:FindFirstChild("Fill")
+	local textTarget        = sendButton:FindFirstChildOfClass("TextLabel") or sendButton
+
+	local uiStroke = sendButton:FindFirstChildOfClass("UIStroke") or Instance.new("UIStroke", sendButton)
+	uiStroke.Thickness = 1.5
+
+	if not fillPart then return end
+
+	sendButton.ClipsDescendants = false
+	progressContainer.ClipsDescendants = true
+
+	local progCorner = progressContainer:FindFirstChildOfClass("UICorner") or Instance.new("UICorner", progressContainer)
+	local btnCorner = sendButton:FindFirstChildOfClass("UICorner")
+	if btnCorner then progCorner.CornerRadius = btnCorner.CornerRadius end
+
+	progressContainer.Size     = UDim2.new(1, 0, 1, 0)
+	progressContainer.Position = UDim2.new(0, 0, 0, 0)
+	progressContainer.AnchorPoint = Vector2.new(0, 0)
+
+	fillPart.BorderSizePixel = 0
+	fillPart.AnchorPoint     = Vector2.new(0, 1)
+	fillPart.Position        = UDim2.new(0, 0, 1, 0)
+
+	manualCooldownLoopID += 1
+	local currentLoop = manualCooldownLoopID
+	local timeLeft    = sharedCooldownEnd - tick()
+
+	if timeLeft > 0 then
+		sendButton.BackgroundColor3    = Color3.fromRGB(0, 160, 255)
+		uiStroke.Color                 = Color3.fromRGB(0, 220, 255)
+		fillPart.BackgroundColor3      = Color3.fromRGB(0, 0, 0)
+		fillPart.BackgroundTransparency = 0.55
+
+		isShipOnCooldown = true
+		if textTarget ~= sendButton then sendButton.Text = "" end
+
+		manualTimerLabel.Visible = true
+
+		local pct = timeLeft / currentCooldownTime
+		fillPart.Size = UDim2.new(1, 0, pct, 0)
+
+		TweenService:Create(fillPart, TweenInfo.new(timeLeft, Enum.EasingStyle.Linear), {
+			Size = UDim2.new(1, 0, 0, 0)
+		}):Play()
+
+		task.spawn(function()
+			while manualCooldownLoopID == currentLoop do
+				local currentLeft = sharedCooldownEnd - tick()
+
+				if currentLeft <= 0 then break end
+
+				manualTimerLabel.Text = string.format("%.1fs", currentLeft)
+				task.wait(0.05) 
+			end
+
+			if manualCooldownLoopID == currentLoop then
+				isShipOnCooldown  = false
+				textTarget.Text   = ""
+				fillPart.Size     = UDim2.new(1, 0, 0, 0)
+				manualTimerLabel.Visible = false
+
+				if pendingAuras <= 0 then
+					sendButton.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
+					uiStroke.Color = Color3.fromRGB(50, 50, 50)
+				else
+					sendButton.BackgroundColor3 = Color3.fromRGB(0, 160, 255)
+					uiStroke.Color = Color3.fromRGB(0, 220, 255)
+				end
+			end
+		end)
+	else
+		isShipOnCooldown = false
+		textTarget.Text  = ""
+		fillPart.Size    = UDim2.new(1, 0, 0, 0)
+		manualTimerLabel.Visible = false
+
+		if pendingAuras <= 0 then
+			sendButton.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
+			uiStroke.Color = Color3.fromRGB(50, 50, 50)
+		else
+			sendButton.BackgroundColor3 = Color3.fromRGB(0, 160, 255)
+			uiStroke.Color = Color3.fromRGB(0, 220, 255)
+		end
+	end
+
+
+end
+
+local function UpdateSendButton()
+	if AdminConfig.DisableShipping then
+		sendButton.Visible = false
+		autoHabitatLabel.Visible = false
+		return
+	end
+
+	if isAutoMode then
+		sendButton.Visible = false
+		autoHabitatLabel.Visible = true
+
+		local offset = player:GetAttribute("HabitatVisualOffset") or 0
+		local visualPending = math.max(0, pendingAuras + offset)
+
+		autoHabitatLabel.Text = "Waiting: " .. FormatNumber(visualPending) .. " / " .. FormatNumber(habitatCapacity)
+
+		if visualPending >= habitatCapacity then
+			autoHabitatLabel.TextColor3 = Color3.fromRGB(255, 80, 80)
+		elseif visualPending > 0 then
+			autoHabitatLabel.TextColor3 = Color3.fromRGB(100, 255, 128)
+		else
+			autoHabitatLabel.TextColor3 = Color3.fromRGB(160, 160, 180)
+		end
+	else
+		autoHabitatLabel.Visible = false
+		sendButton.Visible = true 
+		SyncManualCooldownVisuals()
+	end
+
+
+end
+
+player:GetAttributeChangedSignal("HabitatVisualOffset"):Connect(function()
+	UpdateHabitatBar(pendingAuras, habitatCapacity)
+	UpdateSendButton()
+end)
+
+local autoProgressContainer = Instance.new("Frame")
+autoProgressContainer.Name             = "AutoProgressContainer"
+autoProgressContainer.Size             = UDim2.new(0, 12, 1, 0)
+autoProgressContainer.Position         = UDim2.new(1, 8, 0, 0)
+autoProgressContainer.BackgroundColor3 = Color3.fromRGB(24, 60, 24)
+autoProgressContainer.BorderSizePixel  = 0
+autoProgressContainer.Visible          = false
+autoProgressContainer.Parent           = modeToggle
+Instance.new("UICorner", autoProgressContainer).CornerRadius = UDim.new(0.5, 0)
+
+local autoFillClip = Instance.new("Frame")
+autoFillClip.Size                 = UDim2.new(1, 0, 1, 0)
+autoFillClip.BackgroundTransparency = 1
+autoFillClip.ClipsDescendants     = true
+autoFillClip.Parent               = autoProgressContainer
+Instance.new("UICorner", autoFillClip).CornerRadius = UDim.new(0.5, 0)
+
+local autoFill = Instance.new("Frame")
+autoFill.Name             = "Fill"
+autoFill.Size             = UDim2.new(1, 0, 1, 0)
+autoFill.Position         = UDim2.new(0, 0, 1, 0)
+autoFill.AnchorPoint      = Vector2.new(0, 1)
+autoFill.BackgroundColor3 = Color3.fromRGB(0, 255, 128)
+autoFill.BorderSizePixel  = 0
+autoFill.Parent           = autoFillClip
+
+local function UpdateModeToggleVisuals()
+	local textLabel = modeToggle:FindFirstChildOfClass("TextLabel") or modeToggle
+	local uiStroke  = modeToggle:FindFirstChildOfClass("UIStroke")
+
+	autoLoopID += 1
+	local currentLoop = autoLoopID
+
+	if isAutoMode then
+		modeToggle.BackgroundColor3 = Color3.fromRGB(24, 60, 24)
+		textLabel.Text              = "[AUTO ACTIVE]"
+		textLabel.TextColor3        = Color3.fromRGB(0, 255, 128)
+		if uiStroke then uiStroke.Color = Color3.fromRGB(0, 255, 128) end
+
+		autoProgressContainer.Visible = true
+		autoTimerLabel.Visible = true
+
+		task.spawn(function()
+			local activeTween = nil
+
+			while isAutoMode and autoLoopID == currentLoop do
+				local currentLeft = sharedCooldownEnd - tick()
+
+				if currentLeft <= 0 then
+					if pendingAuras > 0 then
+						ShipAurasBridge:Fire({ action = "manual" })
+						if type(shared.TutorialRecordShipSent) == "function" then shared.TutorialRecordShipSent() end
+					end
+
+					sharedCooldownEnd = tick() + currentCooldownTime
+					currentLeft = currentCooldownTime
+
+					if activeTween then activeTween:Cancel() end
+					autoFill.Size = UDim2.new(1, 0, 1, 0)
+					activeTween = TweenService:Create(autoFill, TweenInfo.new(currentLeft, Enum.EasingStyle.Linear), {
+						Size = UDim2.new(1, 0, 0, 0)
+					})
+					activeTween:Play()
+				end
+
+				autoTimerLabel.Text = string.format("%.1fs", math.max(0, currentLeft))
+				task.wait(0.05) 
+			end
+
+			if activeTween then activeTween:Cancel() end
+		end)
+	else
+		modeToggle.BackgroundColor3 = Color3.fromRGB(38, 38, 45)
+		textLabel.Text              = "Mode: Manual"
+		textLabel.TextColor3        = Color3.fromRGB(220, 230, 240)
+		if uiStroke then uiStroke.Color = Color3.fromRGB(100, 180, 220) end
+
+		autoProgressContainer.Visible = false
+		autoTimerLabel.Visible = false
+	end
+
+
+end
+
+sendButton.MouseButton1Down:Connect(function()
+	if AdminConfig.DisableShipping then return end
+	if isAutoMode or isShipOnCooldown or pendingAuras <= 0 then return end
+
+	if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_SendShip") then return end
+
+	ShipAurasBridge:Fire({ action = "manual" })
+	sharedCooldownEnd = tick() + currentCooldownTime
+	SyncManualCooldownVisuals()
+
+	if type(shared.TutorialRecordShipSent) == "function" then shared.TutorialRecordShipSent() end
+	if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
+
+
+end)
+
+modeToggle.MouseButton1Down:Connect(function()
+	if AdminConfig.DisableShipping then return end
+
+	if type(shared.TutorialCanPerform) == "function" and not shared.TutorialCanPerform("Action_ToggleAutoShip") then return end
+
+	isAutoMode = not isAutoMode
+	ShipAurasBridge:Fire({ action = "setMode", value = isAutoMode and "auto" or "manual" })
+
+	UpdateModeToggleVisuals()
+	UpdateSendButton()
+
+	if type(shared.AdvanceTutorialStep) == "function" then shared.AdvanceTutorialStep() end
+
+
+end)
+
+UpdateModeToggleVisuals()
+
+if AdminConfig.DisableShipping then
+	isAutoMode         = false
+	sendButton.Visible = false
+	modeToggle.Visible = false
+end
+
+UpdateHUDBridge:Connect(function(stats)
+
+	if stats.currency ~= nil then
+		displayedCurrency = stats.currency
+		player:SetAttribute("LiveCurrency", displayedCurrency)
+		UpdateWalletVisual()
+	end
+
+	if stats.goldenAuras ~= nil then
+		liveGoldenAuras = stats.goldenAuras
+		player:SetAttribute("LiveGoldenAuras", liveGoldenAuras)
+		UpdateAuraVisual()
+	end
+
+	if stats.aurmers ~= nil then
+		liveAurmers = stats.aurmers
+		player:SetAttribute("LiveAurmers", liveAurmers)
+		if AurmerLabel then
+			AurmerLabel.Text = FormatNumber(liveAurmers)
+		end
+	end
+
+	if stats.prestigeCount ~= nil then
+		local currentPrestige = player:GetAttribute("PrestigeCount") or 0
+		if stats.prestigeCount > currentPrestige then
+			player:SetAttribute("PrestigeCount", stats.prestigeCount)
+			player:SetAttribute("HabitatVisualOffset", 0)
+			pendingAuras = 0
+		end
+	end
+
+	if stats.currentArea ~= nil then
+		local currentArea = player:GetAttribute("CurrentArea") or 1
+		if stats.currentArea ~= currentArea then
+			player:SetAttribute("CurrentArea", stats.currentArea)
+			player:SetAttribute("HabitatVisualOffset", 0)
+			pendingAuras = 0
+		end
+	end
+
+	if stats.shipCapacity ~= nil then
+		shipCapacity = stats.shipCapacity
+		UpdateHabitatBar(pendingAuras, habitatCapacity)
+	end
+
+	-- FIX: ONLY update capacity if it explicitly exists and is valid. Never fall back to nil/0.
+	if stats.habitatCapacity ~= nil and stats.habitatCapacity > 0 then
+		habitatCapacity = stats.habitatCapacity
+	end
+
+	if stats.pendingAuras ~= nil then
+		if stats.pendingAuras < pendingAuras then
+			local diff = pendingAuras - stats.pendingAuras
+			local currentOffset = player:GetAttribute("HabitatVisualOffset") or 0
+			player:SetAttribute("HabitatVisualOffset", currentOffset + diff)
+		end
+
+		pendingAuras = stats.pendingAuras
+
+		UpdateHabitatBar(pendingAuras, habitatCapacity)
+		UpdateSendButton() 
+	end
+
+	if stats.rate ~= nil then
+		passiveInterval = stats.passiveInterval or passiveInterval
+		local serverRate = stats.rate
+		ratePerSecond = (passiveInterval > 0 and serverRate > 0) and serverRate / passiveInterval or 0
+
+		rate.Text = FormatRate(ratePerSecond)
+		local offset = player:GetAttribute("HabitatVisualOffset") or 0
+		TweenService:Create(rate, TweenInfo.new(0.3), { TextColor3 = GetRateColor(pendingAuras + offset, habitatCapacity) }):Play()	
+	end
+
+	if stats.shipCooldown ~= nil then
+		currentCooldownTime = stats.shipCooldown
+	end
+
+
+end)
+
+ShipAurasBridge:Connect(function(info)
+	if type(info) == "table" and info.action == "payoutConfirmed" then
+		local amt = info.amount or 0
+		if amt > 0 then
+			if type(shared.TutorialRecordEarned) == "function" then shared.TutorialRecordEarned(amt) end
+			curr.TextColor3 = Color3.fromRGB(80, 255, 80)
+			TweenService:Create(curr, TweenInfo.new(0.5), { TextColor3 = Color3.fromRGB(255, 255, 255) }):Play()
+		end
+	end
+end)
+
+local function RefreshLook()
+	if GoldenAurasLabel then UITheme.ApplyFlair(GoldenAurasLabel, "GoldStroke") end
+	if AurmerLabel then UITheme.ApplyFlair(AurmerLabel, "AurmerStroke") end
+end
+
+task.wait(2)
+RefreshLook()
+
+local function ForceSpawnTeleport()
+	local char = player.Character or player.CharacterAdded:Wait()
+	local spawnLoc = workspace:WaitForChild("SpawnLocation", 10)
+
+	if char and spawnLoc then
+		task.wait(0.1) 
+		char:PivotTo(spawnLoc.CFrame * CFrame.new(0, (spawnLoc.Size.Y / 2) + 3, 0))
+	end
+
+
+end
+
+task.spawn(ForceSpawnTeleport)
 
 local Players             = game:GetService("Players")
 local ReplicatedStorage   = game:GetService("ReplicatedStorage")
@@ -1156,7 +2516,15 @@ local CubeSmushedBridge      = BridgeNet2.ServerBridge("CubeSmushed")
 local CubeStoredBridge       = BridgeNet2.ServerBridge("CubeStored")
 
 local HABITAT_HOLDER = workspace:WaitForChild("HabitatHolder")
-local HABITAT_PART   = HABITAT_HOLDER:WaitForChild("Position")
+
+local function GetServerHabitatPos()
+	local posPart = HABITAT_HOLDER:FindFirstChild("Position", true)
+	if posPart and posPart:IsA("BasePart") then
+		return posPart.Position
+	end
+	return HABITAT_HOLDER:GetPivot().Position
+end
+
 local AURA_HOLDER    = workspace:WaitForChild("AuraHolder")
 
 local lastFire          = {}
@@ -1530,7 +2898,7 @@ local function SpawnAura(player, data, runtime, holdMult, luckBonus)
 
 	local totalValue = baseValue + math.floor(baseValue * (holdMult - 1))
 
-	local spawnPos = HABITAT_PART.Position + Vector3.new(math.random(-3,3), 10, math.random(-3,3))  
+	local spawnPos = GetServerHabitatPos() + Vector3.new(math.random(-3,3), 10, math.random(-3,3))  
 	local activeAuraModel = workspace:FindFirstChild("AuraHolder") and workspace.AuraHolder:FindFirstChildWhichIsA("Model")
 	if activeAuraModel then
 		local spawnPoint = activeAuraModel:FindFirstChild("AuraSpawnPoint", true)
@@ -1664,13 +3032,328 @@ end)
 CubeSmushedBridge:Connect(function(player, cubeId)
 	local uid = player.UserId
 
-	-- Ensure if a cube gets smushed/sold it clears out appropriately, 
-	-- the FIFO queue will organically clean itself up since returning 
-	-- destroyed instances to the PoolManager is handled safely.
 	GameManager.RemoveCube(uid, cubeId)
 	SendHUDUpdate(player)
 	local data = GameManager.GetData(uid)
 	UpdateHatcheryBridge:Fire(player, { current = hatchery[uid], max = GetHatcheryMax(data) })
+end)
+
+-- PassiveIncome
+-- Location: ServerScriptService > PassiveIncome
+
+local Players             = game:GetService("Players")
+local ReplicatedStorage   = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local AdminConfig    = require(ReplicatedStorage.Modules.AdminConfig)
+local UpgradeConfig  = require(ReplicatedStorage.Modules.UpgradeConfig)
+local GameManager    = require(ServerScriptService.GameManager)
+local BoostManager   = require(ServerScriptService.BoostManager)
+
+local BridgeNet2      = require(ReplicatedStorage.Modules:WaitForChild("BridgeNet2"))
+local UpdateHUDBridge = BridgeNet2.ServerBridge("UpdateHUD")
+
+if script:GetAttribute("Running") then script:Destroy(); return end
+script:SetAttribute("Running", true)
+
+local lastSentCurrency   = {}  
+local lastSentStored     = {}
+
+Players.PlayerAdded:Connect(function(p)
+	lastSentCurrency[p.UserId] = 0
+	lastSentStored[p.UserId]   = 0
+end)
+
+Players.PlayerRemoving:Connect(function(p)
+	lastSentCurrency[p.UserId] = nil
+	lastSentStored[p.UserId]   = nil
+end)
+
+while true do
+	-- ✨ BLAZING FAST 20Hz LOOP (Matches your FocusScript!)
+	local dt = task.wait(0.05)
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player:GetAttribute("TutorialFrozen") then continue end
+
+		local uid     = player.UserId
+		local data    = GameManager.GetData(uid)
+		local runtime = GameManager.GetRuntime(uid)
+		if not data or not runtime then continue end
+
+		local activeValue = runtime.activeMutatedValue or 0
+		local storedCount = runtime.storedCubeCount or 0
+
+		local interval = UpgradeConfig.GetPassiveInterval(data)
+		if interval <= 0 then interval = 1 end
+
+		local boostMult = BoostManager.GetValueMultiplier(uid) * BoostManager.GetSpawnRateMultiplier(uid)
+
+		-- Calculate the exact microscopic fraction earned in this 0.05s window
+		local fullTickEarned   = activeValue * boostMult
+		local fractionalEarned = fullTickEarned * (dt / interval)
+
+		if fractionalEarned > 0 then
+			data.currency       = (data.currency       or 0) + fractionalEarned
+			data.totalEarned    = (data.totalEarned     or 0) + fractionalEarned
+			data.farmEvaluation = (data.farmEvaluation  or 0) + fractionalEarned
+		end
+
+		-- Only fire the BridgeNet update if they are actively making money or the habitat changed
+		local shouldFire = false
+		if not lastSentCurrency[uid] or math.abs(data.currency - lastSentCurrency[uid]) > 0.001 then
+			shouldFire = true
+		end
+		if storedCount ~= lastSentStored[uid] then
+			shouldFire = true
+		end
+
+		if shouldFire then
+			lastSentCurrency[uid] = data.currency
+			lastSentStored[uid]   = storedCount
+
+			local habCap = UpgradeConfig.GetHabitatCapacity(data)
+
+			UpdateHUDBridge:Fire(player, {
+				currency        = data.currency, 
+				pendingAuras    = storedCount, 
+				habitatCapacity = habCap,
+				rate            = math.floor(fullTickEarned),
+				passiveInterval = interval,
+				totalEarned     = math.floor(data.totalEarned or 0),
+				soulAuras       = data.soulAuras      or 0,
+				farmEvaluation  = math.floor(data.farmEvaluation or 0),
+				boostMultiplier = boostMult -- ✨ THE FIX: Sync to HUD so labels scale!
+			})
+		end
+	end
+end
+
+local Players             = game:GetService("Players")
+local ReplicatedStorage   = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+local HttpService         = game:GetService("HttpService")
+
+local AdminConfig       = require(ReplicatedStorage.Modules.AdminConfig)
+local UpgradeConfig     = require(ReplicatedStorage.Modules.UpgradeConfig)
+local MutationConfig    = require(ReplicatedStorage.Modules.MutationConfig)
+local GameManager       = require(ServerScriptService.GameManager)
+local EpicUpgradeConfig = require(ReplicatedStorage.Modules.EpicUpgradeConfig)
+local BoostManager      = require(ServerScriptService.BoostManager)
+local BankConfig        = require(ReplicatedStorage.Modules.BankConfig)
+
+local BridgeNet2      = require(ReplicatedStorage.Modules:WaitForChild("BridgeNet2"))
+local UpdateHUDBridge = BridgeNet2.ServerBridge("UpdateHUD")
+local ShipAurasBridge = BridgeNet2.ServerBridge("ShipAuras")
+
+local RemoteEvents = ReplicatedStorage:WaitForChild("RemoteEvents")
+if not RemoteEvents:FindFirstChild("AuraDiscovered") then
+	local ev = Instance.new("RemoteEvent")
+	ev.Name = "AuraDiscovered"
+	ev.Parent = RemoteEvents
+end
+local AuraDiscovered = RemoteEvents:WaitForChild("AuraDiscovered")
+
+local playerTimers   = {}
+local activeTrucks   = {}
+local playerAutoMode = {}
+local pendingPayouts = {}
+
+Players.PlayerAdded:Connect(function(player)
+	playerTimers[player.UserId]   = AdminConfig.ShipInterval
+	activeTrucks[player.UserId]   = 0
+	playerAutoMode[player.UserId] = AdminConfig.AutoDispatch
+	pendingPayouts[player.UserId] = {}
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	playerTimers[player.UserId]   = nil
+	activeTrucks[player.UserId]   = nil
+	playerAutoMode[player.UserId] = nil
+	pendingPayouts[player.UserId] = nil
+end)
+
+local function SendHUDUpdate(player)
+	local uid     = player.UserId
+	local data    = GameManager.GetData(uid)
+	local runtime = GameManager.GetRuntime(uid)
+	if not data or not runtime then return end
+
+	local storedCount = runtime.storedCubeCount or 0
+	local activeMV    = runtime.activeMutatedValue or 0
+
+	local boostMult = BoostManager.GetValueMultiplier(uid) * BoostManager.GetSpawnRateMultiplier(uid)
+	local rate = math.floor(activeMV * boostMult)
+
+	local habitatCap = UpgradeConfig.GetHabitatCapacity(data)
+	local passiveInt = UpgradeConfig.GetPassiveInterval(data)
+
+	local shipReduction = 0
+	local shipCfg = EpicUpgradeConfig.GetUpgradeConfig("epicShipCooldown")
+	if shipCfg and shipCfg.apply then
+		shipReduction = shipCfg.apply(data)
+	end
+
+	local finalCooldown = math.max(0.5, AdminConfig.ShipInterval - shipReduction)
+
+	UpdateHUDBridge:Fire(player, {
+		currency        = data.currency,
+		pendingAuras    = storedCount,
+		habitatCapacity = habitatCap,
+		rate            = rate,
+		passiveInterval = passiveInt,
+		totalEarned     = data.totalEarned    or 0,
+		soulAuras       = data.soulAuras      or 0,
+		farmEvaluation  = data.farmEvaluation or 0,
+		shipCooldown    = finalCooldown,
+		discoveredTiers = data.discoveredTiers or {},
+		totalPlatformsShipped = data.totalPlatformsShipped or 0,
+		totalCubesProduced    = data.totalCubesProduced or 0,
+		shipCapacity          = UpgradeConfig.GetShippingCapacity(data) or AdminConfig.PlatformCapacity,
+	})
+
+
+end
+
+local function TryDispatch(player)
+	if AdminConfig.DisableShipping then return end
+	local uid     = player.UserId
+	local data    = GameManager.GetData(uid)
+	local runtime = GameManager.GetRuntime(uid)
+	if not data or not runtime then return end
+	if data.inSpecialArea then return end
+	if (activeTrucks[uid] or 0) >= 50 then return end
+
+	local totalCubes = runtime.cubeCount
+	if totalCubes <= 0 then return end
+
+	local epicStorageBoost = 0
+	local epicStorageCfg = EpicUpgradeConfig.GetUpgradeConfig("epicShipStorage")
+	if epicStorageCfg and epicStorageCfg.apply then 
+		epicStorageBoost = epicStorageCfg.apply(data)
+	end
+
+	local baseShipCap = UpgradeConfig.GetShippingCapacity and UpgradeConfig.GetShippingCapacity(data) or AdminConfig.PlatformCapacity
+	local toCollect = math.min(totalCubes, baseShipCap + epicStorageBoost)		
+	local cubeIds, cubes = GameManager.CollectOldestCubes(uid, toCollect)
+	local collected  = #cubeIds
+	if collected == 0 then return end
+
+	local totalPayout = 0
+
+	data.discoveredTiers = data.discoveredTiers or {}
+	local newlyDiscovered = {}
+
+	local doubleEarningsOwned = player:GetAttribute("Pass_DoubleEarnings")
+	local passMultiplier = doubleEarningsOwned and BankConfig.Gamepasses.DoubleEarnings.bonus or 1.0
+
+	local epicGoldenYield = 0
+	local goldenYieldCfg = EpicUpgradeConfig.GetUpgradeConfig("epicGoldenAuraYield")
+	if goldenYieldCfg and goldenYieldCfg.apply then epicGoldenYield = goldenYieldCfg.apply(data) end
+
+	for _, cube in ipairs(cubes) do
+		totalPayout = totalPayout + (MutationConfig.GetMutatedValue(cube) * passMultiplier)
+
+		if epicGoldenYield > 0 and (cube.isGolden or cube.tierName == "Legendary") then
+			data.goldenAuras = (data.goldenAuras or 0) + epicGoldenYield
+		end
+
+		local cArea = cube.currentArea or data.currentArea or 1
+		local discoverKey = cArea .. "_" .. cube.tierName
+
+		if not data.discoveredTiers[discoverKey] then
+			data.discoveredTiers[discoverKey] = true
+			table.insert(newlyDiscovered, {name = cube.tierName, color = cube.color, area = cArea})
+		end
+	end
+
+	activeTrucks[uid] = (activeTrucks[uid] or 0) + 1
+	data.totalPlatformsShipped = (data.totalPlatformsShipped or 0) + 1
+
+	GameManager.SavePlayer(player)
+
+	local dispatchId = HttpService:GenerateGUID(false)
+	pendingPayouts[uid][dispatchId] = totalPayout
+
+	SendHUDUpdate(player)
+
+	ShipAurasBridge:Fire(player, {
+		collected  = collected,
+		payout     = totalPayout,
+		dispatchId = dispatchId,
+	})
+
+	if #newlyDiscovered > 0 then
+		AuraDiscovered:FireClient(player, newlyDiscovered)
+	end
+
+	task.delay(AdminConfig.PlatformSpeed * 4 + 10, function()
+		if Players:GetPlayerByUserId(uid) and pendingPayouts[uid] and pendingPayouts[uid][dispatchId] then
+			pendingPayouts[uid][dispatchId] = nil
+			activeTrucks[uid] = math.max(0, (activeTrucks[uid] or 1) - 1)
+		end
+	end)
+
+
+end
+
+ShipAurasBridge:Connect(function(player, payload)
+	if type(payload) ~= "table" then return end
+	local uid = player.UserId
+	local action = payload.action
+	local value = payload.value
+
+	if action == "manual" then
+		TryDispatch(player)
+
+		local data          = GameManager.GetData(uid)
+		local shipReduction = 0
+		if data then
+			local shipCfg = EpicUpgradeConfig.GetUpgradeConfig("epicShipCooldown")
+			if shipCfg and shipCfg.apply then shipReduction = shipCfg.apply(data) end
+		end
+
+		playerTimers[uid] = math.max(0.5, AdminConfig.ShipInterval - shipReduction)
+		return
+	end
+
+	if action == "setMode" then
+		playerAutoMode[uid] = (value == "auto")
+		return
+	end
+
+	if action == "payout" then
+		if player:GetAttribute("TutorialFrozen") then return end
+
+		local data = GameManager.GetData(uid)
+		if not data then return end
+
+		local dispatchId   = value
+		local actualPayout = pendingPayouts[uid] and pendingPayouts[uid][dispatchId]
+
+		if not actualPayout then
+			warn("[Security] " .. player.Name .. " attempted invalid platform payout.")
+			return
+		end
+
+		pendingPayouts[uid][dispatchId] = nil
+		activeTrucks[uid] = math.max(0, (activeTrucks[uid] or 1) - 1)
+
+		data.currency       = (data.currency        or 0) + actualPayout
+		data.totalEarned    = (data.totalEarned     or 0) + actualPayout
+		data.farmEvaluation = (data.farmEvaluation  or 0) + actualPayout
+
+		GameManager.SavePlayer(player)
+
+		SendHUDUpdate(player)
+
+		ShipAurasBridge:Fire(player, {
+			action = "payoutConfirmed",
+			amount = actualPayout
+		})
+	end
+
+
 end)
 
 local Players             = game:GetService("Players")
@@ -1940,805 +3623,6 @@ Players.PlayerRemoving:Connect(function(player)
 end)
 
 return {}
-
-local Players             = game:GetService("Players")
-local ReplicatedStorage   = game:GetService("ReplicatedStorage")
-local ServerScriptService = game:GetService("ServerScriptService")
-local HttpService         = game:GetService("HttpService")
-
-local AdminConfig       = require(ReplicatedStorage.Modules.AdminConfig)
-local UpgradeConfig     = require(ReplicatedStorage.Modules.UpgradeConfig)
-local MutationConfig    = require(ReplicatedStorage.Modules.MutationConfig)
-local GameManager       = require(ServerScriptService.GameManager)
-local EpicUpgradeConfig = require(ReplicatedStorage.Modules.EpicUpgradeConfig)
-local BoostManager      = require(ServerScriptService.BoostManager)
-local BankConfig        = require(ReplicatedStorage.Modules.BankConfig)
-
-local BridgeNet2      = require(ReplicatedStorage.Modules:WaitForChild("BridgeNet2"))
-local UpdateHUDBridge = BridgeNet2.ServerBridge("UpdateHUD")
-local ShipAurasBridge = BridgeNet2.ServerBridge("ShipAuras")
-
-local RemoteEvents = ReplicatedStorage:WaitForChild("RemoteEvents")
-if not RemoteEvents:FindFirstChild("AuraDiscovered") then
-	local ev = Instance.new("RemoteEvent")
-	ev.Name = "AuraDiscovered"
-	ev.Parent = RemoteEvents
-end
-local AuraDiscovered = RemoteEvents:WaitForChild("AuraDiscovered")
-
-local playerTimers   = {}
-local activeTrucks   = {}
-local playerAutoMode = {}
-local pendingPayouts = {}
-
-Players.PlayerAdded:Connect(function(player)
-	playerTimers[player.UserId]   = AdminConfig.ShipInterval
-	activeTrucks[player.UserId]   = 0
-	playerAutoMode[player.UserId] = AdminConfig.AutoDispatch
-	pendingPayouts[player.UserId] = {}
-end)
-
-Players.PlayerRemoving:Connect(function(player)
-	playerTimers[player.UserId]   = nil
-	activeTrucks[player.UserId]   = nil
-	playerAutoMode[player.UserId] = nil
-	pendingPayouts[player.UserId] = nil
-end)
-
-local function SendHUDUpdate(player)
-	local uid     = player.UserId
-	local data    = GameManager.GetData(uid)
-	local runtime = GameManager.GetRuntime(uid)
-	if not data or not runtime then return end
-
-	local storedCount = runtime.storedCubeCount or 0
-	local activeMV    = runtime.activeMutatedValue or 0
-
-	local boostMult = BoostManager.GetValueMultiplier(uid) * BoostManager.GetSpawnRateMultiplier(uid)
-	local rate = math.floor(activeMV * boostMult)
-
-	local habitatCap = UpgradeConfig.GetHabitatCapacity(data)
-	local passiveInt = UpgradeConfig.GetPassiveInterval(data)
-
-	local shipReduction = 0
-	local shipCfg = EpicUpgradeConfig.GetUpgradeConfig("epicShipCooldown")
-	if shipCfg and shipCfg.apply then
-		shipReduction = shipCfg.apply(data)
-	end
-
-	local finalCooldown = math.max(0.5, AdminConfig.ShipInterval - shipReduction)
-
-	UpdateHUDBridge:Fire(player, {
-		currency        = data.currency,
-		pendingAuras    = storedCount,
-		habitatCapacity = habitatCap,
-		rate            = rate,
-		passiveInterval = passiveInt,
-		totalEarned     = data.totalEarned    or 0,
-		soulAuras       = data.soulAuras      or 0,
-		farmEvaluation  = data.farmEvaluation or 0,
-		shipCooldown    = finalCooldown,
-		discoveredTiers = data.discoveredTiers or {},
-		totalPlatformsShipped = data.totalPlatformsShipped or 0,
-		totalCubesProduced    = data.totalCubesProduced or 0,
-		shipCapacity          = UpgradeConfig.GetShippingCapacity(data) or AdminConfig.PlatformCapacity,
-	})
-
-
-end
-
-local function TryDispatch(player)
-	if AdminConfig.DisableShipping then return end
-	local uid     = player.UserId
-	local data    = GameManager.GetData(uid)
-	local runtime = GameManager.GetRuntime(uid)
-	if not data or not runtime then return end
-	if data.inSpecialArea then return end
-	if (activeTrucks[uid] or 0) >= 50 then return end
-
-	local totalCubes = runtime.cubeCount
-	if totalCubes <= 0 then return end
-
-	local epicStorageBoost = 0
-	local epicStorageCfg = EpicUpgradeConfig.GetUpgradeConfig("epicShipStorage")
-	if epicStorageCfg and epicStorageCfg.apply then 
-		epicStorageBoost = epicStorageCfg.apply(data)
-	end
-
-	local baseShipCap = UpgradeConfig.GetShippingCapacity and UpgradeConfig.GetShippingCapacity(data) or AdminConfig.PlatformCapacity
-	local toCollect = math.min(totalCubes, baseShipCap + epicStorageBoost)		
-	local cubeIds, cubes = GameManager.CollectOldestCubes(uid, toCollect)
-	local collected  = #cubeIds
-	if collected == 0 then return end
-
-	local totalPayout = 0
-
-	data.discoveredTiers = data.discoveredTiers or {}
-	local newlyDiscovered = {}
-
-	local doubleEarningsOwned = player:GetAttribute("Pass_DoubleEarnings")
-	local passMultiplier = doubleEarningsOwned and BankConfig.Gamepasses.DoubleEarnings.bonus or 1.0
-
-	local epicGoldenYield = 0
-	local goldenYieldCfg = EpicUpgradeConfig.GetUpgradeConfig("epicGoldenAuraYield")
-	if goldenYieldCfg and goldenYieldCfg.apply then epicGoldenYield = goldenYieldCfg.apply(data) end
-
-	for _, cube in ipairs(cubes) do
-		totalPayout = totalPayout + (MutationConfig.GetMutatedValue(cube) * passMultiplier)
-
-		if epicGoldenYield > 0 and (cube.isGolden or cube.tierName == "Legendary") then
-			data.goldenAuras = (data.goldenAuras or 0) + epicGoldenYield
-		end
-
-		local cArea = cube.currentArea or data.currentArea or 1
-		local discoverKey = cArea .. "_" .. cube.tierName
-
-		if not data.discoveredTiers[discoverKey] then
-			data.discoveredTiers[discoverKey] = true
-			table.insert(newlyDiscovered, {name = cube.tierName, color = cube.color, area = cArea})
-		end
-	end
-
-	activeTrucks[uid] = (activeTrucks[uid] or 0) + 1
-	data.totalPlatformsShipped = (data.totalPlatformsShipped or 0) + 1
-
-	GameManager.SavePlayer(player)
-
-	local dispatchId = HttpService:GenerateGUID(false)
-	pendingPayouts[uid][dispatchId] = totalPayout
-
-	SendHUDUpdate(player)
-
-	ShipAurasBridge:Fire(player, {
-		collected  = collected,
-		payout     = totalPayout,
-		dispatchId = dispatchId,
-	})
-
-	if #newlyDiscovered > 0 then
-		AuraDiscovered:FireClient(player, newlyDiscovered)
-	end
-
-	task.delay(AdminConfig.PlatformSpeed * 4 + 10, function()
-		if Players:GetPlayerByUserId(uid) and pendingPayouts[uid] and pendingPayouts[uid][dispatchId] then
-			pendingPayouts[uid][dispatchId] = nil
-			activeTrucks[uid] = math.max(0, (activeTrucks[uid] or 1) - 1)
-		end
-	end)
-
-
-end
-
-ShipAurasBridge:Connect(function(player, payload)
-	if type(payload) ~= "table" then return end
-	local uid = player.UserId
-	local action = payload.action
-	local value = payload.value
-
-	if action == "manual" then
-		TryDispatch(player)
-
-		local data          = GameManager.GetData(uid)
-		local shipReduction = 0
-		if data then
-			local shipCfg = EpicUpgradeConfig.GetUpgradeConfig("epicShipCooldown")
-			if shipCfg and shipCfg.apply then shipReduction = shipCfg.apply(data) end
-		end
-
-		playerTimers[uid] = math.max(0.5, AdminConfig.ShipInterval - shipReduction)
-		return
-	end
-
-	if action == "setMode" then
-		playerAutoMode[uid] = (value == "auto")
-		return
-	end
-
-	if action == "payout" then
-		if player:GetAttribute("TutorialFrozen") then return end
-
-		local data = GameManager.GetData(uid)
-		if not data then return end
-
-		local dispatchId   = value
-		local actualPayout = pendingPayouts[uid] and pendingPayouts[uid][dispatchId]
-
-		if not actualPayout then
-			warn("[Security] " .. player.Name .. " attempted invalid platform payout.")
-			return
-		end
-
-		pendingPayouts[uid][dispatchId] = nil
-		activeTrucks[uid] = math.max(0, (activeTrucks[uid] or 1) - 1)
-
-		data.currency       = (data.currency        or 0) + actualPayout
-		data.totalEarned    = (data.totalEarned     or 0) + actualPayout
-		data.farmEvaluation = (data.farmEvaluation  or 0) + actualPayout
-
-		GameManager.SavePlayer(player)
-
-		SendHUDUpdate(player)
-
-		ShipAurasBridge:Fire(player, {
-			action = "payoutConfirmed",
-			amount = actualPayout
-		})
-	end
-
-
-end)
-
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local TweenService = game:GetService("TweenService")
-local Debris = game:GetService("Debris")
-local AdminConfig = require(ReplicatedStorage.Modules.AdminConfig)
-local Formatter = require(ReplicatedStorage.Modules.NumberFormatter) 
-local PoolManager = require(ReplicatedStorage.Modules:WaitForChild("PoolManager"))
-local UpdateMultiplier = ReplicatedStorage:WaitForChild("UpdateMultiplier")
-local HabitatFullEvent = ReplicatedStorage:WaitForChild("HabitatFullEvent")
-
-local AreaChanged = ReplicatedStorage.RemoteEvents:WaitForChild("AreaChanged")
-local AreaUpdated = ReplicatedStorage.RemoteEvents:WaitForChild("AreaUpdated")
-
-local BridgeNet2      = require(ReplicatedStorage.Modules:WaitForChild("BridgeNet2"))
-local ShipAurasBridge = BridgeNet2.ClientBridge("ShipAuras")
-
-local HabitatHolder = workspace:WaitForChild("HabitatHolder") 
-
-local Camera = workspace.CurrentCamera
-local player = Players.LocalPlayer
-local playerGui = player:WaitForChild("PlayerGui")
-local mainHUD = playerGui:WaitForChild("MainHUD")
-local currLabel = mainHUD:WaitForChild("CurrencyLabel")
-local gaurasLabel = mainHUD:WaitForChild("GoldenAurasLabel")
-
-local function GetHabitatPos()
-	return HabitatHolder:WaitForChild("Position").Position
-end
-
-local currentMultiplier = 1.0
-local currentAreaIndex = 1
-local platformQueue = {}
-local processingPlatform = false
-
-local MultiplierColors = {
-	[1.0] = Color3.fromRGB(255, 255, 255),
-	[1.5] = Color3.fromRGB(100, 200, 255),
-	[2.0] = Color3.fromRGB(80, 255, 120),
-	[3.0] = Color3.fromRGB(180, 60, 255),
-	[5.0] = Color3.fromRGB(255, 200, 0),
-}
-
-local MultiplierNames = {
-	[1.0] = "No Bonus",
-	[1.5] = "1.5x Bonus",
-	[2.0] = "2x Bonus",
-	[3.0] = "3x Bonus",
-	[5.0] = "5x Bonus",
-}
-
-UpdateMultiplier.Event:Connect(function(mult)
-	currentMultiplier = mult
-end)
-
-AreaUpdated.OnClientEvent:Connect(function(info)
-	if info.currentArea then currentAreaIndex = info.currentArea end
-end)
-
-AreaChanged.OnClientEvent:Connect(function(info)
-	if info.newArea then currentAreaIndex = info.newArea end
-	player:SetAttribute("HabitatVisualOffset", 0)
-end)
-
-local PrestigeComplete = ReplicatedStorage.RemoteEvents:FindFirstChild("PrestigeComplete")
-if PrestigeComplete then
-	PrestigeComplete.OnClientEvent:Connect(function()
-		player:SetAttribute("HabitatVisualOffset", 0)
-	end)
-end
-
-local function FormatCurrency(n)
-	local num = tonumber(n) or 0
-	if num < 1000 then
-		return string.format("%.2f", num)
-	else
-		return Formatter.Format(num)
-	end
-end
-
-local function FormatNumber(n)
-	return Formatter.Format(math.floor(tonumber(n) or 0))
-end
-
----------------------------------------------------------------
--- UNIVERSAL JUICY VISUALS
----------------------------------------------------------------
-local function PlayJuiceEffect(exactAmount, currencyType)
-	local isAura = (currencyType == "Auras")
-	local targetLabel = isAura and gaurasLabel or currLabel
-
-	local pendingKey = isAura and "LocalPendingAuras" or "LocalPendingPayout"
-	local addKey = isAura and "VisualAurasToAdd" or "VisualCashToAdd"
-
-	local currentPending = player:GetAttribute(pendingKey) or 0
-	player:SetAttribute(pendingKey, currentPending + exactAmount)
-
-	local targetPos = targetLabel.AbsolutePosition
-	local targetSize = targetLabel.AbsoluteSize
-
-	local popupWidth = 250
-	local popupHeight = 70
-	local startX = targetPos.X - popupWidth - 40 
-	local startY = targetPos.Y + (targetSize.Y / 2) - (popupHeight / 2) 
-
-	local endPos2D = targetPos + (targetSize / 2)
-
-	local effectGui = Instance.new("ScreenGui")
-	effectGui.Name = "JuiceGui_" .. currencyType
-	effectGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-	effectGui.Parent = playerGui
-
-	local popupText = Instance.new("TextLabel")
-	popupText.Text = (isAura and "+" or "+$") .. FormatCurrency(exactAmount)
-	popupText.Font = Enum.Font.FredokaOne
-	popupText.TextScaled = true
-	popupText.TextColor3 = isAura and Color3.fromRGB(255, 215, 0) or Color3.fromRGB(85, 255, 127)
-	popupText.BackgroundTransparency = 1
-	popupText.TextXAlignment = Enum.TextXAlignment.Right 
-	popupText.Size = UDim2.new(0, popupWidth, 0, popupHeight)
-	popupText.Position = UDim2.new(0, startX, 0, startY)
-	popupText.ZIndex = 100
-	popupText.Parent = effectGui
-
-	local textStroke = Instance.new("UIStroke", popupText)
-	textStroke.Color = isAura and Color3.fromRGB(80, 50, 0) or Color3.fromRGB(0, 50, 0)
-	textStroke.Thickness = 3
-
-	local textScale = Instance.new("UIScale", popupText)
-	textScale.Scale = 0
-
-	TweenService:Create(textScale, TweenInfo.new(0.4, Enum.EasingStyle.Bounce, Enum.EasingDirection.Out), {Scale = 1.2}):Play()
-
-	task.delay(0.6, function()
-		TweenService:Create(popupText, TweenInfo.new(0.8, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {
-			Position = UDim2.new(0, startX - 120, 0, startY),
-			TextTransparency = 1
-		}):Play()
-		TweenService:Create(textStroke, TweenInfo.new(0.8), {Transparency = 1}):Play()
-	end)
-
-	local sfxFolder = ReplicatedStorage:FindFirstChild("SFX") or ReplicatedStorage:FindFirstChild("Sounds")
-	if sfxFolder and sfxFolder:FindFirstChild("CashRegister") then
-		local sfx = sfxFolder.CashRegister:Clone()
-		if isAura then sfx.Pitch = 1.3 end 
-		sfx.Parent = game:GetService("SoundService")
-		sfx:Play()
-		Debris:AddItem(sfx, 2)
-	end
-
-	local iconCount = 10
-	local iconSize = 40
-	local iconId = "rbxassetid://14916846070" 
-
-	if isAura then
-		iconId = "rbxassetid://4483362458" 
-		if exactAmount < 100 then
-			iconCount = math.min(exactAmount, 30)
-			iconSize = 35 
-		elseif exactAmount < 1000 then
-			iconCount = math.min(math.ceil(exactAmount / 10), 30)
-			iconSize = 55 
-		else
-			iconCount = math.min(math.ceil(exactAmount / 100), 30)
-			iconSize = 80 
-		end
-	end
-
-	local chunkAmount = exactAmount / iconCount
-	local coinsHit = 0
-
-	for i = 1, iconCount do
-		local coin = Instance.new("ImageLabel")
-		coin.Image = iconId
-		if isAura then coin.ImageColor3 = Color3.fromRGB(255, 215, 0) end 
-		coin.BackgroundTransparency = 1
-		coin.Size = UDim2.new(0, iconSize, 0, iconSize)
-
-		local coinStartX = startX + popupWidth - (iconSize * 1.5)
-		local coinStartY = startY + (popupHeight / 2) - (iconSize / 2)
-
-		coin.Position = UDim2.new(0, coinStartX, 0, coinStartY)
-		coin.ZIndex = 90
-		coin.Parent = effectGui
-
-		local randomOffsetX = math.random(-80, 80)
-		local randomOffsetY = math.random(-80, 80)
-		local burstPos = UDim2.new(0, coinStartX + randomOffsetX, 0, coinStartY + randomOffsetY)
-
-		local burstTween = TweenService:Create(coin, TweenInfo.new(0.3, Enum.EasingStyle.Cubic, Enum.EasingDirection.Out), {
-			Position = burstPos,
-			Rotation = math.random(-180, 180)
-		})
-		burstTween:Play()
-
-		burstTween.Completed:Connect(function()
-			local flyTween = TweenService:Create(coin, TweenInfo.new(0.4 + (i * 0.02), Enum.EasingStyle.Back, Enum.EasingDirection.In), {
-				Position = UDim2.new(0, endPos2D.X - (iconSize/2), 0, endPos2D.Y - (iconSize/2)),
-				Size = UDim2.new(0, iconSize/2, 0, iconSize/2),
-				ImageTransparency = 0.3
-			})
-			flyTween:Play()
-
-			flyTween.Completed:Connect(function()
-				if coin.Parent then coin:Destroy() end
-				coinsHit += 1
-
-				player:SetAttribute(addKey, chunkAmount)
-
-				local pending = player:GetAttribute(pendingKey) or 0
-				player:SetAttribute(pendingKey, math.max(0, pending - chunkAmount))
-
-				if sfxFolder and sfxFolder:FindFirstChild("CoinTick") then
-					local sfx = sfxFolder.CoinTick:Clone()
-					sfx.Pitch = (isAura and 1.8 or 1.5) + (math.random()*0.2)
-					sfx.Parent = game:GetService("SoundService")
-					sfx:Play()
-					Debris:AddItem(sfx, 1)
-				end
-
-				local ts = targetLabel:FindFirstChildOfClass("UIScale") or Instance.new("UIScale", targetLabel)
-				ts.Scale = 1.1
-				TweenService:Create(ts, TweenInfo.new(0.1, Enum.EasingStyle.Sine), {Scale = 1}):Play()
-			end)
-		end)
-	end
-
-	task.delay(3, function()
-		if effectGui.Parent then effectGui:Destroy() end
-		if coinsHit < iconCount then
-			local remaining = (iconCount - coinsHit) * chunkAmount
-			player:SetAttribute(addKey, remaining)
-			player:SetAttribute(pendingKey, 0)
-		end
-	end)
-end
-
----------------------------------------------------------------
--- DYNAMIC 3D PLATFORM SPAWNER
----------------------------------------------------------------
-local function CreatePlatform(spawnCFrame, multiplierColor)
-	local areaFolder = ReplicatedStorage:FindFirstChild("AreaAssets") and ReplicatedStorage.AreaAssets:FindFirstChild("Area" .. currentAreaIndex)
-	local template = areaFolder and areaFolder:FindFirstChild("PlatformModel")
-
-	if not template then
-		template = ReplicatedStorage:FindFirstChild("PlatformModel")
-	end
-
-	local platform
-
-	if template and template:IsA("Model") then
-		platform = template:Clone()
-		platform:PivotTo(spawnCFrame)
-
-		for _, part in ipairs(platform:GetDescendants()) do
-			if part:IsA("BasePart") and (part.Name == "Glow" or part.Material == Enum.Material.Neon) then
-				part.Color = multiplierColor
-			end
-		end
-	else
-		platform = Instance.new("Part")
-		platform.Name = "HoverPlatform"
-		platform.Size = Vector3.new(8, 0.5, 8)
-		platform.Anchored = true
-		platform.CastShadow = false
-		platform.Material = Enum.Material.Neon
-		platform.Color = multiplierColor
-		platform.CFrame = spawnCFrame
-
-		local light = Instance.new("PointLight")
-		light.Brightness = 2
-		light.Range = 12
-		light.Color = multiplierColor
-		light.Parent = platform
-	end
-
-	platform.Parent = workspace
-	return platform
-end
-
-local function AttachLabels(platformRoot, payout, multiplier)
-	if not platformRoot then return end
-
-	local payoutBB = Instance.new("BillboardGui")
-	payoutBB.Size = UDim2.new(8, 0, 2.5, 0) 
-	payoutBB.StudsOffset = Vector3.new(0, 5, 0)
-	payoutBB.AlwaysOnTop = false
-	payoutBB.Adornee = platformRoot
-	payoutBB.Parent = platformRoot
-
-	local payoutLabel = Instance.new("TextLabel")
-	payoutLabel.Size = UDim2.new(1, 0, 1, 0)
-	payoutLabel.BackgroundTransparency = 1
-	payoutLabel.Text = "$" .. FormatCurrency(payout)
-	payoutLabel.TextColor3 = Color3.fromRGB(100, 255, 100)
-	payoutLabel.TextScaled = true
-	payoutLabel.Font = Enum.Font.GothamBold
-	payoutLabel.TextStrokeTransparency = 1
-	payoutLabel.TextTransparency = 1
-	payoutLabel.Parent = payoutBB
-
-	local payoutStroke = Instance.new("UIStroke", payoutLabel)
-	payoutStroke.Thickness = 3
-	payoutStroke.Color = Color3.fromRGB(0, 40, 0)
-
-	local multBB = Instance.new("BillboardGui")
-	multBB.Size = UDim2.new(6, 0, 1.5, 0) 
-	multBB.StudsOffset = Vector3.new(0, 2.5, 0)
-	multBB.AlwaysOnTop = false
-	multBB.Adornee = platformRoot
-	multBB.Parent = platformRoot
-
-	local multLabel = Instance.new("TextLabel")
-	multLabel.Size = UDim2.new(1, 0, 1, 0)
-	multLabel.BackgroundTransparency = 1
-	multLabel.Text = MultiplierNames[multiplier] or "No Bonus"
-	multLabel.TextColor3 = MultiplierColors[multiplier] or Color3.fromRGB(255, 255, 255)
-	multLabel.TextScaled = true
-	multLabel.Font = Enum.Font.Gotham
-	multLabel.TextStrokeTransparency = 1
-	multLabel.TextTransparency = 1
-	multLabel.Parent = multBB
-
-	local multStroke = Instance.new("UIStroke", multLabel)
-	multStroke.Thickness = 2.5
-	multStroke.Color = Color3.fromRGB(0, 0, 0)
-
-	TweenService:Create(payoutLabel, TweenInfo.new(0.3), { TextTransparency = 0 }):Play()
-	TweenService:Create(multLabel, TweenInfo.new(0.3), { TextTransparency = 0 }):Play()
-end
-
-local function PayoutPopup(position, payout, multiplier)
-	local anchor = Instance.new("Part")
-	anchor.Size = Vector3.new(0.1, 0.1, 0.1)
-	anchor.Anchored = true
-	anchor.Transparency = 1
-	anchor.CanCollide = false
-	anchor.Position = position
-	anchor.Parent = workspace
-
-	local bb = Instance.new("BillboardGui")
-	bb.Size = UDim2.new(10, 0, 2.5, 0) 
-	bb.StudsOffset = Vector3.new(0, 7, 0)
-	bb.AlwaysOnTop = false
-	bb.Adornee = anchor
-	bb.Parent = anchor
-
-	local label = Instance.new("TextLabel")
-	label.Size = UDim2.new(1, 0, 1, 0)
-	label.BackgroundTransparency = 1
-	label.Text = "+ $" .. FormatCurrency(payout)
-	label.TextColor3 = MultiplierColors[multiplier] or Color3.fromRGB(100, 255, 100)
-	label.TextScaled = true
-	label.Font = Enum.Font.GothamBold
-	label.TextStrokeTransparency = 1
-	label.TextTransparency = 0
-	label.Parent = bb
-
-	local lStroke = Instance.new("UIStroke", label)
-	lStroke.Thickness = 3
-	lStroke.Color = Color3.fromRGB(0, 0, 0)
-
-	TweenService:Create(bb, TweenInfo.new(1.8, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), { StudsOffset = Vector3.new(0, 18, 0) }):Play()
-	task.delay(0.6, function()
-		TweenService:Create(label, TweenInfo.new(1.0, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { TextTransparency = 1 }):Play()
-		TweenService:Create(lStroke, TweenInfo.new(1.0, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Transparency = 1 }):Play()
-	end)
-	Debris:AddItem(anchor, 2.5)
-end
-
-local function GetAuraBlocksNearHabitat()
-	local blocks = {}
-	local habitatPos = GetHabitatPos()  
-
-	for _, obj in ipairs(workspace:GetChildren()) do
-		if obj.Name == "HoverPlatform" or obj == HabitatHolder then
-			continue
-		end
-
-		local rootPart = nil
-		local isCube = false
-
-		if obj:GetAttribute("AuraCube") then
-			isCube = true
-			if obj:IsA("Model") then
-				rootPart = obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart")
-			elseif obj:IsA("BasePart") then
-				rootPart = obj
-			end
-		elseif obj:IsA("Part") and obj.Material == Enum.Material.Neon then
-			isCube = true
-			rootPart = obj
-		end
-
-		if isCube and rootPart then
-			local dist = (rootPart.Position - habitatPos).Magnitude  
-			if dist < 20 then
-				table.insert(blocks, { instance = obj, rootPart = rootPart })
-			end
-		end
-	end
-	return blocks
-end
-
-local function MagnetBlocks(platformRoot, blocks, count)
-	if not platformRoot then return end
-	local collected = math.min(#blocks, count)
-	if collected == 0 then return end
-
-	local tweensDone = 0
-	local tweensStarted = 0
-
-	for i = 1, collected do
-		local block = blocks[i]
-		if not block or not block.rootPart or not block.rootPart.Parent then continue end
-
-		local rootPart = block.rootPart
-		local instance = block.instance
-
-		rootPart.Anchored = true
-
-		local tweenProps = { Position = platformRoot.Position }
-		if instance:IsA("BasePart") then
-			tweenProps.Size = Vector3.new(0.1, 0.1, 0.1)
-		end
-
-		local tween = TweenService:Create(rootPart,
-			TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
-			tweenProps
-		)
-
-		tweensStarted += 1
-		tween.Completed:Connect(function()
-			PoolManager.ReturnAura(instance)
-			tweensDone += 1
-
-			local currentOffset = player:GetAttribute("HabitatVisualOffset") or 0
-			player:SetAttribute("HabitatVisualOffset", math.max(0, currentOffset - 1))
-		end)
-		tween:Play()
-		task.wait(0.05)
-	end
-
-	local timeout = tick() + 3
-	while tweensDone < tweensStarted and tick() < timeout do
-		task.wait(0.05)
-	end
-end
-
-local function ProcessPlatform(info)
-	if info.collected == 0 then return end
-
-	local myPayout     = info.payout
-	local myMultiplier = currentMultiplier
-	local myDispatchId = info.dispatchId
-	local multColor    = MultiplierColors[myMultiplier] or Color3.fromRGB(255, 255, 255)
-
-	local activeSpawn = workspace:FindFirstChild("TruckSpawn", true)
-	local activeDest  = workspace:FindFirstChild("TruckDestination", true)
-
-	if not activeSpawn or not activeDest then
-		warn("TruckSpawn or TruckDestination not found! Ensure they exist in the current Area model.")
-		return
-	end
-
-	local spawnCF = activeSpawn:IsA("Model") and activeSpawn:GetPivot() or activeSpawn.CFrame
-	local destCF  = activeDest:IsA("Model") and activeDest:GetPivot() or activeDest.CFrame
-
-	spawnCF = spawnCF + Vector3.new(0, AdminConfig.PlatformHoverHeight, 0)
-	destCF  = destCF + Vector3.new(0, AdminConfig.PlatformHoverHeight, 0)
-
-	local platform = CreatePlatform(spawnCF, multColor)
-	local platformRoot = platform:IsA("Model") and (platform.PrimaryPart or platform:FindFirstChildWhichIsA("BasePart")) or platform
-
-	local thrusterAtt = Instance.new("Attachment")
-	thrusterAtt.Position = Vector3.new(0, -1, 0)
-	thrusterAtt.Parent = platformRoot
-
-	local thrusterVFX = Instance.new("ParticleEmitter")
-	thrusterVFX.Color = ColorSequence.new(multColor)
-
-	thrusterVFX.Size = NumberSequence.new({
-		NumberSequenceKeypoint.new(0, 0),
-		NumberSequenceKeypoint.new(0.5, 0),
-		NumberSequenceKeypoint.new(1, 1)
-	})
-
-	thrusterVFX.Lifetime = NumberRange.new(0.3, 0.6)
-	thrusterVFX.Rate = 50
-	thrusterVFX.Speed = NumberRange.new(5, 10)
-	thrusterVFX.EmissionDirection = Enum.NormalId.Bottom
-	thrusterVFX.Parent = thrusterAtt
-
-	local habitatPos = GetHabitatPos()
-	local midCF = CFrame.new(habitatPos + Vector3.new(0, AdminConfig.PlatformHoverHeight, 0))
-
-	midCF = CFrame.new(midCF.Position) * spawnCF.Rotation 
-	destCF = CFrame.new(destCF.Position) * spawnCF.Rotation
-
-	local cframeProxy = Instance.new("CFrameValue")
-	cframeProxy.Value = spawnCF
-	cframeProxy.Changed:Connect(function(val)
-		if platform:IsA("Model") then
-			platform:PivotTo(val)
-		else
-			platform.CFrame = val
-		end
-	end)
-
-	local distIn = (spawnCF.Position - midCF.Position).Magnitude
-	local tweenIn = TweenService:Create(cframeProxy,
-		TweenInfo.new(math.max(0.1, distIn / AdminConfig.PlatformSpeed), Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-		{ Value = midCF }
-	)
-	tweenIn:Play()
-	tweenIn.Completed:Wait()
-
-	AttachLabels(platformRoot, myPayout, myMultiplier)
-	PayoutPopup(platformRoot.Position, myPayout, myMultiplier)
-
-	local blocks = GetAuraBlocksNearHabitat()
-	MagnetBlocks(platformRoot, blocks, info.collected)
-
-	task.wait(0.5)
-	HabitatFullEvent:Fire(false)
-
-	local distOut = (midCF.Position - destCF.Position).Magnitude
-	local tweenOut = TweenService:Create(cframeProxy,
-		TweenInfo.new(math.max(0.1, distOut / AdminConfig.PlatformSpeed), Enum.EasingStyle.Quad, Enum.EasingDirection.In),
-		{ Value = destCF }
-	)
-	tweenOut:Play()
-	tweenOut.Completed:Wait()
-
-	cframeProxy:Destroy()
-	platform:Destroy()
-	ShipAurasBridge:Fire({ action = "payout", value = myDispatchId })
-end
-
-local function ProcessQueue()
-	if processingPlatform then return end
-	processingPlatform = true
-
-	while #platformQueue > 0 do
-		local nextInfo = table.remove(platformQueue, 1)
-		ProcessPlatform(nextInfo)
-	end
-
-	processingPlatform = false
-end
-
-ShipAurasBridge:Connect(function(info)
-	if type(info) ~= "table" then return end
-	if info.action == "payoutConfirmed" then
-		PlayJuiceEffect(info.amount, "Currency")
-	elseif info.action == "playJuice" then
-		PlayJuiceEffect(info.amount, info.currencyType)
-	else
-		table.insert(platformQueue, info)
-		task.spawn(ProcessQueue)
-	end
-end)
-
-local LocalJuiceEvent = ReplicatedStorage:FindFirstChild("LocalJuiceEvent")
-if not LocalJuiceEvent then
-	LocalJuiceEvent = Instance.new("BindableEvent")
-	LocalJuiceEvent.Name = "LocalJuiceEvent"
-	LocalJuiceEvent.Parent = ReplicatedStorage
-end
-LocalJuiceEvent.Event:Connect(function(exactAmount, currencyType)
-	PlayJuiceEffect(exactAmount, currencyType)
-end)
 
 local DataStoreService  = game:GetService("DataStoreService")
 local Players           = game:GetService("Players")
@@ -3139,3 +4023,155 @@ game:BindToClose(function()
 end)
 
 return GameManager
+
+-- PoolManager
+-- Location: ReplicatedStorage > Modules > PoolManager
+-- Handles all Object Pooling for Auras to eliminate client-side cloning lag!
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local AreaRegistry = require(ReplicatedStorage.Modules:WaitForChild("AreaRegistry"))
+
+local PoolManager = {}
+
+local POOL_SIZES = {
+	Common    = 500,
+	Uncommon  = 500,
+	Rare      = 300,
+	Epic      = 150,
+	Legendary = 50,
+}
+
+local DEFAULT_POOL_SIZE = 10
+
+local poolFolder = workspace:FindFirstChild("AuraPoolCache")
+if not poolFolder then
+	poolFolder = Instance.new("Folder")
+	poolFolder.Name = "AuraPoolCache"
+	poolFolder.Parent = workspace
+end
+
+local pools = {}
+
+local function SleepAura(instance)
+	local success = pcall(function()
+		instance.Parent = poolFolder
+	end)
+
+	if not success then return false end
+
+	if instance:IsA("Model") then
+		if instance.PrimaryPart then
+			instance.PrimaryPart.Anchored = true
+			instance.PrimaryPart.AssemblyLinearVelocity = Vector3.zero
+			instance.PrimaryPart.AssemblyAngularVelocity = Vector3.zero
+		end
+		instance:PivotTo(CFrame.new(0, -10000, 0))
+	elseif instance:IsA("BasePart") then
+		instance.Anchored = true
+		instance.AssemblyLinearVelocity = Vector3.zero
+		instance.AssemblyAngularVelocity = Vector3.zero
+		instance.Position = Vector3.new(0, -10000, 0)
+	end
+
+	for _, desc in ipairs(instance:GetDescendants()) do
+		if desc:IsA("ParticleEmitter") or desc:IsA("Trail") then
+			desc.Enabled = false
+		end
+	end
+
+	return true
+end
+
+local function CreateNewAura(areaId, tierName)
+	local newAura = AreaRegistry.FetchAuraModel(areaId, tierName)
+
+	if not newAura then
+		newAura = Instance.new("Part")
+		newAura.Size = Vector3.new(1.5, 1.5, 1.5)
+		newAura.Material = Enum.Material.Neon
+		newAura.CastShadow = false
+	end
+
+	newAura:SetAttribute("PoolAreaId", areaId)
+	newAura:SetAttribute("PoolTierName", tierName)
+	newAura:SetAttribute("AuraCube", true)
+
+	return newAura
+end
+
+function PoolManager.InitializeArea(areaId)
+	if type(areaId) == "string" then return end
+
+	if pools[areaId] then return end 
+	pools[areaId] = {}
+
+	for tierName, count in pairs(POOL_SIZES) do
+		pools[areaId][tierName] = {}
+		for i = 1, count do
+			local aura = CreateNewAura(areaId, tierName)
+			SleepAura(aura)
+			table.insert(pools[areaId][tierName], aura)
+		end
+	end
+	print("PoolManager: Initialized Area " .. tostring(areaId) .. " with " .. tostring(#pools[areaId].Common) .. " Common Auras in cache.")
+end
+
+function PoolManager.GetAura(areaId, tierName)
+	if not pools[areaId] then pools[areaId] = {} end
+	if not pools[areaId][tierName] then pools[areaId][tierName] = {} end
+
+	local auraList = pools[areaId][tierName]
+	local aura = nil
+
+	if #auraList > 0 then
+		aura = table.remove(auraList)
+	else
+		aura = CreateNewAura(areaId, tierName)
+	end
+
+	return aura
+end
+
+function PoolManager.ReturnAura(instance)
+	if not instance or not instance.Parent then return end
+
+	local areaId = instance:GetAttribute("PoolAreaId")
+	local tierName = instance:GetAttribute("PoolTierName")
+
+	if areaId and tierName then
+		if not pools[areaId] then pools[areaId] = {} end
+		if not pools[areaId][tierName] then pools[areaId][tierName] = {} end
+
+		if table.find(pools[areaId][tierName], instance) then return end
+
+		if SleepAura(instance) then
+			table.insert(pools[areaId][tierName], instance)
+		else
+			pcall(function() instance:Destroy() end)
+		end
+	else
+		pcall(function() instance:Destroy() end)
+	end
+end
+
+-- NEW FIX: Completely wipe the cache of all models to prevent picking up destroyed instances
+function PoolManager.ClearPools()
+	for areaId, tiers in pairs(pools) do
+		for tierName, list in pairs(tiers) do
+			for _, aura in ipairs(list) do
+				if aura then
+					pcall(function() aura:Destroy() end)
+				end
+			end
+		end
+	end
+	table.clear(pools)
+
+	if poolFolder then
+		poolFolder:ClearAllChildren()
+	end
+
+	print("PoolManager: Successfully purged all cached auras due to Area Change.")
+end
+
+return PoolManager
