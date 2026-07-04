@@ -1,991 +1,4 @@
-local DataStoreService  = game:GetService("DataStoreService")
-local Players           = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local ServerScriptService = game:GetService("ServerScriptService")
-
-local PlayerDB       = DataStoreService:GetDataStore("PlayerData_v1")
-local AdminConfig    = require(ReplicatedStorage.Modules.AdminConfig)	
-local UpgradeConfig  = require(ReplicatedStorage.Modules.UpgradeConfig)
-local MutationConfig = require(ReplicatedStorage.Modules.MutationConfig)
-local EpicUpgradeConfig = require(ReplicatedStorage.Modules:WaitForChild("EpicUpgradeConfig"))
-
-local BridgeNet2      = require(ReplicatedStorage.Modules:WaitForChild("BridgeNet2"))
-local UpdateHUDBridge = BridgeNet2.ServerBridge("UpdateHUD")
-local BankActionBridge = BridgeNet2.ServerBridge("BankAction")
-
-local AreaChanged = ReplicatedStorage.RemoteEvents:WaitForChild("AreaChanged")
-
-local SAVE_COOLDOWN = 7
-
-local function DefaultData()
-	return {
-		currency      = 0,
-		totalEarned   = 0,
-		soulAuras     = 0,
-		prestigeCount = 0,
-		pendingAuras        = 0,
-		upgrades = { dropRate=0, blockValue=0, habitatCapacity=0, autoShipper=0, mutationSpeed=0, mutationTierChance=0, passiveTickSpeed=0, hatcheryCapacity=0 },
-		totalCubesProduced    = 0,
-		totalPlatformsShipped = 0,
-		totalLegendaryCubes   = 0,
-		totalMythicCubes      = 0,
-		totalDivineCubes      = 0,
-		totalCelestialCubes   = 0,
-		totalCosmicCubes      = 0,
-		totalOmniCubes        = 0,
-		settings = { sfxEnabled=true, musicEnabled=true },
-		farmEvaluation = 0,
-		currentArea    = 1,
-		unlockedAreas  = { 1 },
-		goldenAuras = AdminConfig.GoldenAuraStart or 10,
-		piggyBank = 0,
-		highestPiggyBank = 0,
-		piggyBankBroken = 0,
-		aurmers = 0,
-		inSpecialArea = false,
-		boostInventory = { AuraRush=0, SpawnBoost=0, SoulBoost=0 },
-		hasPrestigedThisArea = false,
-		epicUpgrades         = {},
-		tutorialProgress     = {},
-		tutorialComplete     = false,
-		claimedMail          = {},
-		unlockedMail         = {},
-		claimedBadges        = {},
-		claimedChallenges    = {},
-		claimedAuras         = {},
-		discoveredTiers      = {}
-	}
-end
-
-local function DefaultRuntime()
-	return {
-		cubes              = {},
-
-		-- O(1) Amortized Queue System
-		cubeQueue          = {},
-		cubeQueueHead      = 1,
-		cubeQueueTail      = 0,
-
-		cubeCount          = 0,
-		storedCubeCount    = 0,
-
-		activeMutatedValue = 0,
-
-		nextCubeId         = 1,
-		totalMutatedValue  = 0,
-		lastActiveTime     = tick(),
-		sessionStart       = tick(),
-	}
-end
-
-local PlayerData    = {}
-local PlayerRuntime = {}
-local lastSaveTick  = {}
-local pendingSave   = {}
-
-local function DeepMerge(saved, defaults)
-	for key, defaultValue in pairs(defaults) do
-		if saved[key] == nil then
-			saved[key] = defaultValue
-		elseif type(defaultValue) == "table" and type(saved[key]) == "table" and not getmetatable(saved[key]) then
-			if defaultValue[1] == nil then DeepMerge(saved[key], defaultValue) end
-		end
-	end
-end
-
-local function EnsureUnlockedAreas(data)
-	if type(data.unlockedAreas) ~= "table" then data.unlockedAreas = { 1 } end
-	local has1, hasCurrent = false, false
-	for _, v in ipairs(data.unlockedAreas) do
-		if v == 1 then has1 = true end
-		if v == data.currentArea then hasCurrent = true end
-	end
-	if not has1 then table.insert(data.unlockedAreas, 1) end
-	if not hasCurrent and data.currentArea ~= 1 then table.insert(data.unlockedAreas, data.currentArea) end
-end
-
-local function SaveData(player)
-	local uid  = player.UserId
-	local data = PlayerData[uid]
-	if not data then return end
-	local now, last = tick(), lastSaveTick[uid] or 0
-	if now - last >= SAVE_COOLDOWN then
-		lastSaveTick[uid] = now
-		pcall(function() PlayerDB:SetAsync("Player_" .. uid, data) end)
-	else
-		if not pendingSave[uid] then
-			pendingSave[uid] = true
-			task.delay(SAVE_COOLDOWN - (now - last) + 0.5, function()
-				pendingSave[uid] = nil
-				if player and player.Parent and PlayerData[uid] then
-					pcall(function() PlayerDB:SetAsync("Player_" .. uid, PlayerData[uid]) end)
-					lastSaveTick[uid] = tick()
-				end
-			end)
-		end
-	end
-end
-
-local function LoadData(player)
-	local key      = "Player_" .. player.UserId
-	local ok, data = pcall(function() return PlayerDB:GetAsync(key) end)
-
-	if ok and data then
-		DeepMerge(data, DefaultData())
-		PlayerData[player.UserId] = data
-	else
-		PlayerData[player.UserId] = DefaultData()
-	end
-
-	local d = PlayerData[player.UserId]
-	EnsureUnlockedAreas(d)
-	PlayerRuntime[player.UserId] = DefaultRuntime()
-
-	if AdminConfig.WipeMoneyOnLoad then
-		d.currency=0; d.totalEarned=0; d.pendingAuras=0; d.pendingPayout=0; d.pendingBonusPayout=0; d.lastPayout=0
-		for k in pairs(d.upgrades) do d.upgrades[k] = 0 end
-		d.totalCubesProduced=0; d.totalPlatformsShipped=0; d.totalLegendaryCubes=0
-		d.totalMythicCubes=0; d.totalDivineCubes=0; d.totalCelestialCubes=0; d.totalCosmicCubes=0; d.totalOmniCubes=0
-		d.piggyBank=0; d.highestPiggyBank=0; d.piggyBankBroken=0; d.farmEvaluation=0; d.goldenAuras=AdminConfig.GoldenAuraStart or 10
-		d.aurmers=0; d.inSpecialArea=false
-		d.boostInventory={ AuraRush=0, SpawnBoost=0, SoulBoost=0 }
-		d.hasPrestigedThisArea=false; d.claimedMail={}; d.tutorialProgress={}; d.tutorialComplete=false
-	end
-
-	if AdminConfig.WipePrestigeOnLoad then d.soulAuras=0; d.prestigeCount=0; d.hasPrestigedThisArea=false end
-	if AdminConfig.WipeAreaOnLoad then d.currentArea=1; d.farmEvaluation=0; d.unlockedAreas={ 1 }; d.hasPrestigedThisArea=false end
-	if AdminConfig.WipeEpicOnLoad then d.goldenAuras = AdminConfig.GoldenAuraStart or 0; d.epicUpgrades = {} end
-
-	if AdminConfig.WipeAchievementsOnLoad then 
-		d.totalCubesProduced=0; d.totalPlatformsShipped=0; d.totalLegendaryCubes=0
-		d.totalMythicCubes=0; d.totalDivineCubes=0; d.totalCelestialCubes=0; d.totalCosmicCubes=0; d.totalOmniCubes=0
-		d.claimedBadges={}; d.claimedChallenges={}; d.claimedAuras={}; d.discoveredTiers={}
-	end
-
-	if not d.epicUpgrades     then d.epicUpgrades     = {} end
-	if not d.tutorialProgress then d.tutorialProgress = {} end
-	if d.tutorialComplete == nil then d.tutorialComplete = false end
-	if not d.claimedMail      then d.claimedMail      = {} end
-	if not d.unlockedMail     then d.unlockedMail     = {} end
-	if d.hasPrestigedThisArea == nil then d.hasPrestigedThisArea = false end
-
-	d.inSpecialArea = false
-
-	task.wait(1)
-	if not player or not player.Parent then return end
-
-	local upgradesState = {}
-	for upgradeId, level in pairs(d.upgrades or {}) do upgradesState[upgradeId] = { level = level } end
-
-	local epicUpgradesState = {}
-	for upgradeId, level in pairs(d.epicUpgrades or {}) do epicUpgradesState[upgradeId] = { level = level } end
-
-	UpdateHUDBridge:Fire(player, {
-		currency=d.currency, pendingAuras=0, 
-		habitatCapacity = UpgradeConfig.GetHabitatCapacity(d), 
-		shipCapacity = UpgradeConfig.GetShippingCapacity(d) or (AdminConfig.PlatformCapacity or 5), rate=0, 
-		passiveInterval = UpgradeConfig.GetPassiveInterval(d),
-		totalEarned=d.totalEarned or 0, soulAuras=d.soulAuras or 0, farmEvaluation=d.farmEvaluation or 0,
-		goldenAuras=d.goldenAuras or 0, 
-		piggyBank=d.piggyBank or 0, piggyBankBroken=d.piggyBankBroken or 0, highestPiggyBank=d.highestPiggyBank or 0,
-		aurmers=d.aurmers or 0, inSpecialArea=d.inSpecialArea or false,
-		boostInventory=d.boostInventory or {}, settings=d.settings or {},
-		prestigeCount=d.prestigeCount or 0, hasPrestigedThisArea=d.hasPrestigedThisArea or false,
-		tutorialProgress=d.tutorialProgress or {}, tutorialComplete=d.tutorialComplete or false,
-		epicUpgrades=epicUpgradesState, totalCubesProduced=d.totalCubesProduced or 0,
-		currentArea=d.currentArea or 1, upgrades=upgradesState,
-	})
-
-	player:SetAttribute("LivePiggyBank", d.piggyBank or 0)
-	player:SetAttribute("HighestPiggyBank", d.highestPiggyBank or 0)
-	player:SetAttribute("PiggyBankBroken", d.piggyBankBroken or 0)
-
-	task.delay(0.5, function()
-		if not player or not player.Parent then return end
-
-		local resetState = {}
-		for tierNum, tierData in ipairs(UpgradeConfig.Tiers) do
-			for upgradeId, cfg in pairs(tierData.upgrades) do
-				local lv = d.upgrades[upgradeId] or 0
-				local maxed = lv >= cfg.maxLevel
-				resetState[upgradeId] = { level=lv, maxLevel=cfg.maxLevel, cost=maxed and 0 or UpgradeConfig.CalculateCost(upgradeId, lv, d), maxed=maxed }
-			end
-		end
-		local UpgradeUpdated = ReplicatedStorage.RemoteEvents:FindFirstChild("UpgradeUpdated")
-		if UpgradeUpdated then UpgradeUpdated:FireClient(player, { type="fullState", upgrades=resetState, currency=d.currency }) end
-
-		local epicResetState = {}
-		for tierNum, tierData in ipairs(EpicUpgradeConfig.Tiers) do
-			for upgradeId, cfg in pairs(tierData.upgrades) do
-				local lv = d.epicUpgrades[upgradeId] or 0
-				local maxed = lv >= cfg.maxLevel
-				epicResetState[upgradeId] = { level=lv, maxLevel=cfg.maxLevel, cost=maxed and 0 or EpicUpgradeConfig.CalculateCost(upgradeId, lv), maxed=maxed }
-			end
-		end
-		local EpicUpgradeUpdated = ReplicatedStorage.RemoteEvents:FindFirstChild("EpicUpgradeUpdated")
-		if EpicUpgradeUpdated then EpicUpgradeUpdated:FireClient(player, { type="fullState", upgrades=epicResetState, goldenAuras=d.goldenAuras or 0 }) end
-	end)
-end
-
-Players.PlayerAdded:Connect(LoadData)
-
-Players.PlayerRemoving:Connect(function(player)
-	SaveData(player)
-	PlayerData[player.UserId] = nil
-	PlayerRuntime[player.UserId] = nil
-end)
-
-local lastPeriodicSave = tick()
-game:GetService("RunService").Heartbeat:Connect(function()
-	if tick() - lastPeriodicSave >= 60 then
-		lastPeriodicSave = tick()
-		for _, p in ipairs(Players:GetPlayers()) do SaveData(p) end
-	end
-end)
-
-task.spawn(function()
-	local TutorialStepComplete = ReplicatedStorage.RemoteEvents:WaitForChild("TutorialStepComplete", 10)
-	if not TutorialStepComplete then return end
-	TutorialStepComplete.OnServerEvent:Connect(function(player, stepId)
-		local uid  = player.UserId
-		local data = PlayerData[uid]
-		if not data then return end
-		if not data.tutorialProgress then data.tutorialProgress = {} end
-		if stepId == "tutorialComplete" then data.tutorialComplete = true
-		elseif type(stepId) == "string" and #stepId < 100 then data.tutorialProgress[stepId] = true end
-	end)
-end)
-
-local GameManager = {}
-
-function GameManager.GetData(uid)    return PlayerData[uid]    end
-function GameManager.GetRuntime(uid) return PlayerRuntime[uid] end
-function GameManager.SavePlayer(p)   SaveData(p)               end
-
-function GameManager.PerformPrestigeReset(player)
-	local uid = player.UserId
-	local runtime = PlayerRuntime[uid]
-	if runtime then
-		runtime.cubes = {}
-		-- Reset O(1) Queue
-		runtime.cubeQueue = {}
-		runtime.cubeQueueHead = 1
-		runtime.cubeQueueTail = 0
-
-		runtime.cubeCount = 0
-		runtime.activeMutatedValue = 0
-		runtime.storedCubeCount = 0
-		runtime.totalMutatedValue = 0
-		runtime.lastActiveTime = tick()
-		runtime.sessionStart = tick()
-	end
-	SaveData(player)
-end
-
-function GameManager.AddGoldenAuras(uid, amount)
-	local data = PlayerData[uid]
-	if not data then return 0 end
-
-	local epicBonus = 0
-	pcall(function()
-		local EpicUpgradeManager = require(ReplicatedStorage.Modules:WaitForChild("EpicUpgradeManager"))
-		epicBonus = EpicUpgradeManager.GetBonus(uid, "goldenAuraValue") or 0
-	end)
-
-	local finalAmount = math.floor(amount * (1 + epicBonus))
-	data.goldenAuras = (data.goldenAuras or 0) + finalAmount
-
-	local player = Players:GetPlayerByUserId(uid)
-	if player then
-		UpdateHUDBridge:Fire(player, { goldenAuras = data.goldenAuras })
-	end
-
-	return finalAmount
-end
-
-function GameManager.AddPiggyBank(uid, rawAmount)
-	local BankFillEvent = game:GetService("ServerScriptService"):FindFirstChild("BankFillEvent")
-	if BankFillEvent then
-		BankFillEvent:Fire(uid, rawAmount)
-	else
-		warn("[GameManager] BankFillEvent not found! PiggyBank visual routing failed.")
-	end
-end
-
-function GameManager.AddCube(uid, cubeRecord)
-	local runtime = PlayerRuntime[uid]
-	if not runtime then return nil end
-
-	local id = runtime.nextCubeId
-	runtime.nextCubeId += 1	
-	runtime.cubes[id] = cubeRecord
-
-	local val = MutationConfig.GetMutatedValue(cubeRecord)
-	runtime.totalMutatedValue += val
-
-	if not cubeRecord.isStored then
-		runtime.activeMutatedValue += val
-	else
-		runtime.storedCubeCount += 1
-
-		-- Append straight to the queue if spawned directly into storage
-		runtime.cubeQueueTail += 1
-		runtime.cubeQueue[runtime.cubeQueueTail] = id
-	end
-
-	runtime.cubeCount += 1
-	return id
-end
-
--- AFTER
-function GameManager.MarkCubeStored(uid, cubeId)
-	local runtime = PlayerRuntime[uid]
-	local data    = PlayerData[uid]
-	if not runtime or not data then return false end
-
-	local cube = runtime.cubes[cubeId]
-	if not cube or cube.isStored then return false end
-
-	-- HARD CAP: never let storedCubeCount exceed current habitat capacity,
-	-- even if this cube was already in-flight before the gate tripped.
-	local capacity = UpgradeConfig.GetHabitatCapacity(data)
-	if runtime.storedCubeCount >= capacity then
-		return false
-	end
-
-	cube.isStored = true
-	runtime.storedCubeCount += 1
-	runtime.activeMutatedValue -= MutationConfig.GetMutatedValue(cube)
-
-	runtime.cubeQueueTail += 1
-	runtime.cubeQueue[runtime.cubeQueueTail] = cubeId
-
-	return true
-end
-
-function GameManager.RemoveCube(uid, cubeId)
-	local runtime = PlayerRuntime[uid]
-	if not runtime or not runtime.cubes[cubeId] then return end
-	local cube = runtime.cubes[cubeId]
-
-	local val = MutationConfig.GetMutatedValue(cube)
-	runtime.totalMutatedValue -= val
-
-	if cube.isStored then
-		runtime.storedCubeCount -= 1
-	else
-		runtime.activeMutatedValue -= val
-	end
-
-	-- O(1) Memory clear. CollectOldestCubes will just skip it.
-	runtime.cubes[cubeId] = nil
-	runtime.cubeCount -= 1
-end
-
-function GameManager.CollectOldestCubes(uid, count)
-	local runtime = PlayerRuntime[uid]
-	if not runtime then return {}, {} end
-
-	local collected, collectedCubes = {}, {}
-	local needed = count
-
-	-- O(1) Amortized Iteration. We only iterate front values and discard them.
-	while needed > 0 and runtime.cubeQueueHead <= runtime.cubeQueueTail do
-		local cubeId = runtime.cubeQueue[runtime.cubeQueueHead]
-
-		-- Clean up queue table memory behind us as we move the head forward
-		runtime.cubeQueue[runtime.cubeQueueHead] = nil
-		runtime.cubeQueueHead += 1
-
-		local cube = runtime.cubes[cubeId]
-
-		-- Verify it exists and is stored (avoids edge cases if it was somehow removed/smushed early)
-		if cube and cube.isStored then
-			table.insert(collected, cubeId)
-			table.insert(collectedCubes, cube)
-
-			-- Run removal logic to decrease totals/values properly
-			GameManager.RemoveCube(uid, cubeId)
-
-			needed -= 1
-		end
-	end
-
-	-- If queue becomes entirely empty, reset indexes to prevent number overflow 
-	-- (though it takes quintillions to overflow, standard practice)
-	if runtime.cubeQueueHead > runtime.cubeQueueTail then
-		runtime.cubeQueueHead = 1
-		runtime.cubeQueueTail = 0
-	end
-
-	return collected, collectedCubes
-end
-
-game:BindToClose(function()
-	print("[GameManager] Server shutting down. Forcing final save for all players...")
-	for _, player in ipairs(Players:GetPlayers()) do SaveData(player) end
-	task.wait(2)
-end)
-
-return GameManager
-
-local Players             = game:GetService("Players")
-local ReplicatedStorage   = game:GetService("ReplicatedStorage")
-local ServerScriptService = game:GetService("ServerScriptService")
-
-local TierConfig     = require(ReplicatedStorage.Modules.TierConfig)
-local UpgradeConfig  = require(ReplicatedStorage.Modules.UpgradeConfig)
-local PrestigeModule = require(ReplicatedStorage.Modules.PrestigeModule)
-local AdminConfig    = require(ReplicatedStorage.Modules.AdminConfig)
-local MutationConfig = require(ReplicatedStorage.Modules.MutationConfig)
-local AreaRegistry   = require(ReplicatedStorage.Modules.AreaRegistry)
-local GameManager    = require(ServerScriptService.GameManager)
-local BoostManager   = require(ServerScriptService.BoostManager)
-local WeatherManager = require(ServerScriptService.WeatherManager)
-local EpicUpgradeConfig = require(ReplicatedStorage.Modules:WaitForChild("EpicUpgradeConfig"))
-
-local HabitatFull    = ReplicatedStorage.RemoteEvents:WaitForChild("HabitatFull")
-
-local BridgeNet2             = require(ReplicatedStorage.Modules:WaitForChild("BridgeNet2"))
-local UpdateHUDBridge        = BridgeNet2.ServerBridge("UpdateHUD")
-local ProduceAuraBridge      = BridgeNet2.ServerBridge("ProduceAura")
-local AuraSpawnedBridge      = BridgeNet2.ServerBridge("AuraSpawned")
-local UpdateHatcheryBridge   = BridgeNet2.ServerBridge("UpdateHatchery")
-local CubeMutatedBatchBridge = BridgeNet2.ServerBridge("CubeMutatedBatch")
-local CubeSmushedBridge      = BridgeNet2.ServerBridge("CubeSmushed")
-local CubeStoredBridge       = BridgeNet2.ServerBridge("CubeStored")
-
-local HABITAT_HOLDER = workspace:WaitForChild("HabitatHolder")
-
-local function GetServerHabitatPos()
-	local posPart = HABITAT_HOLDER:FindFirstChild("Position", true)
-	if posPart and posPart:IsA("BasePart") then
-		return posPart.Position
-	end
-	return HABITAT_HOLDER:GetPivot().Position
-end
-
-local AURA_HOLDER    = workspace:WaitForChild("AuraHolder")
-
-local lastFire          = {}
-local holdStart         = {}
-local hatchery          = {}
-
-local function GetAreaAuraModels(areaId)
-	local config = nil
-	if type(AreaRegistry.GetArea) == "function" then
-		config = AreaRegistry.GetArea(areaId)
-	elseif type(AreaRegistry.GetAreaConfig) == "function" then
-		config = AreaRegistry.GetAreaConfig(areaId)
-	elseif AreaRegistry.Areas then
-		config = AreaRegistry.Areas[areaId]
-	end
-	return config and config.auraModels or nil
-end
-
-local function GetHatcheryMax(data)
-	if type(UpgradeConfig.GetHatcheryMax) == "function" then
-		return UpgradeConfig.GetHatcheryMax(data)
-	end
-	return AdminConfig.HatcheryMax or 150
-end
-
-local function GetHabitatCapacity(data)
-	if type(UpgradeConfig.GetHabitatCapacity) == "function" then
-		return UpgradeConfig.GetHabitatCapacity(data)
-	end
-	return AdminConfig.BaseHabitatCapacity or 50
-end
-
-local function GetMutationSpeedMult(data)
-	local cfg = UpgradeConfig.GetUpgradeConfig("mutationSpeed")
-	return (cfg and cfg.apply) and cfg.apply(data) or 1
-end
-
-local function TrackTierSpawn(data, tierName)
-	if tierName == "Legendary" then data.totalLegendaryCubes = (data.totalLegendaryCubes or 0) + 1
-	elseif tierName == "Mythic" then data.totalMythicCubes = (data.totalMythicCubes or 0) + 1
-	elseif tierName == "Divine" then data.totalDivineCubes = (data.totalDivineCubes or 0) + 1
-	elseif tierName == "Celestial" then data.totalCelestialCubes = (data.totalCelestialCubes or 0) + 1
-	elseif tierName == "Cosmic" then data.totalCosmicCubes = (data.totalCosmicCubes or 0) + 1
-	elseif tierName == "Omni" then data.totalOmniCubes = (data.totalOmniCubes or 0) + 1
-	end
-end
-
-Players.PlayerAdded:Connect(function(p)
-	hatchery[p.UserId] = AdminConfig.HatcheryMax
-end)
-
-Players.PlayerRemoving:Connect(function(p)
-	hatchery[p.UserId]=nil; holdStart[p.UserId]=nil; lastFire[p.UserId]=nil
-end)
-
-task.spawn(function()
-	local PR = ServerScriptService:WaitForChild("PrestigeReset", 30)
-	if PR then
-		PR.Event:Connect(function(player)
-			local uid = player.UserId
-			local data = GameManager.GetData(uid)
-			hatchery[uid] = data and GetHatcheryMax(data) or AdminConfig.HatcheryMax
-			holdStart[uid]=nil; lastFire[uid]=nil
-		end)
-	end
-end)
-
-task.spawn(function()
-	while true do
-		task.wait(0.1)
-		for _, player in ipairs(Players:GetPlayers()) do
-			local uid = player.UserId
-			local data = GameManager.GetData(uid)
-			local hatchMax = data and GetHatcheryMax(data) or AdminConfig.HatcheryMax
-			local prev = hatchery[uid] or hatchMax
-
-			local hasInstaHatchery = BoostManager.IsActive(uid, "InstaHatchery")
-			local refillMultiplier = BoostManager.GetHatcheryMultiplier(uid)
-
-			if hasInstaHatchery then
-				hatchery[uid] = hatchMax
-			else
-				if holdStart[uid] then
-					hatchery[uid] = math.max(0, prev - AdminConfig.HatcheryDrainRate * 0.1)
-				else
-					hatchery[uid] = math.min(hatchMax, prev + (AdminConfig.HatcheryRefillRate * refillMultiplier * 0.1))
-				end
-			end
-
-			if hatchery[uid] ~= prev then
-				UpdateHatcheryBridge:Fire(player, { current=hatchery[uid], max=hatchMax })
-			end
-
-			if hatchery[uid] <= 0 and holdStart[uid] then
-				holdStart[uid] = nil
-				ReplicatedStorage.RemoteEvents.ForceStopHold:FireClient(player)
-			end
-		end
-	end
-end)
-
-local function GetAFKSpeed(runtime)
-	local idleTime = tick() - runtime.lastActiveTime
-	local speed = MutationConfig.AFKDecay[1].speed
-	for _, e in ipairs(MutationConfig.AFKDecay) do
-		if idleTime >= e.time then speed = e.speed end
-	end
-	return speed
-end
-
-local function GetEffectiveFireRate(uid)
-	local rushMult = BoostManager.GetSpawnRateMultiplier(uid)
-	local weatherSpawnMult, _ = WeatherManager.GetMultipliers(uid)
-	local effectiveFireRate = AdminConfig.FireRate / (rushMult * weatherSpawnMult)
-	if effectiveFireRate < 0.05 then effectiveFireRate = 0.05 end
-	return effectiveFireRate
-end
-
-local function SendHUDUpdate(player)
-	local uid = player.UserId
-	local data = GameManager.GetData(uid)
-	local runtime = GameManager.GetRuntime(uid)
-	if not data or not runtime then return end
-
-	local storedCount = runtime.storedCubeCount or 0
-	local activeMV = runtime.activeMutatedValue or 0
-
-	local boostMult = BoostManager.GetValueMultiplier(uid) * BoostManager.GetSpawnRateMultiplier(uid)
-	local displayRate = math.floor(activeMV * boostMult)
-
-	UpdateHUDBridge:Fire(player, {
-		currency        = data.currency, 
-		pendingAuras    = storedCount, 
-		habitatCapacity = GetHabitatCapacity(data), 
-		rate            = displayRate,
-		passiveInterval = UpgradeConfig.GetPassiveInterval(data), 
-		totalEarned     = data.totalEarned or 0,
-		soulAuras       = data.soulAuras or 0, 
-		farmEvaluation  = data.farmEvaluation or 0,
-		goldenAuras     = data.goldenAuras or 0, 
-		boostInventory  = data.boostInventory or {},
-		prestigeCount   = data.prestigeCount or 0,
-		upgrades        = data.upgrades or {},
-		totalCubesProduced = data.totalCubesProduced or 0,
-		currentArea     = data.currentArea or 1,
-		discoveredTiers = data.discoveredTiers or {},
-		currentFireRate = GetEffectiveFireRate(uid),
-		boostMultiplier = boostMult ,
-		shipCapacity    = UpgradeConfig.GetShippingCapacity(data) or AdminConfig.PlatformCapacity,
-	})
-end
-
-task.spawn(function()
-	while true do
-		local tickInterval = AdminConfig.MutationTickInterval or MutationConfig.CheckInterval
-		task.wait(tickInterval)
-
-		for _, player in ipairs(Players:GetPlayers()) do
-			local uid = player.UserId
-			local data = GameManager.GetData(uid)
-			local runtime = GameManager.GetRuntime(uid)
-			if not data or not runtime then continue end
-
-			local dt = tickInterval * GetAFKSpeed(runtime) * GetMutationSpeedMult(data) * (AdminConfig.MutationSpeedMultiplier or 1)
-			local mutationBatch = {}
-			local currentArea = data.currentArea or 1
-			local areaModels = GetAreaAuraModels(currentArea)
-
-			for cubeId, cube in pairs(runtime.cubes) do
-				local oldMutatedValue = MutationConfig.GetMutatedValue(cube)
-				local mutated = false
-
-				local prev = cube.effectiveElapsed
-				cube.effectiveElapsed += dt
-				local pl = MutationConfig.GetValueBonusLevel(prev)
-				local nl = MutationConfig.GetValueBonusLevel(cube.effectiveElapsed)
-
-				if nl > pl then
-					mutated = true
-					local be = MutationConfig.ValueBonuses[nl]
-					table.insert(mutationBatch, { 
-						cubeId = cubeId, mutationType = "valueBonus", bonusLevel = nl, 
-						bonusPercent = be and math.floor(be.bonus * 100) or 0 
-					})
-				end
-
-				local maxTier = AdminConfig.MutationMaxTierIndex or 3
-				local upgrades = 0
-
-				while cube.tierIndex < maxTier and cube.tierIndex < #TierConfig.Tiers and upgrades < 5 do
-					if areaModels then
-						local nextTierName = TierConfig.Tiers[cube.tierIndex + 1].name
-						if not areaModels[nextTierName] then break end
-					end
-
-					local timeSince = cube.effectiveElapsed - (cube.lastUpgradeElapsed or 0)
-					local bestChance, bestTime = 0, 0
-					for _, threshold in ipairs(MutationConfig.TierUpgrades) do
-						if timeSince >= threshold.time then bestChance = threshold.chance; bestTime = threshold.time end
-					end
-
-					if bestChance <= 0 then break end
-
-					if math.random() <= bestChance then
-						local oldTier = TierConfig.Tiers[cube.tierIndex]
-						cube.tierIndex += 1
-						local newTier = TierConfig.Tiers[cube.tierIndex]
-						cube.baseValue = math.floor(cube.baseValue * (newTier.multiplier/oldTier.multiplier))
-						cube.color = newTier.color; cube.glow = newTier.glow; cube.tierName = newTier.name
-						cube.lastUpgradeElapsed = (cube.lastUpgradeElapsed or 0) + bestTime
-						upgrades += 1; mutated = true
-
-						local auraKey = currentArea .. "_" .. newTier.name
-						if not data.discoveredTiers then data.discoveredTiers = {} end
-						if not data.discoveredTiers[auraKey] then
-							data.discoveredTiers[auraKey] = true
-							GameManager.SavePlayer(player)
-							UpdateHUDBridge:Fire(player, { discoveredTiers = data.discoveredTiers })
-						end
-
-						table.insert(mutationBatch, { 
-							cubeId = cubeId, mutationType = "tierUpgrade",
-							newColor = newTier.color, newGlow = newTier.glow, 
-							tierName = newTier.name, currentArea = currentArea
-						})
-
-						TrackTierSpawn(data, newTier.name)
-					else break end
-				end
-
-				if mutated then
-					local newMutatedValue = MutationConfig.GetMutatedValue(cube)
-					runtime.totalMutatedValue = (runtime.totalMutatedValue or 0) + (newMutatedValue - oldMutatedValue)
-					if not cube.isStored then runtime.activeMutatedValue = (runtime.activeMutatedValue or 0) + (newMutatedValue - oldMutatedValue) end
-
-					if #mutationBatch > 0 then
-						for i = #mutationBatch, 1, -1 do
-							if mutationBatch[i].cubeId == cubeId then
-								mutationBatch[i].newValue = newMutatedValue
-								break
-							end
-						end
-					end
-				end
-			end
-
-			if #mutationBatch > 0 then CubeMutatedBatchBridge:Fire(player, mutationBatch) end
-			SendHUDUpdate(player)
-		end
-	end
-end)
-
-local function GetHoldMultiplier(holdTime, data)
-	local upgrades = data and data.upgrades or {}
-	local speedData = upgrades["multiplierSpeed"]
-	local speedLevel = (typeof(speedData) == "table" and speedData.level) or (typeof(speedData) == "number" and speedData) or 0
-	local playerMultSpeed = 1.0 + (speedLevel * 0.05)
-
-	local playerMaxTier = 5
-	local tierUnlocks = {
-		{ upgradeId = "unlockOmniMult", tier = 10 }, { upgradeId = "unlockUniversalMult", tier = 9 },
-		{ upgradeId = "unlockGodlyMult", tier = 8 }, { upgradeId = "unlockCosmicMult", tier = 7 },
-		{ upgradeId = "unlockMythicMult", tier = 6 },
-	}
-
-	for _, tData in ipairs(tierUnlocks) do
-		local lvl = upgrades[tData.upgradeId]
-		local finalLvl = (typeof(lvl) == "table" and lvl.level) or (typeof(lvl) == "number" and lvl) or 0
-		if finalLvl > 0 then playerMaxTier = tData.tier; break end
-	end
-
-	local milestoneReduction = 0
-	local clickMilestoneCfg = EpicUpgradeConfig.GetUpgradeConfig("epicClickMilestone")
-	if clickMilestoneCfg and clickMilestoneCfg.apply then
-		milestoneReduction = clickMilestoneCfg.apply(data)
-	end
-
-	local function GetMilestoneTime(index)
-		if not AdminConfig.MilestoneData[index] then return 999999 end
-		return math.max(0, AdminConfig.MilestoneData[index].time - milestoneReduction)
-	end
-
-	local effectiveTime = holdTime * playerMultSpeed
-	local currentTier = 1
-
-	for i = 1, playerMaxTier do
-		if AdminConfig.MilestoneData[i] and effectiveTime >= GetMilestoneTime(i) then currentTier = i end
-	end
-
-	local nextTier = math.min(currentTier + 1, playerMaxTier)
-	if currentTier == playerMaxTier then return AdminConfig.MilestoneData[currentTier].mult, AdminConfig.MilestoneData[currentTier].luck end
-
-	local timePassed = effectiveTime - GetMilestoneTime(currentTier)
-	local timeNeeded = GetMilestoneTime(nextTier) - GetMilestoneTime(currentTier)
-	local ratio = timeNeeded > 0 and (timePassed / timeNeeded) or 1 
-
-	local cMult = AdminConfig.MilestoneData[currentTier].mult
-	local nMult = AdminConfig.MilestoneData[nextTier].mult
-	local smoothMult = cMult + ((nMult - cMult) * ratio)
-
-	return smoothMult, AdminConfig.MilestoneData[currentTier].luck
-end
-
-local function RollWithLuck(luckBonus)
-	local tiers = TierConfig.Tiers
-	local adjusted, total = {}, 0
-
-	for _, tier in ipairs(tiers) do
-		local chance = tier.chance
-		if tier.name ~= "Common" then 
-			chance = chance * (1 + (luckBonus or 0)) 
-		end
-		table.insert(adjusted, { tier=tier, chance=chance })
-		total += chance
-	end
-
-	local r = math.random() * total
-	local cum = 0
-	local rolledTier = nil
-
-	for _, e in ipairs(adjusted) do 
-		cum += e.chance
-		if not rolledTier and r <= cum then 
-			rolledTier = e.tier 
-		end 
-	end
-
-	rolledTier = rolledTier or tiers[1]
-	return rolledTier
-end
-
-local function SpawnAura(player, data, runtime, holdMult, luckBonus)
-	local uid  = player.UserId
-	local tier = RollWithLuck(luckBonus)
-	local tierIndex = 1
-	for i, t in ipairs(TierConfig.Tiers) do if t.name == tier.name then tierIndex=i; break end end
-
-	local currentArea = data.currentArea or 1
-	local areaModels = GetAreaAuraModels(currentArea)
-
-	if areaModels then
-		while tierIndex > 1 do
-			local checkName = TierConfig.Tiers[tierIndex].name
-			if areaModels[checkName] then break end
-			tierIndex -= 1
-		end
-		tier = TierConfig.Tiers[tierIndex] 
-	end
-
-	local totalValueMultiplier = UpgradeConfig.GetTotalValueMultiplier(data)
-
-	local prestigeMult    = PrestigeModule.GetMultiplier(data.soulAuras, data)
-	local areaMult        = AreaRegistry.GetMultiplier(data.currentArea or 1)
-	local boostValueMult  = BoostManager.GetValueMultiplier(uid)
-	local _, weatherValueMult = WeatherManager.GetMultipliers(uid)
-
-	local epicLuckCfg = EpicUpgradeConfig.GetUpgradeConfig("epicLuck")
-	if epicLuckCfg and epicLuckCfg.apply then luckBonus = (luckBonus or 0) + epicLuckCfg.apply(data) end
-
-	local calcMultFloat = totalValueMultiplier * prestigeMult * areaMult * boostValueMult * weatherValueMult
-	local baseValue = math.floor(AdminConfig.BaseAuraValue * tier.multiplier * calcMultFloat)
-
-	local godlyCritCfg = UpgradeConfig.GetUpgradeConfig("godlyCritChance")
-	local critChance = (godlyCritCfg and godlyCritCfg.apply) and godlyCritCfg.apply(data) or 0
-	local isGodlyCrit = false
-
-	if critChance > 0 and (math.random() * 100) <= critChance then
-		isGodlyCrit = true
-		baseValue = baseValue * 500 
-	end
-
-	local totalValue = baseValue + math.floor(baseValue * (holdMult - 1))
-
-	local spawnPos = GetServerHabitatPos() + Vector3.new(math.random(-3,3), 10, math.random(-3,3))  
-	local activeAuraModel = workspace:FindFirstChild("AuraHolder") and workspace.AuraHolder:FindFirstChildWhichIsA("Model")
-	if activeAuraModel then
-		local spawnPoint = activeAuraModel:FindFirstChild("AuraSpawnPoint", true)
-		if spawnPoint and spawnPoint:IsA("BasePart") then
-			local size = spawnPoint.Size
-			local randX = (math.random() - 0.5) * size.X
-			local randZ = (math.random() - 0.5) * size.Z
-			spawnPos = (spawnPoint.CFrame * CFrame.new(randX, 0, randZ)).Position
-		end
-	end
-
-	local cubeRecord = { spawnTime=tick(), effectiveElapsed=0, lastUpgradeElapsed=0, baseValue=totalValue, tierIndex=tierIndex, tierName=tier.name, color=tier.color, glow=tier.glow, isStored=false, currentArea=currentArea }
-
-	if AdminConfig.MutationInstantMax then
-		local mb = MutationConfig.ValueBonuses[#MutationConfig.ValueBonuses]
-		if mb then cubeRecord.effectiveElapsed = mb.time + 1 end
-	end
-
-	local cubeId = GameManager.AddCube(uid, cubeRecord)
-	if not cubeId then return end
-
-	local epicDoubleSpawn = EpicUpgradeConfig.GetUpgradeConfig("epicDoubleSpawn")
-	if epicDoubleSpawn and epicDoubleSpawn.apply and epicDoubleSpawn.apply(data) > 0 then
-		local doubleCubeId = GameManager.AddCube(uid, cubeRecord)
-		if doubleCubeId then
-			AuraSpawnedBridge:Fire(player, { cubeId=doubleCubeId, tier=tier.name, color=tier.color, glow=tier.glow, value=totalValue, spawnPos=spawnPos, currentArea = currentArea, isGodlyCrit = isGodlyCrit })
-			data.totalCubesProduced = (data.totalCubesProduced or 0) + 1
-			TrackTierSpawn(data, tier.name)
-		end
-	end
-
-	local auraKey = currentArea .. "_" .. tier.name
-	if not data.discoveredTiers then data.discoveredTiers = {} end
-	if not data.discoveredTiers[auraKey] then
-		data.discoveredTiers[auraKey] = true
-		GameManager.SavePlayer(player)
-		UpdateHUDBridge:Fire(player, { discoveredTiers = data.discoveredTiers })
-	end
-
-	data.totalCubesProduced = (data.totalCubesProduced or 0) + 1
-	TrackTierSpawn(data, tier.name)
-
-	runtime.lastActiveTime = tick()
-
-	AuraSpawnedBridge:Fire(player, { cubeId=cubeId, tier=tier.name, color=tier.color, glow=tier.glow, value=totalValue, spawnPos=spawnPos, currentArea = currentArea, isGodlyCrit = isGodlyCrit })
-end
-
-ProduceAuraBridge:Connect(function(player, action)
-	if player:GetAttribute("IsTransitioning") or player:GetAttribute("InSpecialArea") then
-		if action == "start" then holdStart[player.UserId] = nil end
-		return
-	end
-
-	local uid = player.UserId
-	local now = tick()
-	local data = GameManager.GetData(uid)
-	local runtime = GameManager.GetRuntime(uid)
-
-	if action == "start" then 
-		if data and runtime then
-			local storedCount = runtime.storedCubeCount or 0
-			if storedCount >= GetHabitatCapacity(data) then HabitatFull:FireClient(player); return end
-		end
-		if (hatchery[uid] or 0) > 0.5 then holdStart[uid] = now 
-		else UpdateHatcheryBridge:Fire(player, { current = 0, max = data and GetHatcheryMax(data) or AdminConfig.HatcheryMax }) end
-		return 
-	end
-
-	if action == "stop" then holdStart[uid] = nil; return end
-	if not data or not runtime then return end
-
-	local capacity = GetHabitatCapacity(data)
-	local storedCount = runtime.storedCubeCount or 0
-
-	if storedCount >= capacity then HabitatFull:FireClient(player); return end
-
-	if runtime.cubeCount >= capacity + 1000 then return end 
-
-	if (hatchery[uid] or 0) <= 0.5 then 
-		UpdateHatcheryBridge:Fire(player, { current = 0, max = data and GetHatcheryMax(data) or AdminConfig.HatcheryMax })
-		return 
-	end
-	if not holdStart[uid] then return end
-
-	local rushMult = BoostManager.GetSpawnRateMultiplier(uid)
-	local weatherSpawnMult, _ = WeatherManager.GetMultipliers(uid)
-	local effectiveFireRate = AdminConfig.FireRate / (rushMult * weatherSpawnMult)
-	local spawnCount = 1
-
-	if effectiveFireRate < 0.05 then
-		spawnCount = math.floor(0.05 / effectiveFireRate)
-		effectiveFireRate = 0.05
-	end
-
-	if lastFire[uid] then
-		local timeSinceLast = now - lastFire[uid]
-		if timeSinceLast < (effectiveFireRate - 0.015) then return end 
-	end
-	lastFire[uid] = now
-
-	local holdTime = now - holdStart[uid]
-	local holdMult, luckBonus = GetHoldMultiplier(holdTime, data)
-
-	local doubleSpawnCfg = UpgradeConfig.GetUpgradeConfig("doubleSpawnChance")
-	local doubleChance = (doubleSpawnCfg and doubleSpawnCfg.apply) and doubleSpawnCfg.apply(data) or 0
-
-	for i = 1, spawnCount do 
-		SpawnAura(player, data, runtime, holdMult, luckBonus) 
-
-		if doubleChance > 0 and math.random(1, 100) <= doubleChance then
-			SpawnAura(player, data, runtime, holdMult, luckBonus) 
-		end
-	end
-
-	SendHUDUpdate(player)
-	UpdateHatcheryBridge:Fire(player, { current=hatchery[uid], max=GetHatcheryMax(data) })
-end)
-
--- AFTER
-CubeStoredBridge:Connect(function(player, cubeId)
-	local uid = player.UserId
-	local runtime = GameManager.GetRuntime(uid)
-	local data = GameManager.GetData(uid)
-	if runtime and runtime.cubes[cubeId] then
-		local wasStored = GameManager.MarkCubeStored(uid, cubeId)
-		SendHUDUpdate(player)
-
-		local storedCount = runtime.storedCubeCount or 0
-		if storedCount >= GetHabitatCapacity(data) then HabitatFull:FireClient(player) end
-
-		if not wasStored then
-			-- Habitat was already full when this in-flight cube landed — reject it
-			-- instead of letting storedCubeCount silently overflow.
-			CubeStoredBridge:Fire(player, { rejected = true, cubeId = cubeId })
-		end
-	end
-end)
-
-CubeSmushedBridge:Connect(function(player, cubeId)
-	local uid = player.UserId
-
-	GameManager.RemoveCube(uid, cubeId)
-	SendHUDUpdate(player)
-	local data = GameManager.GetData(uid)
-	UpdateHatcheryBridge:Fire(player, { current = hatchery[uid], max = GetHatcheryMax(data) })
-end)
-
+--ClickHandler
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TweenService = game:GetService("TweenService")
@@ -1541,6 +554,8 @@ end
 local function HookHabitatModel(model)
 	task.delay(0.1, function()
 		local storage = model:FindFirstChild("StorageTrigger", true)
+		local storageAnchors = model:FindFirstChild("StorageAnchors", true)
+
 		if storage then
 			storage.Touched:Connect(function(hit)
 				if hit:HasTag("PhysicsAura") or (hit.Parent and hit.Parent:HasTag("PhysicsAura")) then
@@ -1560,11 +575,10 @@ local function HookHabitatModel(model)
 					if data and not data.isStored then
 						data.isStored = true
 						auraObj:SetAttribute("IsStored", true)
-						activeCubes[cid] = nil -- No longer active, stop checking in loop
+						activeCubes[cid] = nil
 
 						CubeStoredBridge:Fire(cid)
 
-						-- PERFORMANCE CAP: Destroy physical instances if visual array overflows
 						local visualStoredCount = 0
 						for _, d in pairs(cubeDataMap) do
 							if d.isStored then visualStoredCount += 1 end
@@ -1576,15 +590,27 @@ local function HookHabitatModel(model)
 							return
 						end
 
-						-- If we are under the visual cap, keep the instance rendering normally:
 						if data.rateLabel and data.rateLabel.Parent and data.rateLabel.Parent:IsA("BillboardGui") then 
 							data.rateLabel.Parent.Enabled = false 
 						end
 
 						local root = GetRootPart(auraObj)
 						if root then
-							local dropOffset = Vector3.new(-10, 4, math.random(-4, 4))
-							auraObj:PivotTo(CFrame.new(storage.Position + dropOffset))
+							if storageAnchors and storageAnchors:IsA("BasePart") then
+								-- Scatter cubes naturally within the StorageAnchors local bounding box
+								local size = storageAnchors.Size
+								local randomLocalOffset = Vector3.new(
+									(math.random() - 0.5) * size.X,
+									(math.random() - 0.5) * size.Y,
+									(math.random() - 0.5) * size.Z
+								)
+								local targetWorldCFrame = storageAnchors.CFrame * CFrame.new(randomLocalOffset)
+								auraObj:PivotTo(targetWorldCFrame)
+							else
+								-- Fallback for areas without StorageAnchors yet
+								local dropOffset = Vector3.new(math.random(-9, -4), math.random(2, 7), math.random(-5, 5))
+								auraObj:PivotTo(CFrame.new(storage.Position + dropOffset))
+							end
 
 							if auraObj:IsA("Model") then
 								for _, desc in ipairs(auraObj:GetDescendants()) do
@@ -1876,7 +902,7 @@ AuraSpawnedBridge:Connect(function(info)
 			rateLabel = permLabel,
 			baseValue = info.value 
 		}
-		activeCubes[info.cubeId] = true -- Register it in the active window
+		activeCubes[info.cubeId] = true 
 
 		cubeDataMap[info.cubeId].ancestryConn = instance.AncestryChanged:Connect(function(_, parent)
 			if not parent then 
@@ -2008,7 +1034,6 @@ CubeMutatedBatchBridge:Connect(function(batchData)
 	end
 end)
 
--- Server rejected storing this cube because habitat was actually full (in-flight overflow)
 CubeStoredBridge:Connect(function(payload)
 	if type(payload) ~= "table" or not payload.rejected then return end
 	local cid = payload.cubeId
@@ -2025,7 +1050,6 @@ CubeStoredBridge:Connect(function(payload)
 	activeCubes[cid] = nil
 end)
 
--- OPTIMIZED ROLLING WINDOW: Only checks instances actively falling to the void
 task.spawn(function()
 	while true do
 		task.wait(1.5)
@@ -2064,7 +1088,7 @@ task.spawn(function()
 					end
 				end
 			else
-				activeCubes[id] = nil -- Clean up invalid entries from window
+				activeCubes[id] = nil
 			end
 		end
 	end
@@ -2107,580 +1131,1343 @@ PrestigeComplete.OnClientEvent:Connect(function(info)
 	UpdateMultiplier:Fire(1.0)
 end)
 
--- =====================================================================
--- 1. MODULE: AreaRegistry
--- Location: ReplicatedStorage > Modules > AreaRegistry
--- =====================================================================
-local AreaRegistry = {}
+local Players             = game:GetService("Players")
+local ReplicatedStorage   = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
 
-AreaRegistry.LightingPresets = {
+local TierConfig     = require(ReplicatedStorage.Modules.TierConfig)
+local UpgradeConfig  = require(ReplicatedStorage.Modules.UpgradeConfig)
+local PrestigeModule = require(ReplicatedStorage.Modules.PrestigeModule)
+local AdminConfig    = require(ReplicatedStorage.Modules.AdminConfig)
+local MutationConfig = require(ReplicatedStorage.Modules.MutationConfig)
+local AreaRegistry   = require(ReplicatedStorage.Modules.AreaRegistry)
+local GameManager    = require(ServerScriptService.GameManager)
+local BoostManager   = require(ServerScriptService.BoostManager)
+local WeatherManager = require(ServerScriptService.WeatherManager)
+local EpicUpgradeConfig = require(ReplicatedStorage.Modules:WaitForChild("EpicUpgradeConfig"))
 
-	-- 🏭 PHASE 1: THE GRIME (Areas 1-3)
-	["Area1_DeepScrapyard"] = {
-		ClockTime = 12, Brightness = 0.3, SunRaysIntensity = 0,
-		Ambient = Color3.fromRGB(70, 60, 50), FogColor = Color3.fromRGB(90, 80, 65),
-		FogStart = 20, FogEnd = 60, Density = 0.7, Haze = 10, AtmosphereColor = Color3.fromRGB(90, 80, 65)
-	},
-	["Area2_RustyWastes"] = {
-		ClockTime = 14, Brightness = 0.4, SunRaysIntensity = 0,
-		Ambient = Color3.fromRGB(80, 65, 50), FogColor = Color3.fromRGB(100, 85, 60),
-		FogStart = 20, FogEnd = 80, Density = 0.6, Haze = 8, AtmosphereColor = Color3.fromRGB(100, 91, 70)
-	},
-	["Area3_IndustrialOutskirts"] = {
-		ClockTime = 16, Brightness = 3, SunRaysIntensity = 0.2,
-		Ambient = Color3.fromRGB(124, 115, 105), FogColor = Color3.fromRGB(125, 117, 111),
-		FogStart = 0, FogEnd = 0, Density = 0, Haze = 0, AtmosphereColor = Color3.fromRGB(120, 116, 113)
-	},
+local HabitatFull    = ReplicatedStorage.RemoteEvents:WaitForChild("HabitatFull")
 
-	-- ☣️ PHASE 2: TOXIC ZONES (Areas 4-5)
-	["Area4_ChemicalSpill"] = {
-		ClockTime = 17, Brightness = 0.4, SunRaysIntensity = 0,
-		Ambient = Color3.fromRGB(60, 75, 50), FogColor = Color3.fromRGB(75, 90, 55),
-		FogStart = 0, FogEnd = 0, Density = 0, Haze = 2, AtmosphereColor = Color3.fromRGB(75, 90, 55)
-	},
-	["Area5_BioHazard"] = {
-		ClockTime = 15.7, Brightness = 0.3, SunRaysIntensity = 0.37,
-		Ambient = Color3.fromRGB(209, 209, 209), FogColor = Color3.fromRGB(230, 230, 230),
-		FogStart = 0, FogEnd = 0, Density = 0, Haze = 3, AtmosphereColor = Color3.fromRGB(203, 208, 109)
-	},
+local BridgeNet2             = require(ReplicatedStorage.Modules:WaitForChild("BridgeNet2"))
+local UpdateHUDBridge        = BridgeNet2.ServerBridge("UpdateHUD")
+local ProduceAuraBridge      = BridgeNet2.ServerBridge("ProduceAura")
+local AuraSpawnedBridge      = BridgeNet2.ServerBridge("AuraSpawned")
+local UpdateHatcheryBridge   = BridgeNet2.ServerBridge("UpdateHatchery")
+local CubeMutatedBatchBridge = BridgeNet2.ServerBridge("CubeMutatedBatch")
+local CubeSmushedBridge      = BridgeNet2.ServerBridge("CubeSmushed")
+local CubeStoredBridge       = BridgeNet2.ServerBridge("CubeStored")
 
-	-- 🌆 PHASE 3: TWILIGHT SLUMS (Areas 6-8)
-	["Area6_SunsetStrip"] = {
-		ClockTime = 17.8, Brightness = 0.6, SunRaysIntensity = 0.1,
-		Ambient = Color3.fromRGB(70, 40, 40), FogColor = Color3.fromRGB(90, 40, 30),
-		FogStart = 20, FogEnd = 150, Density = 0.5, Haze = 4, AtmosphereColor = Color3.fromRGB(120, 50, 40)
-	},
-	["Area7_TwilightSector"] = {
-		ClockTime = 18.2, Brightness = 0.4, SunRaysIntensity = 0,
-		Ambient = Color3.fromRGB(40, 30, 60), FogColor = Color3.fromRGB(35, 25, 55),
-		FogStart = 20, FogEnd = 180, Density = 0.55, Haze = 4, AtmosphereColor = Color3.fromRGB(35, 25, 55)
-	},
-	["Area8_NeonSlums"] = {
-		ClockTime = 0, Brightness = 0.5, SunRaysIntensity = 0,
-		Ambient = Color3.fromRGB(30, 20, 50), FogColor = Color3.fromRGB(20, 10, 40),
-		FogStart = 25, FogEnd = 200, Density = 0.5, Haze = 3, AtmosphereColor = Color3.fromRGB(40, 20, 80)
-	},
+local HABITAT_HOLDER = workspace:WaitForChild("HabitatHolder")
 
-	-- 🌃 PHASE 4: CYBER CITY (Areas 9-10)
-	["Area9_LowerCyber"] = {
-		ClockTime = 0, Brightness = 0.7, SunRaysIntensity = 0,
-		Ambient = Color3.fromRGB(25, 25, 55), FogColor = Color3.fromRGB(15, 15, 45),
-		FogStart = 30, FogEnd = 250, Density = 0.4, Haze = 2, AtmosphereColor = Color3.fromRGB(20, 20, 60)
-	},
-	["Area10_CyberCore"] = {
-		ClockTime = 0, Brightness = 1, SunRaysIntensity = 0,
-		Ambient = Color3.fromRGB(20, 30, 60), FogColor = Color3.fromRGB(10, 20, 50),
-		FogStart = 50, FogEnd = 400, Density = 0.25, Haze = 1, AtmosphereColor = Color3.fromRGB(15, 25, 65)
-	},
-
-	-- 🌐 PHASE 5: CORPORATE STERILITY (Areas 11-13)
-	["Area11_GlassFacility"] = {
-		ClockTime = 12, Brightness = 2.0, SunRaysIntensity = 0.4,
-		Ambient = Color3.fromRGB(130, 130, 140), FogColor = Color3.fromRGB(200, 220, 240),
-		FogStart = 100, FogEnd = 1500, Density = 0.15, Haze = 0, AtmosphereColor = Color3.fromRGB(200, 220, 240)
-	},
-	["Area12_CrystalLab"] = {
-		ClockTime = 14, Brightness = 2.5, SunRaysIntensity = 0.5,
-		Ambient = Color3.fromRGB(150, 150, 150), FogColor = Color3.fromRGB(220, 240, 255),
-		FogStart = 150, FogEnd = 2500, Density = 0.1, Haze = 0, AtmosphereColor = Color3.fromRGB(220, 240, 255)
-	},
-	["Area13_QuantumGrid"] = {
-		ClockTime = 14, Brightness = 2.2, SunRaysIntensity = 0.3,
-		Ambient = Color3.fromRGB(100, 180, 200), FogColor = Color3.fromRGB(150, 255, 255),
-		FogStart = 200, FogEnd = 3000, Density = 0.05, Haze = 0, AtmosphereColor = Color3.fromRGB(150, 255, 255)
-	},
-
-	-- 🌌 PHASE 6: REALITY BREAKING (Areas 14-16)
-	["Area14_PlasmaCore"] = {
-		ClockTime = 17.5, Brightness = 1.8, SunRaysIntensity = 0.3,
-		Ambient = Color3.fromRGB(150, 80, 150), FogColor = Color3.fromRGB(200, 100, 200),
-		FogStart = 100, FogEnd = 2000, Density = 0.2, Haze = 2, AtmosphereColor = Color3.fromRGB(200, 100, 200)
-	},
-	["Area15_CosmicRift"] = {
-		ClockTime = 6, Brightness = 1.5, SunRaysIntensity = 0.2,
-		Ambient = Color3.fromRGB(100, 30, 150), FogColor = Color3.fromRGB(70, 0, 100),
-		FogStart = 50, FogEnd = 1000, Density = 0.3, Haze = 4, AtmosphereColor = Color3.fromRGB(150, 0, 255)
-	},
-	["Area16_DarkMatter"] = {
-		ClockTime = 0, Brightness = 0.8, SunRaysIntensity = 0,
-		Ambient = Color3.fromRGB(80, 10, 20), FogColor = Color3.fromRGB(40, 0, 5),
-		FogStart = 30, FogEnd = 600, Density = 0.5, Haze = 6, AtmosphereColor = Color3.fromRGB(120, 0, 10)
-	},
-
-	-- ⬛ PHASE 7: THE VOID (Areas 17-20)
-	["Area17_EventHorizon"] = {
-		ClockTime = 0, Brightness = 0.4, SunRaysIntensity = 0,
-		Ambient = Color3.fromRGB(30, 10, 40), FogColor = Color3.fromRGB(15, 5, 20),
-		FogStart = 50, FogEnd = 800, Density = 0.3, Haze = 3, AtmosphereColor = Color3.fromRGB(20, 5, 30)
-	},
-	["Area18_DeepSpace"] = {
-		ClockTime = 0, Brightness = 0.2, SunRaysIntensity = 0,
-		Ambient = Color3.fromRGB(15, 15, 25), FogColor = Color3.fromRGB(5, 5, 15),
-		FogStart = 100, FogEnd = 1500, Density = 0.15, Haze = 1, AtmosphereColor = Color3.fromRGB(5, 5, 15)
-	},
-	["Area19_TheAbyss"] = {
-		ClockTime = 0, Brightness = 0.05, SunRaysIntensity = 0,
-		Ambient = Color3.fromRGB(5, 5, 5), FogColor = Color3.fromRGB(2, 2, 2),
-		FogStart = 200, FogEnd = 3000, Density = 0.05, Haze = 0, AtmosphereColor = Color3.fromRGB(2, 2, 2)
-	},
-	["Area20_UniversalVoid"] = {
-		ClockTime = 0, Brightness = 0, SunRaysIntensity = 0,
-		Ambient = Color3.fromRGB(0, 0, 0), FogColor = Color3.fromRGB(0, 0, 0),
-		FogStart = 500, FogEnd = 5000, Density = 0, Haze = 0, AtmosphereColor = Color3.fromRGB(0, 0, 0)
-	},
-
-	-- ✨ SPECIAL: THE GOLDEN VAULT (Piggy Bank)
-	["Area_PiggyBank"] = {
-		ClockTime = 12, Brightness = 3.0, SunRaysIntensity = 0.5,
-		Ambient = Color3.fromRGB(200, 150, 50), FogColor = Color3.fromRGB(255, 240, 150),
-		FogStart = 50, FogEnd = 1000, Density = 0.1, Haze = 0, AtmosphereColor = Color3.fromRGB(255, 215, 0)
-	}
-}
-
-AreaRegistry.Areas = {
-	[1] = { 
-		name             = "Green Scrapyard",     
-		threshold        = 0,   
-		valueMultiplier  = 1.0, 
-		yOffset          = -2.7, 
-		yRotation        = 180, 
-		auraPreviewColor = Color3.fromRGB(200, 200, 200), 
-		grassColor       = Color3.fromRGB(92, 197, 53), 
-		pathColor        = Color3.fromRGB(163, 130, 88), 
-		ambientColor     = Color3.fromRGB(90, 90, 100), 
-		fogColor         = Color3.fromRGB(180, 200, 220), 
-		auraHolderColor  = Color3.fromRGB(255, 255, 255), 
-		auraHolderGlow   = Color3.fromRGB(255, 255, 255), 
-		lightingPreset   = "Area1_DeepScrapyard", 
-		icon = "rbxassetid://71630626823279",
-		auraModels       = { Common = "GearAura", Uncommon = "ScrewAura", Rare = "BottleAura", Epic = "TireAura", Legendary = "RadioAura" }
-	},
-	[2] = { 
-		name             = "Industrial Rust",    
-		threshold = 2.5e4,
-		valueMultiplier  = 1.5, 
-		yOffset          = -4.5, 
-		yRotation        = 180, 
-		auraPreviewColor = Color3.fromRGB(180, 100, 50), 
-		grassColor       = Color3.fromRGB(104, 160, 98), 
-		pathColor        = Color3.fromRGB(132, 140, 81), 
-		ambientColor     = Color3.fromRGB(80, 100, 80), 
-		fogColor         = Color3.fromRGB(160, 200, 160), 
-		auraHolderColor  = Color3.fromRGB(187, 255, 183), 
-		auraHolderGlow   = Color3.fromRGB(100, 255, 100), 
-		lightingPreset   = "Area2_RustyWastes", 
-		icon = "rbxassetid://130447112533927",
-		auraModels       = { Common = "GearAura", Uncommon = "ScrapMetalAura", Rare = "BarrelAura", Epic = "OilAura", Legendary = "BrokenweaponAura" }
-	},
-	[3] = { 
-		name             = "Foil Scrapyard",        
-		threshold        = 2.5e5, 
-		valueMultiplier  = 4.0, 
-		yOffset          = -2.8, 
-		yRotation        = 180, 
-		auraPreviewColor = Color3.fromRGB(220, 230, 255), 
-		grassColor       = Color3.fromRGB(180, 190, 200), 
-		pathColor        = Color3.fromRGB(150, 160, 170), 
-		ambientColor     = Color3.fromRGB(100, 110, 120), 
-		fogColor         = Color3.fromRGB(200, 210, 220), 
-		auraHolderColor  = Color3.fromRGB(220, 230, 255), 
-		auraHolderGlow   = Color3.fromRGB(240, 250, 255), 
-		lightingPreset   = "Area3_IndustrialOutskirts", 
-		icon = "rbxassetid://127570555675325",
-		auraModels       = { Common = "FoilBallAura", Uncommon = "CandyAura", Rare = "CrushedCanAura", Epic = "CapAura", Legendary = "SilverLeafAura", Mythic = "BalloonAura" }
-	},
-	[4] = { 
-		name             = "Cheap Metal",        
-		threshold        = 5e6, 
-		valueMultiplier  = 8.0, 
-		yOffset          = -2.8, 
-		yRotation        = 180, 
-		auraPreviewColor = Color3.fromRGB(150, 150, 160), 
-		grassColor       = Color3.fromRGB(130, 130, 140), 
-		pathColor        = Color3.fromRGB(100, 100, 110), 
-		ambientColor     = Color3.fromRGB(80, 80, 90), 
-		fogColor         = Color3.fromRGB(140, 140, 150), 
-		auraHolderColor  = Color3.fromRGB(170, 170, 180), 
-		auraHolderGlow   = Color3.fromRGB(190, 190, 200), 
-		lightingPreset   = "Area4_ChemicalSpill", 
-		icon = "rbxassetid://114952653386252",
-		auraModels       = { Common = "PlateAura", Uncommon = "PipeAura", Rare = "CoinAura", Epic = "WheelAura", Legendary = "ShoppingAura", Mythic = "StatueAura" }
-	},
-	[5] = { 
-		name             = "Solid Metal",   
-		threshold        = 5e7, 
-		valueMultiplier  = 20.0,
-		yOffset          = -3.0,   
-		yRotation        = 0,   
-		auraPreviewColor = Color3.fromRGB(90, 95, 100), 
-		grassColor       = Color3.fromRGB(80, 85, 90), 
-		pathColor        = Color3.fromRGB(60, 65, 70), 
-		ambientColor     = Color3.fromRGB(50, 55, 60), 
-		fogColor         = Color3.fromRGB(100, 105, 110), 
-		auraHolderColor  = Color3.fromRGB(120, 125, 130), 
-		auraHolderGlow   = Color3.fromRGB(140, 145, 150), 
-		lightingPreset   = "Area5_BioHazard", 
-		icon = "rbxassetid://71630626823279",
-		auraModels       = { Common = "StoneAura", Uncommon = "IronoreAura", Rare = "CopperingotAura", Epic = "MeteoriteAura", Legendary = "EmeraldAura", Mythic = "DiamondAura", Divine = "SadrockModel", Celestial = "TimeoreAura" }
-	},
-	[6] = {
-		name             = "Refined Alloys",
-		threshold        = 5e9,
-		valueMultiplier  = 75.0,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(200, 120, 50),
-		grassColor       = Color3.fromRGB(160, 90, 40),
-		pathColor        = Color3.fromRGB(120, 70, 30),
-		ambientColor     = Color3.fromRGB(90, 50, 20),
-		fogColor         = Color3.fromRGB(180, 100, 60),
-		auraHolderColor  = Color3.fromRGB(220, 140, 80),
-		auraHolderGlow   = Color3.fromRGB(255, 180, 100),
-		lightingPreset   = "Area6_RefinedAlloys", 
-		auraModels       = { Common = "CopperWire", Uncommon = "BrassGear", Rare = "BronzeStatue", Epic = "TitaniumPlate", Legendary = "CobaltShard" }
-	},
-	[7] = {
-		name             = "Precious Metals",
-		threshold        = 5e12,
-		valueMultiplier  = 350.0,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(255, 215, 0),
-		grassColor       = Color3.fromRGB(200, 170, 0),
-		pathColor        = Color3.fromRGB(150, 120, 0),
-		ambientColor     = Color3.fromRGB(120, 100, 20),
-		fogColor         = Color3.fromRGB(255, 230, 100),
-		auraHolderColor  = Color3.fromRGB(255, 240, 150),
-		auraHolderGlow   = Color3.fromRGB(255, 255, 200),
-		lightingPreset   = "Area7_PreciousMetals", 
-		auraModels       = { Common = "SilverBar", Uncommon = "GoldNugget", Rare = "PlatinumRing", Epic = "PalladiumCoin", Legendary = "RhodiumIngot" }
-	},
-	[8] = {
-		name             = "Industrial Synthetics",
-		threshold        = 5e15,
-		valueMultiplier  = 2500.0,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(230, 230, 230),
-		grassColor       = Color3.fromRGB(40, 40, 40),
-		pathColor        = Color3.fromRGB(20, 20, 20),
-		ambientColor     = Color3.fromRGB(60, 60, 60),
-		fogColor         = Color3.fromRGB(100, 100, 100),
-		auraHolderColor  = Color3.fromRGB(255, 255, 255),
-		auraHolderGlow   = Color3.fromRGB(200, 200, 255),
-		lightingPreset   = "Area8_Synthetics", 
-		auraModels       = { Common = "PVC_Pipe", Uncommon = "KevlarWeave", Rare = "TeflonBlock", Epic = "CarbonFiberRoll", Legendary = "GrapheneSheet" }
-	},
-	[9] = {
-		name             = "Volatile Materials",
-		threshold        = 5e19,
-		valueMultiplier  = 50000.0,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(100, 255, 100),
-		grassColor       = Color3.fromRGB(30, 50, 30),
-		pathColor        = Color3.fromRGB(20, 40, 20),
-		ambientColor     = Color3.fromRGB(40, 70, 40),
-		fogColor         = Color3.fromRGB(80, 200, 80),
-		auraHolderColor  = Color3.fromRGB(150, 255, 150),
-		auraHolderGlow   = Color3.fromRGB(0, 255, 0),
-		lightingPreset   = "Area9_Volatile", 
-		auraModels       = { Common = "GlowingSludge", Uncommon = "RadiumDial", Rare = "UraniumRod", Epic = "PlutoniumCore", Legendary = "AntimatterVial" }
-	},
-	[10] = {
-		name             = "Rough Gemstones",
-		threshold        = 5e25,
-		valueMultiplier  = 1000000.0,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(200, 100, 255),
-		grassColor       = Color3.fromRGB(90, 50, 120),
-		pathColor        = Color3.fromRGB(60, 30, 80),
-		ambientColor     = Color3.fromRGB(100, 60, 130),
-		fogColor         = Color3.fromRGB(180, 120, 255),
-		auraHolderColor  = Color3.fromRGB(230, 150, 255),
-		auraHolderGlow   = Color3.fromRGB(200, 50, 255),
-		lightingPreset   = "Area10_RoughGems", 
-		auraModels       = { Common = "AmethystCluster", Uncommon = "RawSapphire", Rare = "UncutRuby", Epic = "EmeraldChunk", Legendary = "OpalGeode" }
-	},
-	[11] = {
-		name             = "Polished Gems",
-		threshold        = 5e32,
-		valueMultiplier  = 5e7,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(150, 255, 255),
-		grassColor       = Color3.fromRGB(200, 240, 255),
-		pathColor        = Color3.fromRGB(180, 220, 255),
-		ambientColor     = Color3.fromRGB(100, 200, 255),
-		fogColor         = Color3.fromRGB(180, 255, 255),
-		auraHolderColor  = Color3.fromRGB(220, 255, 255),
-		auraHolderGlow   = Color3.fromRGB(255, 255, 255),
-		lightingPreset   = "Area11_PolishedGems", 
-		auraModels       = { Common = "PolishedTopaz", Uncommon = "FacetedSapphire", Rare = "CutRuby", Epic = "PerfectEmerald", Legendary = "FlawlessDiamond" }
-	},
-	[12] = {
-		name             = "High-Tech Computing",
-		threshold        = 5e40,
-		valueMultiplier  = 2.5e9,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(50, 200, 100),
-		grassColor       = Color3.fromRGB(20, 40, 30),
-		pathColor        = Color3.fromRGB(15, 30, 20),
-		ambientColor     = Color3.fromRGB(30, 60, 40),
-		fogColor         = Color3.fromRGB(40, 120, 80),
-		auraHolderColor  = Color3.fromRGB(100, 255, 150),
-		auraHolderGlow   = Color3.fromRGB(50, 255, 100),
-		lightingPreset   = "Area12_HighTech", 
-		auraModels       = { Common = "SiliconWafer", Uncommon = "Microchip", Rare = "RAM_Stick", Epic = "QuantumProcessor", Legendary = "AI_Core" }
-	},
-	[13] = {
-		name             = "Neon & Plasma",
-		threshold        = 5e50,
-		valueMultiplier  = 1.5e11,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(255, 50, 150),
-		grassColor       = Color3.fromRGB(40, 10, 30),
-		pathColor        = Color3.fromRGB(20, 5, 15),
-		ambientColor     = Color3.fromRGB(60, 20, 50),
-		fogColor         = Color3.fromRGB(100, 20, 80),
-		auraHolderColor  = Color3.fromRGB(255, 100, 200),
-		auraHolderGlow   = Color3.fromRGB(255, 0, 150),
-		lightingPreset   = "Area13_Neon", 
-		auraModels       = { Common = "NeonTube", Uncommon = "PlasmaArc", Rare = "LaserDiode", Epic = "HardLight", Legendary = "PhotonCell" }
-	},
-	[14] = {
-		name             = "Quantum Mechanics",
-		threshold        = 5e62,
-		valueMultiplier  = 1e14,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(255, 255, 255),
-		grassColor       = Color3.fromRGB(200, 200, 255),
-		pathColor        = Color3.fromRGB(150, 150, 200),
-		ambientColor     = Color3.fromRGB(100, 100, 150),
-		fogColor         = Color3.fromRGB(200, 200, 255),
-		auraHolderColor  = Color3.fromRGB(255, 255, 255),
-		auraHolderGlow   = Color3.fromRGB(100, 200, 255),
-		lightingPreset   = "Area14_Quantum", 
-		auraModels       = { Common = "Quark", Uncommon = "Tachyon", Rare = "Boson", Epic = "Tesseract", Legendary = "SchrodingerCat" }
-	},
-	[15] = {
-		name             = "Celestial Matter",
-		threshold        = 5e75,
-		valueMultiplier  = 5e16,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(150, 200, 255),
-		grassColor       = Color3.fromRGB(30, 40, 60),
-		pathColor        = Color3.fromRGB(20, 25, 40),
-		ambientColor     = Color3.fromRGB(40, 50, 80),
-		fogColor         = Color3.fromRGB(80, 100, 150),
-		auraHolderColor  = Color3.fromRGB(200, 230, 255),
-		auraHolderGlow   = Color3.fromRGB(100, 150, 255),
-		lightingPreset   = "Area15_Celestial", 
-		auraModels       = { Common = "MoonRock", Uncommon = "MarsDust", Rare = "CometIce", Epic = "AsteroidCore", Legendary = "SolarFlare" }
-	},
-	[16] = {
-		name             = "Cosmic Phenomena",
-		threshold        = 5e90,
-		valueMultiplier  = 2e19,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(200, 50, 255),
-		grassColor       = Color3.fromRGB(20, 10, 40),
-		pathColor        = Color3.fromRGB(10, 5, 20),
-		ambientColor     = Color3.fromRGB(40, 20, 80),
-		fogColor         = Color3.fromRGB(80, 30, 150),
-		auraHolderColor  = Color3.fromRGB(255, 150, 255),
-		auraHolderGlow   = Color3.fromRGB(150, 50, 255),
-		lightingPreset   = "Area16_Cosmic", 
-		auraModels       = { Common = "Stardust", Uncommon = "PulsarPulse", Rare = "QuasarLight", Epic = "SupernovaRemnant", Legendary = "GalaxySpiral" }
-	},
-	[17] = {
-		name             = "Dark Matter",
-		threshold        = 5e108,
-		valueMultiplier  = 1e22,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(20, 0, 40),
-		grassColor       = Color3.fromRGB(10, 0, 15),
-		pathColor        = Color3.fromRGB(5, 0, 10),
-		ambientColor     = Color3.fromRGB(15, 5, 30),
-		fogColor         = Color3.fromRGB(5, 0, 10),
-		auraHolderColor  = Color3.fromRGB(50, 0, 100),
-		auraHolderGlow   = Color3.fromRGB(255, 0, 50),
-		lightingPreset   = "Area17_DarkMatter", 
-		auraModels       = { Common = "ShadowMatter", Uncommon = "VoidResidue", Rare = "EventHorizon", Epic = "Singularity", Legendary = "HawkingRadiation" }
-	},
-	[18] = {
-		name             = "Multiversal Elements",
-		threshold        = 5e128,
-		valueMultiplier  = 5e25,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(0, 255, 255),
-		grassColor       = Color3.fromRGB(30, 30, 30),
-		pathColor        = Color3.fromRGB(15, 15, 15),
-		ambientColor     = Color3.fromRGB(50, 50, 50),
-		fogColor         = Color3.fromRGB(100, 200, 255),
-		auraHolderColor  = Color3.fromRGB(255, 0, 255),
-		auraHolderGlow   = Color3.fromRGB(0, 255, 255),
-		lightingPreset   = "Area18_Multiverse", 
-		auraModels       = { Common = "Paradox", Uncommon = "TimelineThread", Rare = "ParallelShard", Epic = "AlternateReality", Legendary = "MultiverseCore" }
-	},
-	[19] = {
-		name             = "Pure Energy",
-		threshold        = 5e150,
-		valueMultiplier  = 2e29,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(255, 255, 200),
-		grassColor       = Color3.fromRGB(200, 200, 150),
-		pathColor        = Color3.fromRGB(255, 255, 200),
-		ambientColor     = Color3.fromRGB(255, 255, 255),
-		fogColor         = Color3.fromRGB(255, 255, 200),
-		auraHolderColor  = Color3.fromRGB(255, 255, 255),
-		auraHolderGlow   = Color3.fromRGB(255, 255, 150),
-		lightingPreset   = "Area19_PureEnergy", 
-		auraModels       = { Common = "Static", Uncommon = "Kinetic", Rare = "Thermal", Epic = "Ethereal", Legendary = "InfiniteEnergy" }
-	},
-	[20] = {
-		name             = "The Absolute",
-		threshold        = 5e175,
-		valueMultiplier  = 1e34,
-		yOffset          = -4.5,
-		yRotation        = 180,
-		auraPreviewColor = Color3.fromRGB(255, 215, 0),
-		grassColor       = Color3.fromRGB(255, 255, 255),
-		pathColor        = Color3.fromRGB(200, 200, 200),
-		ambientColor     = Color3.fromRGB(255, 240, 200),
-		fogColor         = Color3.fromRGB(255, 255, 255),
-		auraHolderColor  = Color3.fromRGB(255, 215, 0),
-		auraHolderGlow   = Color3.fromRGB(255, 255, 255),
-		lightingPreset   = "Area20_TheAbsolute", 
-		auraModels       = { Common = "Concept", Uncommon = "Truth", Rare = "Existence", Epic = "Reality", Legendary = "Omnipotence" }
-	},
-
-	-- ✨ SPECIAL: THE GOLDEN VAULT (Piggy Bank)
-	["PiggyBank"] = {
-		name             = "The Golden Vault",
-		isSpecial        = true,
-		valueMultiplier  = 1.0,
-		yOffset          = -4.5,
-		yRotation        = 0,
-		auraPreviewColor = Color3.fromRGB(255, 215, 0),
-		grassColor       = Color3.fromRGB(255, 230, 100),
-		pathColor        = Color3.fromRGB(255, 200, 50),
-		ambientColor     = Color3.fromRGB(255, 215, 0),
-		fogColor         = Color3.fromRGB(255, 240, 150),
-		auraHolderColor  = Color3.fromRGB(255, 255, 255),
-		auraHolderGlow   = Color3.fromRGB(255, 215, 0),
-		lightingPreset   = "Area_PiggyBank",
-		icon             = "rbxassetid://14949477468",
-		auraModels       = { Common = "GoldenCube" }
-	}
-}
-
-function AreaRegistry.Get(idx)            return AreaRegistry.Areas[idx] end
-function AreaRegistry.GetName(idx)        return (AreaRegistry.Areas[idx] and AreaRegistry.Areas[idx].name) or ("Area "..idx) end
-function AreaRegistry.GetThreshold(idx)   return AreaRegistry.Areas[idx] and AreaRegistry.Areas[idx].threshold or nil end
-function AreaRegistry.GetMultiplier(idx)  return (AreaRegistry.Areas[idx] and AreaRegistry.Areas[idx].valueMultiplier) or 1.0 end
-function AreaRegistry.GetYOffset(idx)     return (AreaRegistry.Areas[idx] and AreaRegistry.Areas[idx].yOffset)    or 0 end
-function AreaRegistry.GetYRotation(idx)   return (AreaRegistry.Areas[idx] and AreaRegistry.Areas[idx].yRotation)  or 0 end
-
-function AreaRegistry.GetFlipbook(idx)
-	local area = AreaRegistry.Areas[idx]
-	if not area or not area.flipbookImage then return nil end
-	return {
-		image = area.flipbookImage,
-		frames = area.flipbookFrames or 1,
-		fps = area.flipbookFPS or 12,
-		frameW = area.flipbookFrameW or 128,
-		frameH = area.flipbookFrameH or 128,
-		columns = area.flipbookColumns or area.flipbookFrames or 1,
-	}
-end
-
-function AreaRegistry.GetLighting(idx)
-	local area = AreaRegistry.Areas[idx]
-	if not area or not area.lightingPreset then return AreaRegistry.LightingPresets["ClearDay"] end
-	return AreaRegistry.LightingPresets[area.lightingPreset] or AreaRegistry.LightingPresets["ClearDay"]
-end
-
-function AreaRegistry.GetMaxArea()
-	local max = 0
-	for k in pairs(AreaRegistry.Areas) do 
-		if type(k) == "number" and k > max then max = k end 
+local function GetServerHabitatPos()
+	local posPart = HABITAT_HOLDER:FindFirstChild("Position", true)
+	if posPart and posPart:IsA("BasePart") then
+		return posPart.Position
 	end
-	return max
+	return HABITAT_HOLDER:GetPivot().Position
 end
 
-function AreaRegistry.GetBestNextArea(currentArea, farmEvaluation)
-	local maxArea  = AreaRegistry.GetMaxArea()
-	local bestArea = nil
-	for i = currentArea + 1, maxArea do
-		local area = AreaRegistry.Areas[i]
-		if area and not area.isSpecial and farmEvaluation >= (area.threshold or 0) then
-			bestArea = i
-		end
+local AURA_HOLDER    = workspace:WaitForChild("AuraHolder")
+
+local lastFire          = {}
+local holdStart         = {}
+local hatchery          = {}
+
+local function GetAreaAuraModels(areaId)
+	local config = nil
+	if type(AreaRegistry.GetArea) == "function" then
+		config = AreaRegistry.GetArea(areaId)
+	elseif type(AreaRegistry.GetAreaConfig) == "function" then
+		config = AreaRegistry.GetAreaConfig(areaId)
+	elseif AreaRegistry.Areas then
+		config = AreaRegistry.Areas[areaId]
 	end
-	return bestArea
+	return config and config.auraModels or nil
 end
 
-function AreaRegistry.CanAdvance(currentArea, farmEvaluation)
-	local best = AreaRegistry.GetBestNextArea(currentArea, farmEvaluation)
-	if best then return true, best end
-	return false, nil
+local function GetHatcheryMax(data)
+	if type(UpgradeConfig.GetHatcheryMax) == "function" then
+		return UpgradeConfig.GetHatcheryMax(data)
+	end
+	return AdminConfig.HatcheryMax or 150
 end
 
--- =====================================================================
--- 3-STEP FALLBACK HELPER: FETCHES 3D MODEL SAFELY
--- =====================================================================
-function AreaRegistry.FetchAuraModel(areaIndex, rarityName)
-	local ReplicatedStorage = game:GetService("ReplicatedStorage")
-	local AreaAssets = ReplicatedStorage:FindFirstChild("AreaAssets")
-	local GlobalAuras = ReplicatedStorage:FindFirstChild("Auras")
+local function GetHabitatCapacity(data)
+	if type(UpgradeConfig.GetHabitatCapacity) == "function" then
+		return UpgradeConfig.GetHabitatCapacity(data)
+	end
+	return AdminConfig.BaseHabitatCapacity or 50
+end
 
-	local areaConfig = AreaRegistry.Areas[areaIndex]
-	if not areaConfig then return nil end
+local function GetMutationSpeedMult(data)
+	local cfg = UpgradeConfig.GetUpgradeConfig("mutationSpeed")
+	return (cfg and cfg.apply) and cfg.apply(data) or 1
+end
 
-	local expectedModelName = areaConfig.auraModels and areaConfig.auraModels[rarityName]
+local function TrackTierSpawn(data, tierName)
+	if tierName == "Legendary" then data.totalLegendaryCubes = (data.totalLegendaryCubes or 0) + 1
+	elseif tierName == "Mythic" then data.totalMythicCubes = (data.totalMythicCubes or 0) + 1
+	elseif tierName == "Divine" then data.totalDivineCubes = (data.totalDivineCubes or 0) + 1
+	elseif tierName == "Celestial" then data.totalCelestialCubes = (data.totalCelestialCubes or 0) + 1
+	elseif tierName == "Cosmic" then data.totalCosmicCubes = (data.totalCosmicCubes or 0) + 1
+	elseif tierName == "Omni" then data.totalOmniCubes = (data.totalOmniCubes or 0) + 1
+	end
+end
 
-	if expectedModelName and AreaAssets then
-		local areaFolder = AreaAssets:FindFirstChild("Area" .. tostring(areaIndex))
+Players.PlayerAdded:Connect(function(p)
+	hatchery[p.UserId] = AdminConfig.HatcheryMax
+end)
 
-		if type(areaIndex) == "string" then
-			areaFolder = AreaAssets:FindFirstChild(areaIndex)
-		end
+Players.PlayerRemoving:Connect(function(p)
+	hatchery[p.UserId]=nil; holdStart[p.UserId]=nil; lastFire[p.UserId]=nil
+end)
 
-		if areaFolder and areaFolder:FindFirstChild("Auras") then
-			local specificModel = areaFolder.Auras:FindFirstChild(expectedModelName)
-			if specificModel then
-				return specificModel:Clone() 
+task.spawn(function()
+	local PR = ServerScriptService:WaitForChild("PrestigeReset", 30)
+	if PR then
+		PR.Event:Connect(function(player)
+			local uid = player.UserId
+			local data = GameManager.GetData(uid)
+			hatchery[uid] = data and GetHatcheryMax(data) or AdminConfig.HatcheryMax
+			holdStart[uid]=nil; lastFire[uid]=nil
+		end)
+	end
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(0.1)
+		for _, player in ipairs(Players:GetPlayers()) do
+			local uid = player.UserId
+			local data = GameManager.GetData(uid)
+			local hatchMax = data and GetHatcheryMax(data) or AdminConfig.HatcheryMax
+			local prev = hatchery[uid] or hatchMax
+
+			local hasInstaHatchery = BoostManager.IsActive(uid, "InstaHatchery")
+			local refillMultiplier = BoostManager.GetHatcheryMultiplier(uid)
+
+			if hasInstaHatchery then
+				hatchery[uid] = hatchMax
+			else
+				if holdStart[uid] then
+					hatchery[uid] = math.max(0, prev - AdminConfig.HatcheryDrainRate * 0.1)
+				else
+					hatchery[uid] = math.min(hatchMax, prev + (AdminConfig.HatcheryRefillRate * refillMultiplier * 0.1))
+				end
+			end
+
+			if hatchery[uid] ~= prev then
+				UpdateHatcheryBridge:Fire(player, { current=hatchery[uid], max=hatchMax })
+			end
+
+			if hatchery[uid] <= 0 and holdStart[uid] then
+				holdStart[uid] = nil
+				ReplicatedStorage.RemoteEvents.ForceStopHold:FireClient(player)
 			end
 		end
+	end
+end)
 
-		-- Do not warn if this is a special area designed to bypass normal loading
-		if not areaConfig.isSpecial then
-			warn("[AreaRegistry] Missing physical model: " .. tostring(expectedModelName) .. " in Area " .. tostring(areaIndex) .. ". Falling back to placeholder.")
+local function GetAFKSpeed(runtime)
+	local idleTime = tick() - runtime.lastActiveTime
+	local speed = MutationConfig.AFKDecay[1].speed
+	for _, e in ipairs(MutationConfig.AFKDecay) do
+		if idleTime >= e.time then speed = e.speed end
+	end
+	return speed
+end
+
+local function GetEffectiveFireRate(uid)
+	local rushMult = BoostManager.GetSpawnRateMultiplier(uid)
+	local weatherSpawnMult, _ = WeatherManager.GetMultipliers(uid)
+	local effectiveFireRate = AdminConfig.FireRate / (rushMult * weatherSpawnMult)
+	if effectiveFireRate < 0.05 then effectiveFireRate = 0.05 end
+	return effectiveFireRate
+end
+
+local function SendHUDUpdate(player)
+	local uid = player.UserId
+	local data = GameManager.GetData(uid)
+	local runtime = GameManager.GetRuntime(uid)
+	if not data or not runtime then return end
+
+	local storedCount = runtime.storedCubeCount or 0
+	local activeMV = runtime.activeMutatedValue or 0
+
+	local boostMult = BoostManager.GetValueMultiplier(uid) * BoostManager.GetSpawnRateMultiplier(uid)
+	local displayRate = math.floor(activeMV * boostMult)
+
+	UpdateHUDBridge:Fire(player, {
+		currency        = data.currency, 
+		pendingAuras    = storedCount, 
+		habitatCapacity = GetHabitatCapacity(data), 
+		rate            = displayRate,
+		passiveInterval = UpgradeConfig.GetPassiveInterval(data), 
+		totalEarned     = data.totalEarned or 0,
+		soulAuras       = data.soulAuras or 0, 
+		farmEvaluation  = data.farmEvaluation or 0,
+		goldenAuras     = data.goldenAuras or 0, 
+		boostInventory  = data.boostInventory or {},
+		prestigeCount   = data.prestigeCount or 0,
+		upgrades        = data.upgrades or {},
+		totalCubesProduced = data.totalCubesProduced or 0,
+		currentArea     = data.currentArea or 1,
+		discoveredTiers = data.discoveredTiers or {},
+		currentFireRate = GetEffectiveFireRate(uid),
+		boostMultiplier = boostMult ,
+		shipCapacity    = UpgradeConfig.GetShippingCapacity(data) or AdminConfig.PlatformCapacity,
+	})
+end
+
+task.spawn(function()
+	while true do
+		local tickInterval = AdminConfig.MutationTickInterval or MutationConfig.CheckInterval
+		task.wait(tickInterval)
+
+		for _, player in ipairs(Players:GetPlayers()) do
+			local uid = player.UserId
+			local data = GameManager.GetData(uid)
+			local runtime = GameManager.GetRuntime(uid)
+			if not data or not runtime then continue end
+
+			local dt = tickInterval * GetAFKSpeed(runtime) * GetMutationSpeedMult(data) * (AdminConfig.MutationSpeedMultiplier or 1)
+			local mutationBatch = {}
+			local currentArea = data.currentArea or 1
+			local areaModels = GetAreaAuraModels(currentArea)
+
+			for cubeId, cube in pairs(runtime.cubes) do
+				local oldMutatedValue = MutationConfig.GetMutatedValue(cube)
+				local mutated = false
+
+				local prev = cube.effectiveElapsed
+				cube.effectiveElapsed += dt
+				local pl = MutationConfig.GetValueBonusLevel(prev)
+				local nl = MutationConfig.GetValueBonusLevel(cube.effectiveElapsed)
+
+				if nl > pl then
+					mutated = true
+					local be = MutationConfig.ValueBonuses[nl]
+					table.insert(mutationBatch, { 
+						cubeId = cubeId, mutationType = "valueBonus", bonusLevel = nl, 
+						bonusPercent = be and math.floor(be.bonus * 100) or 0 
+					})
+				end
+
+				local maxTier = AdminConfig.MutationMaxTierIndex or 3
+				local upgrades = 0
+
+				while cube.tierIndex < maxTier and cube.tierIndex < #TierConfig.Tiers and upgrades < 5 do
+					if areaModels then
+						local nextTierName = TierConfig.Tiers[cube.tierIndex + 1].name
+						if not areaModels[nextTierName] then break end
+					end
+
+					local timeSince = cube.effectiveElapsed - (cube.lastUpgradeElapsed or 0)
+					local bestChance, bestTime = 0, 0
+					for _, threshold in ipairs(MutationConfig.TierUpgrades) do
+						if timeSince >= threshold.time then bestChance = threshold.chance; bestTime = threshold.time end
+					end
+
+					if bestChance <= 0 then break end
+
+					if math.random() <= bestChance then
+						local oldTier = TierConfig.Tiers[cube.tierIndex]
+						cube.tierIndex += 1
+						local newTier = TierConfig.Tiers[cube.tierIndex]
+						cube.baseValue = math.floor(cube.baseValue * (newTier.multiplier/oldTier.multiplier))
+						cube.color = newTier.color; cube.glow = newTier.glow; cube.tierName = newTier.name
+						cube.lastUpgradeElapsed = (cube.lastUpgradeElapsed or 0) + bestTime
+						upgrades += 1; mutated = true
+
+						local auraKey = currentArea .. "_" .. newTier.name
+						if not data.discoveredTiers then data.discoveredTiers = {} end
+						if not data.discoveredTiers[auraKey] then
+							data.discoveredTiers[auraKey] = true
+							GameManager.SavePlayer(player)
+							UpdateHUDBridge:Fire(player, { discoveredTiers = data.discoveredTiers })
+						end
+
+						table.insert(mutationBatch, { 
+							cubeId = cubeId, mutationType = "tierUpgrade",
+							newColor = newTier.color, newGlow = newTier.glow, 
+							tierName = newTier.name, currentArea = currentArea
+						})
+
+						TrackTierSpawn(data, newTier.name)
+					else break end
+				end
+
+				if mutated then
+					local newMutatedValue = MutationConfig.GetMutatedValue(cube)
+					runtime.totalMutatedValue = (runtime.totalMutatedValue or 0) + (newMutatedValue - oldMutatedValue)
+					if not cube.isStored then runtime.activeMutatedValue = (runtime.activeMutatedValue or 0) + (newMutatedValue - oldMutatedValue) end
+
+					if #mutationBatch > 0 then
+						for i = #mutationBatch, 1, -1 do
+							if mutationBatch[i].cubeId == cubeId then
+								mutationBatch[i].newValue = newMutatedValue
+								break
+							end
+						end
+					end
+				end
+			end
+
+			if #mutationBatch > 0 then CubeMutatedBatchBridge:Fire(player, mutationBatch) end
+			SendHUDUpdate(player)
+		end
+	end
+end)
+
+local function GetHoldMultiplier(holdTime, data)
+	local upgrades = data and data.upgrades or {}
+	local speedData = upgrades["multiplierSpeed"]
+	local speedLevel = (typeof(speedData) == "table" and speedData.level) or (typeof(speedData) == "number" and speedData) or 0
+	local playerMultSpeed = 1.0 + (speedLevel * 0.05)
+
+	local playerMaxTier = 5
+	local tierUnlocks = {
+		{ upgradeId = "unlockOmniMult", tier = 10 }, { upgradeId = "unlockUniversalMult", tier = 9 },
+		{ upgradeId = "unlockGodlyMult", tier = 8 }, { upgradeId = "unlockCosmicMult", tier = 7 },
+		{ upgradeId = "unlockMythicMult", tier = 6 },
+	}
+
+	for _, tData in ipairs(tierUnlocks) do
+		local lvl = upgrades[tData.upgradeId]
+		local finalLvl = (typeof(lvl) == "table" and lvl.level) or (typeof(lvl) == "number" and lvl) or 0
+		if finalLvl > 0 then playerMaxTier = tData.tier; break end
+	end
+
+	local milestoneReduction = 0
+	local clickMilestoneCfg = EpicUpgradeConfig.GetUpgradeConfig("epicClickMilestone")
+	if clickMilestoneCfg and clickMilestoneCfg.apply then
+		milestoneReduction = clickMilestoneCfg.apply(data)
+	end
+
+	local function GetMilestoneTime(index)
+		if not AdminConfig.MilestoneData[index] then return 999999 end
+		return math.max(0, AdminConfig.MilestoneData[index].time - milestoneReduction)
+	end
+
+	local effectiveTime = holdTime * playerMultSpeed
+	local currentTier = 1
+
+	for i = 1, playerMaxTier do
+		if AdminConfig.MilestoneData[i] and effectiveTime >= GetMilestoneTime(i) then currentTier = i end
+	end
+
+	local nextTier = math.min(currentTier + 1, playerMaxTier)
+	if currentTier == playerMaxTier then return AdminConfig.MilestoneData[currentTier].mult, AdminConfig.MilestoneData[currentTier].luck end
+
+	local timePassed = effectiveTime - GetMilestoneTime(currentTier)
+	local timeNeeded = GetMilestoneTime(nextTier) - GetMilestoneTime(currentTier)
+	local ratio = timeNeeded > 0 and (timePassed / timeNeeded) or 1 
+
+	local cMult = AdminConfig.MilestoneData[currentTier].mult
+	local nMult = AdminConfig.MilestoneData[nextTier].mult
+	local smoothMult = cMult + ((nMult - cMult) * ratio)
+
+	return smoothMult, AdminConfig.MilestoneData[currentTier].luck
+end
+
+local function RollWithLuck(luckBonus)
+	local tiers = TierConfig.Tiers
+	local adjusted, total = {}, 0
+
+	for _, tier in ipairs(tiers) do
+		local chance = tier.chance
+		if tier.name ~= "Common" then 
+			chance = chance * (1 + (luckBonus or 0)) 
+		end
+		table.insert(adjusted, { tier=tier, chance=chance })
+		total += chance
+	end
+
+	local r = math.random() * total
+	local cum = 0
+	local rolledTier = nil
+
+	for _, e in ipairs(adjusted) do 
+		cum += e.chance
+		if not rolledTier and r <= cum then 
+			rolledTier = e.tier 
+		end 
+	end
+
+	rolledTier = rolledTier or tiers[1]
+	return rolledTier
+end
+
+local function SpawnAura(player, data, runtime, holdMult, luckBonus)
+	local uid  = player.UserId
+	local tier = RollWithLuck(luckBonus)
+	local tierIndex = 1
+	for i, t in ipairs(TierConfig.Tiers) do if t.name == tier.name then tierIndex=i; break end end
+
+	local currentArea = data.currentArea or 1
+	local areaModels = GetAreaAuraModels(currentArea)
+
+	if areaModels then
+		while tierIndex > 1 do
+			local checkName = TierConfig.Tiers[tierIndex].name
+			if areaModels[checkName] then break end
+			tierIndex -= 1
+		end
+		tier = TierConfig.Tiers[tierIndex] 
+	end
+
+	local totalValueMultiplier = UpgradeConfig.GetTotalValueMultiplier(data)
+
+	local prestigeMult    = PrestigeModule.GetMultiplier(data.soulAuras, data)
+	local areaMult        = AreaRegistry.GetMultiplier(data.currentArea or 1)
+	local boostValueMult  = BoostManager.GetValueMultiplier(uid)
+	local _, weatherValueMult = WeatherManager.GetMultipliers(uid)
+
+	local epicLuckCfg = EpicUpgradeConfig.GetUpgradeConfig("epicLuck")
+	if epicLuckCfg and epicLuckCfg.apply then luckBonus = (luckBonus or 0) + epicLuckCfg.apply(data) end
+
+	local calcMultFloat = totalValueMultiplier * prestigeMult * areaMult * boostValueMult * weatherValueMult
+	local baseValue = math.floor(AdminConfig.BaseAuraValue * tier.multiplier * calcMultFloat)
+
+	local godlyCritCfg = UpgradeConfig.GetUpgradeConfig("godlyCritChance")
+	local critChance = (godlyCritCfg and godlyCritCfg.apply) and godlyCritCfg.apply(data) or 0
+	local isGodlyCrit = false
+
+	if critChance > 0 and (math.random() * 100) <= critChance then
+		isGodlyCrit = true
+		baseValue = baseValue * 500 
+	end
+
+	local totalValue = baseValue + math.floor(baseValue * (holdMult - 1))
+
+	local spawnPos = GetServerHabitatPos() + Vector3.new(math.random(-3,3), 10, math.random(-3,3))  
+	local activeAuraModel = workspace:FindFirstChild("AuraHolder") and workspace.AuraHolder:FindFirstChildWhichIsA("Model")
+	if activeAuraModel then
+		local spawnPoint = activeAuraModel:FindFirstChild("AuraSpawnPoint", true)
+		if spawnPoint and spawnPoint:IsA("BasePart") then
+			local size = spawnPoint.Size
+			local randX = (math.random() - 0.5) * size.X
+			local randZ = (math.random() - 0.5) * size.Z
+			spawnPos = (spawnPoint.CFrame * CFrame.new(randX, 0, randZ)).Position
 		end
 	end
 
-	if GlobalAuras then
-		local placeholderModel = GlobalAuras:FindFirstChild(rarityName)
-		if placeholderModel then
-			return placeholderModel:Clone() 
+	local cubeRecord = { spawnTime=tick(), effectiveElapsed=0, lastUpgradeElapsed=0, baseValue=totalValue, tierIndex=tierIndex, tierName=tier.name, color=tier.color, glow=tier.glow, isStored=false, currentArea=currentArea }
+
+	if AdminConfig.MutationInstantMax then
+		local mb = MutationConfig.ValueBonuses[#MutationConfig.ValueBonuses]
+		if mb then cubeRecord.effectiveElapsed = mb.time + 1 end
+	end
+
+	local cubeId = GameManager.AddCube(uid, cubeRecord)
+	if not cubeId then return end
+
+	local epicDoubleSpawn = EpicUpgradeConfig.GetUpgradeConfig("epicDoubleSpawn")
+	if epicDoubleSpawn and epicDoubleSpawn.apply and epicDoubleSpawn.apply(data) > 0 then
+		local doubleCubeId = GameManager.AddCube(uid, cubeRecord)
+		if doubleCubeId then
+			AuraSpawnedBridge:Fire(player, { cubeId=doubleCubeId, tier=tier.name, color=tier.color, glow=tier.glow, value=totalValue, spawnPos=spawnPos, currentArea = currentArea, isGodlyCrit = isGodlyCrit })
+			data.totalCubesProduced = (data.totalCubesProduced or 0) + 1
+			TrackTierSpawn(data, tier.name)
 		end
 	end
 
-	if not areaConfig.isSpecial then
-		warn("CRITICAL [AreaRegistry]: No custom model OR placeholder found for rarity: " .. tostring(rarityName))
+	local auraKey = currentArea .. "_" .. tier.name
+	if not data.discoveredTiers then data.discoveredTiers = {} end
+	if not data.discoveredTiers[auraKey] then
+		data.discoveredTiers[auraKey] = true
+		GameManager.SavePlayer(player)
+		UpdateHUDBridge:Fire(player, { discoveredTiers = data.discoveredTiers })
 	end
 
+	data.totalCubesProduced = (data.totalCubesProduced or 0) + 1
+	TrackTierSpawn(data, tier.name)
+
+	runtime.lastActiveTime = tick()
+
+	AuraSpawnedBridge:Fire(player, { cubeId=cubeId, tier=tier.name, color=tier.color, glow=tier.glow, value=totalValue, spawnPos=spawnPos, currentArea = currentArea, isGodlyCrit = isGodlyCrit })
+end
+
+ProduceAuraBridge:Connect(function(player, action)
+	if player:GetAttribute("IsTransitioning") or player:GetAttribute("InSpecialArea") then
+		if action == "start" then holdStart[player.UserId] = nil end
+		return
+	end
+
+	local uid = player.UserId
+	local now = tick()
+	local data = GameManager.GetData(uid)
+	local runtime = GameManager.GetRuntime(uid)
+
+	if action == "start" then 
+		if data and runtime then
+			local storedCount = runtime.storedCubeCount or 0
+			if storedCount >= GetHabitatCapacity(data) then HabitatFull:FireClient(player); return end
+		end
+		if (hatchery[uid] or 0) > 0.5 then holdStart[uid] = now 
+		else UpdateHatcheryBridge:Fire(player, { current = 0, max = data and GetHatcheryMax(data) or AdminConfig.HatcheryMax }) end
+		return 
+	end
+
+	if action == "stop" then holdStart[uid] = nil; return end
+	if not data or not runtime then return end
+
+	local capacity = GetHabitatCapacity(data)
+	local storedCount = runtime.storedCubeCount or 0
+
+	if storedCount >= capacity then HabitatFull:FireClient(player); return end
+
+	-- FIX 4: Shrink the in-flight cube buffer from +1000 down to +60 to reduce discarded cubes
+	if runtime.cubeCount >= capacity + 60 then return end 
+
+	if (hatchery[uid] or 0) <= 0.5 then 
+		UpdateHatcheryBridge:Fire(player, { current = 0, max = data and GetHatcheryMax(data) or AdminConfig.HatcheryMax })
+		return 
+	end
+	if not holdStart[uid] then return end
+
+	local rushMult = BoostManager.GetSpawnRateMultiplier(uid)
+	local weatherSpawnMult, _ = WeatherManager.GetMultipliers(uid)
+	local effectiveFireRate = AdminConfig.FireRate / (rushMult * weatherSpawnMult)
+	local spawnCount = 1
+
+	if effectiveFireRate < 0.05 then
+		spawnCount = math.floor(0.05 / effectiveFireRate)
+		effectiveFireRate = 0.05
+	end
+
+	if lastFire[uid] then
+		local timeSinceLast = now - lastFire[uid]
+		if timeSinceLast < (effectiveFireRate - 0.015) then return end 
+	end
+	lastFire[uid] = now
+
+	local holdTime = now - holdStart[uid]
+	local holdMult, luckBonus = GetHoldMultiplier(holdTime, data)
+
+	local doubleSpawnCfg = UpgradeConfig.GetUpgradeConfig("doubleSpawnChance")
+	local doubleChance = (doubleSpawnCfg and doubleSpawnCfg.apply) and doubleSpawnCfg.apply(data) or 0
+
+	for i = 1, spawnCount do 
+		SpawnAura(player, data, runtime, holdMult, luckBonus) 
+
+		if doubleChance > 0 and math.random(1, 100) <= doubleChance then
+			SpawnAura(player, data, runtime, holdMult, luckBonus) 
+		end
+	end
+
+	SendHUDUpdate(player)
+	UpdateHatcheryBridge:Fire(player, { current=hatchery[uid], max=GetHatcheryMax(data) })
+end)
+
+CubeStoredBridge:Connect(function(player, cubeId)
+	local uid = player.UserId
+	local runtime = GameManager.GetRuntime(uid)
+	local data = GameManager.GetData(uid)
+	if runtime and runtime.cubes[cubeId] then
+		local wasStored = GameManager.MarkCubeStored(uid, cubeId)
+		SendHUDUpdate(player)
+
+		local storedCount = runtime.storedCubeCount or 0
+		if storedCount >= GetHabitatCapacity(data) then HabitatFull:FireClient(player) end
+
+		if not wasStored then
+			CubeStoredBridge:Fire(player, { rejected = true, cubeId = cubeId })
+		end
+	end
+end)
+
+CubeSmushedBridge:Connect(function(player, cubeId)
+	local uid = player.UserId
+
+	GameManager.RemoveCube(uid, cubeId)
+	SendHUDUpdate(player)
+	local data = GameManager.GetData(uid)
+	UpdateHatcheryBridge:Fire(player, { current = hatchery[uid], max = GetHatcheryMax(data) })
+end)
+
+-- UpgradeConfig
+-- Location: ReplicatedStorage > Modules > UpgradeConfig
+local AdminConfig = require(script.Parent.AdminConfig)
+local UpgradeConfig = {}
+
+UpgradeConfig.Tiers = {
+	[1] = {
+		tierName = "Tier 1",
+		unlockRequirement = 0,
+		upgrades = {
+			blockValue = {
+				baseCost = 45, costScale = 1.03, maxLevel = 100,
+				apply = function(data) return ((data.upgrades and data.upgrades.blockValue) or 0) * 0.1 end,
+				displayName = "Glow Enhancement", description = "Increases base aura value by +10%", iconId = "rbxassetid://98075952013490",
+			},
+			hatcheryCapacity = {
+				baseCost = 225, costScale = 1.12, maxLevel = 50,
+				apply = function(data) return ((data.upgrades and data.upgrades.hatcheryCapacity) or 0) * 1 end,
+				displayName = "Aura Expansion", description = "Increases the max capacity of your Hatchery by 1", iconId = "rbxassetid://140457223774888",
+			},
+			habitatCapacity = {
+				baseCost = 425, costScale = 1.12, maxLevel = 25,
+				apply = function(data) return ((data.upgrades and data.upgrades.habitatCapacity) or 0) * 2 end,
+				displayName = "Habitat Reservoir", description = "Increase habitat capacity by 2", iconId = "rbxassetid://78419118472133",
+			},
+			unlockMythicMult = { 
+				baseCost = 2500, costScale = 1, maxLevel = 1, 
+				apply = function(data) return ((data.upgrades and data.upgrades.unlockMythicMult) or 0) == 1 end,
+				displayName = "Mythic Multiplier",
+				description = "Allows you to hold past the legendary multiplier! Unlocks the " .. (AdminConfig.MilestoneData[6] and AdminConfig.MilestoneData[6].name or "MYTHIC") .. " tier!",
+				iconId = "rbxassetid://113828358885527",
+			},
+		}
+	},
+	[2] = {
+		tierName = "Tier 2",
+		unlockRequirement = 150,
+		upgrades = {
+			blockValueT2 = {
+				baseCost = 1000, costScale = 1.05, maxLevel = 125,
+				apply = function(data) return ((data.upgrades and data.upgrades.blockValueT2) or 0) * 0.25 end,
+				displayName = "Faster Aura Pulse", description = "Increased aura value by +25%", iconId = "rbxassetid://114779329450267",
+			},
+			passiveTickSpeedT2 = {
+				baseCost = 20000, costScale = 1.45, maxLevel = 5,
+				apply = function(data) return ((data.upgrades and data.upgrades.passiveTickSpeedT2) or 0) * 0.05 end,
+				displayName = "Advanced Aura Generation", description = "Speeds Up Passive Aura Rate By 0.05s", iconId = "rbxassetid://101759432122769",
+			},	
+			shipCapacityT1 = {
+				baseCost = 8000, costScale = 1.25, maxLevel = 25,
+				apply = function(data) return ((data.upgrades and data.upgrades.shipCapacityT1) or 0) * 1 end,	iconId = "rbxassetid://121937028282282",
+				displayName = "Shipping Expansion", description = "Increases the max auras a ship can carry by 1.",
+			},
+			autoDispatchSpeed = {
+				baseCost = 15000, costScale = 1.1, maxLevel = 5,
+				apply = function(data) return ((data.upgrades and data.upgrades.autoDispatchSpeed) or 0) * 0.1 end,
+				displayName = "Premium Fuel", description = "Auto Shipping Speed decreased by 1 Second", iconId = "rbxassetid://72413676865208",
+			},
+		}
+	},
+	[3] = {
+		tierName = "Tier 3",
+		unlockRequirement = 150, 
+		upgrades = {
+			auraValueT3 = {
+				baseCost = 250000, costScale = 1.5, maxLevel = 4,
+				apply = function(data) return ((data.upgrades and data.upgrades.auraValueT3) or 0) * 0.5 end,
+				displayName = "Aura Purifier", description = "Purifies Your Auras, Increases Value by 50%",  iconId = "rbxassetid://104033623069082",
+			},
+			hatcheryT3 = {
+				baseCost = 300000, costScale = 1.05, maxLevel = 25,
+				apply = function(data) return ((data.upgrades and data.upgrades.hatcheryT3) or 0) * 2 end,
+				displayName = "Increased Hatchery", description = "Provides even more hatchery space for more auras by 2",  iconId = "rbxassetid://93371640313869",
+			},
+			habitatT3 = {
+				baseCost = 2000000, costScale = 1.4, maxLevel = 15,
+				apply = function(data) return ((data.upgrades and data.upgrades.habitatT3) or 0) * 10 end,
+				displayName = "Industrial Packaging", description = "Increases Habitat Capacity by 10",  iconId = "rbxassetid://78525019638530",
+			},
+			droneFrequency = {
+				baseCost = 100000, costScale = 1.02, maxLevel = 25,
+				apply = function(data) return ((data.upgrades and data.upgrades.droneFrequency) or 0) * 0.1 end,
+				displayName = "Unstable Shots", description = "Random Aura Shots happen More Frequently by +1%",  iconId = "rbxassetid://133715967622098",
+			},
+		}
+	},
+	[4] = {
+		tierName = "Tier 4",
+		unlockRequirement = 225, 
+		upgrades = {
+			auraValueT4 = {
+				baseCost = 15000000, costScale = 1.03, maxLevel = 250,
+				apply = function(data) return ((data.upgrades and data.upgrades.auraValueT4) or 0) * 0.5 end,
+				displayName = "Shinier Auras", description = "Auras Shine Brighter and increase value by 5%",  iconId = "rbxassetid://126092269539671",
+			},
+			hatcheryT4 = {
+				baseCost = 40000000, costScale = 1.05, maxLevel = 20,
+				apply = function(data) return ((data.upgrades and data.upgrades.hatcheryT4) or 0) * 5 end,
+				displayName = "Advanced Hatchery", description = "Increases Hatchery by 5",  iconId = "rbxassetid://137765991302601",
+			},
+			autoDispatchSpeedT4 = {
+				baseCost = 50000000, costScale = 2, maxLevel = 3,
+				apply = function(data) return ((data.upgrades and data.upgrades.autoDispatchSpeed) or 0) * 0.1 end,
+				displayName = "Powerful Engines", description = "Auto Shipping Speed decreased by 3 Seconds",  iconId = "rbxassetid://107466504388101",
+			},
+			conveyerSpeedT1 = {
+				baseCost = 15000000, costScale = 2, maxLevel = 10,
+				apply = function(data) return ((data.upgrades and data.upgrades.auraValueT6) or 0) * 0.1 end,
+				displayName = "Speedy Conveyers", description = "Increases Conveyer Speed by 1%",  iconId = "rbxassetid://134975192722597",
+			},
+		}
+	},
+	[5] = {
+		tierName = "Tier 5",
+		unlockRequirement = 200,
+		upgrades = {
+			habitatT5 = {
+				baseCost = 5e8, costScale = 1.05, maxLevel = 50,
+				apply = function(data) return ((data.upgrades and data.upgrades.habitatT5) or 0) * 5 end,
+				displayName = "Deep Habitats", description = "House More Auras, Increases Habitat Space by 5",  iconId = "rbxassetid://127255411690284",
+			},
+			unlockCosmicMult = { 
+				baseCost = 2.5e9, costScale = 1, maxLevel = 1, 
+				apply = function(data) return ((data.upgrades and data.upgrades.unlockCosmicMult) or 0) == 1 end,
+				displayName = "Cosmic Multiplier", 
+				description = "Breaks the Mythic limit, unlocking the " .. (AdminConfig.MilestoneData[7] and AdminConfig.MilestoneData[7].name or "COSMIC") .. " tier!",   iconId = "rbxassetid://80891448925628",
+			},
+			auraValueT5 = {
+				baseCost = 1.5e9, costScale = 1.01, maxLevel = 500,
+				apply = function(data) return ((data.upgrades and data.upgrades.auraValueT6) or 0) * 0.1 end,
+				displayName = "Auric Infuser", description = "Infuse auras with eachother increasing value by 1%",  iconId = "rbxassetid://140398335441235",
+			},
+			shipCapacityT2 = {
+				baseCost = 5e8, costScale = 1.10, maxLevel = 20,
+				apply = function(data) return ((data.upgrades and data.upgrades.shipCapacityT2) or 0) * 2 end,
+				displayName = "Ships 'In' Ships", description = "Increases the max auras a ship can carry by 2.",  iconId = "rbxassetid://73988181106956",
+			},
+		}
+	},
+	[6] = {
+		tierName = "Tier 6",
+		unlockRequirement = 300,
+		upgrades = {
+			passiveSpeedT6 = {
+				baseCost = 5e10, costScale = 1.5, maxLevel = 25,
+				apply = function(data) return ((data.upgrades and data.upgrades.passiveSpeedT6) or 0) * 0.1 end,
+				displayName = "Faster Than Light", description = "Auras spawn before you even need them (-0.1s delay).",
+			},
+			auraValueT6 = {
+				baseCost = 1.5e11, costScale = 1.3, maxLevel = 200,
+				apply = function(data) return ((data.upgrades and data.upgrades.auraValueT6) or 0) * 5.0 end,
+				displayName = "Tachyon Infusion", description = "Infuse auras with speed particles for +500% value per level.",
+			},
+			doubleSpawnChance = {
+				baseCost = 2e10, costScale = 1.35, maxLevel = 25,
+				apply = function(data) return ((data.upgrades and data.upgrades.doubleSpawnChance) or 0) * 1 end,
+				displayName = "Mitosis Splitting", description = "1% chance for a spawner to generate two auras at once.",
+			},
+			offlineTimeCap = {
+				baseCost = 3.5e10, costScale = 1.4, maxLevel = 25,
+				apply = function(data) return ((data.upgrades and data.upgrades.offlineTimeCap) or 0) * 1 end,
+				displayName = "Stasis Batteries", description = "Increases max offline earnings time by 1 hour.",
+			},
+			goldenAuraValue = {
+				baseCost = 8e10, costScale = 1.5, maxLevel = 25,
+				apply = function(data) return ((data.upgrades and data.upgrades.goldenAuraValue) or 0) * 0.1 end,
+				displayName = "Refined Gold", description = "Golden Auras collected grant +10% more premium currency.",
+			},
+			shippingCapacityT6 = {
+				baseCost = 1e11, costScale = 1.45, maxLevel = 25,
+				apply = function(data) return ((data.upgrades and data.upgrades.shippingCapacityT6) or 0) * 500 end,
+				displayName = "Wormhole Freight", description = "Ships carry +500 more auras through hyperspace.",
+			},
+			eliteSpawnChance = {
+				baseCost = 25000000, costScale = 1.4, maxLevel = 25,
+				apply = function(data) return ((data.upgrades and data.upgrades.eliteSpawnChance) or 0) * 1.0 end,
+				displayName = "Luckier Shots", description = "Increases the chance of an Elite Aura spawning by 1%.",
+			},
+		}
+	},
+	[7] = {
+		tierName = "Tier 7",
+		unlockRequirement = 500,
+		upgrades = {
+			hatcheryT7 = {
+				baseCost = 1e13, costScale = 1.4, maxLevel = 100,
+				apply = function(data) return ((data.upgrades and data.upgrades.hatcheryT7) or 0) * 50 end,
+				displayName = "Void Reservoirs", description = "Store energy in the endless void (+50 capacity).",
+			},
+			habitatT7 = {
+				baseCost = 5e13, costScale = 1.45, maxLevel = 100,
+				apply = function(data) return ((data.upgrades and data.upgrades.habitatT7) or 0) * 250 end,
+				displayName = "Antimatter Containment", description = "Safely store massive amounts of auras (+250 capacity).",
+			},
+			prestigeMultiplierBonus = {
+				baseCost = 2e13, costScale = 1.6, maxLevel = 10,
+				apply = function(data) return ((data.upgrades and data.upgrades.prestigeMultiplierBonus) or 0) * 0.05 end,
+				displayName = "Soul Memory", description = "Increases the multiplier gained from Prestiging by 5%.",
+			},
+			droneRewardMulti = {
+				baseCost = 8e13, costScale = 1.5, maxLevel = 25,
+				apply = function(data) return ((data.upgrades and data.upgrades.droneRewardMulti) or 0) * 0.2 end,
+				displayName = "Heavier Payloads", description = "Random drops contain 20% more resources.",
+			},
+		}
+	},
+	[8] = {
+		tierName = "Tier 8",
+		unlockRequirement = 1000,
+		upgrades = {
+			auraValueT8 = {
+				baseCost = 5e15, costScale = 1.35, maxLevel = 250,
+				apply = function(data) return ((data.upgrades and data.upgrades.auraValueT8) or 0) * 25.0 end,
+				displayName = "Reality Bending", description = "Auras pull value from alternate dimensions (+2,500% value).",
+			},
+			godlyCritChance = {
+				baseCost = 1e16, costScale = 1.4, maxLevel = 25,
+				apply = function(data) return ((data.upgrades and data.upgrades.godlyCritChance) or 0) * 0.2 end,
+				displayName = "Divine Intervention", description = "0.2% chance for an aura to instantly massively spike its value.",
+			},
+			habitatT8 = {
+				baseCost = 8e16, costScale = 1.5, maxLevel = 100,
+				apply = function(data) return ((data.upgrades and data.upgrades.habitatT8) or 0) * 1000 end,
+				displayName = "Pocket Universes", description = "Creates entire universes to hold your auras (+1,000 capacity).",
+			},
+			unlockGodlyMult = { 
+				baseCost = 1e17, costScale = 1, maxLevel = 1,
+				apply = function(data) return ((data.upgrades and data.upgrades.unlockGodlyMult) or 0) == 1 end,
+				displayName = "Godly Multiplier", 
+				description = "Reach ascension. Unlocks the " .. (AdminConfig.MilestoneData[8] and AdminConfig.MilestoneData[8].name or "GODLY") .. " tier!",
+			},
+		}
+	},
+	[9] = {
+		tierName = "Tier 9",
+		unlockRequirement = 1500,
+		upgrades = {
+			habitatT9 = {
+				baseCost = 1e19, costScale = 1.5, maxLevel = 150,
+				apply = function(data) return ((data.upgrades and data.upgrades.habitatT9) or 0) * 5000 end,
+				displayName = "Galaxy Clusters", description = "Your habitats are now comprised of entire galaxies (+5,000 capacity).",
+			},
+			hatcheryT9 = {
+				baseCost = 5e19, costScale = 1.5, maxLevel = 1500,
+				apply = function(data) return ((data.upgrades and data.upgrades.hatcheryT9) or 0) * 200 end,
+				displayName = "Big Bang Forges", description = "Hatch energy from the birth of new universes (+200 capacity).",
+			},
+			universalShipping = {
+				baseCost = 8e19, costScale = 1.45, maxLevel = 50,
+				apply = function(data) return ((data.upgrades and data.upgrades.universalShipping) or 0) * 50000 end,
+				displayName = "Teleportation Networks", description = "Instantly beam auras to buyers (+50,000 shipping capacity).",
+			},
+			unlockUniversalMult = { 
+				baseCost = 1e20, costScale = 1, maxLevel = 1, 
+				apply = function(data) return ((data.upgrades and data.upgrades.unlockUniversalMult) or 0) == 1 end,
+				displayName = "Universal Multiplier", 
+				description = "Shatter reality. Unlocks the " .. (AdminConfig.MilestoneData[9] and AdminConfig.MilestoneData[9].name or "UNIVERSAL") .. " tier!",
+			},
+		}
+	},
+	[10] = {
+		tierName = "Tier 10",
+		unlockRequirement = 2500,
+		upgrades = {
+			auraValueT10 = {
+				baseCost = 1e22, costScale = 1.4, maxLevel = 500,
+				apply = function(data) return ((data.upgrades and data.upgrades.auraValueT10) or 0) * 150.0 end,
+				displayName = "Limitless Potential", description = "The ultimate value upgrade. +15,000% value per level.",
+			},
+			omniCapacity = {
+				baseCost = 5e22, costScale = 1.5, maxLevel = 500,
+				apply = function(data) return ((data.upgrades and data.upgrades.omniCapacity) or 0) * 25000 end,
+				displayName = "The Final Frontier", description = "Unfathomable space (+25,000 habitat capacity).",
+			},
+			omniSpeed = {
+				baseCost = 8e22, costScale = 1.6, maxLevel = 100,
+				apply = function(data) return ((data.upgrades and data.upgrades.omniSpeed) or 0) * 0.2 end,
+				displayName = "Time Collapse", description = "Auras generate infinitely fast (-0.2s delay).",
+			},
+			unlockOmniMult = { 
+				baseCost = 5e23, costScale = 1, maxLevel = 1,
+				apply = function(data) return ((data.upgrades and data.upgrades.unlockOmniMult) or 0) == 1 end,
+				displayName = "Omni Multiplier", 
+				description = "The absolute limit. Unlocks the " .. (AdminConfig.MilestoneData[10] and AdminConfig.MilestoneData[10].name or "OMNI") .. " tier!",
+			},
+		}
+	},
+}
+
+-- === GLOBAL HELPER FUNCTIONS ===
+
+function UpgradeConfig.GetUpgradeConfig(upgradeId)
+	for _, tierData in ipairs(UpgradeConfig.Tiers) do
+		if tierData.upgrades[upgradeId] then return tierData.upgrades[upgradeId] end
+	end
 	return nil
 end
 
-return AreaRegistry
+function UpgradeConfig.CalculateCost(upgradeId, currentLevel, data)
+	local cfg = UpgradeConfig.GetUpgradeConfig(upgradeId)
+	if not cfg then return math.huge end
+	if currentLevel >= cfg.maxLevel then return math.huge end
+
+	local cost = math.floor(cfg.baseCost * (cfg.costScale ^ currentLevel))
+
+	-- Apply habitat material synthesis discount if applicable
+	if data and string.find(string.lower(upgradeId), "habitat") then
+		local discountCfg = UpgradeConfig.GetUpgradeConfig("habitatDiscount")
+		if discountCfg and discountCfg.apply then
+			local discount = discountCfg.apply(data)
+			cost = math.floor(cost * (1 - discount))
+		end
+	end
+
+	return cost
+end
+
+function UpgradeConfig.GetHabitatCapacity(data)
+	local cap = AdminConfig.BaseHabitatCapacity or 50
+	local keys = {"habitatCapacity", "habitatT3", "habitatT5", "habitatT7", "habitatT8", "habitatT9", "omniCapacity"}
+	for _, k in ipairs(keys) do
+		local cfg = UpgradeConfig.GetUpgradeConfig(k)
+		if cfg and cfg.apply then cap = cap + cfg.apply(data) end
+	end
+	return cap
+end
+
+function UpgradeConfig.GetHatcheryMax(data)
+	local cap = AdminConfig.HatcheryMax or 100
+	local keys = {"hatcheryCapacity", "hatcheryT3", "hatcheryT4", "hatcheryT7", "hatcheryT9"}
+	for _, k in ipairs(keys) do
+		local cfg = UpgradeConfig.GetUpgradeConfig(k)
+		if cfg and cfg.apply then cap = cap + cfg.apply(data) end
+	end
+	return cap
+end
+
+function UpgradeConfig.GetPassiveInterval(data)
+	local interval = AdminConfig.PassiveInterval or 10
+	local keys = {"passiveTickSpeedT2", "passiveSpeedT6", "omniSpeed"}
+	local totalReduction = 0
+	for _, k in ipairs(keys) do
+		local cfg = UpgradeConfig.GetUpgradeConfig(k)
+		if cfg and cfg.apply then totalReduction = totalReduction + cfg.apply(data) end
+	end
+	return math.max(0.1, interval - totalReduction) -- Cap minimum tick speed to 0.1s
+end
+
+function UpgradeConfig.GetTotalValueMultiplier(data)
+	local mult = 1.0
+	local keys = {"blockValue", "blockValueT2", "auraValueT3", "auraValueT4", "auraValueT6", "auraValueT8", "auraValueT10"}
+	for _, k in ipairs(keys) do
+		local cfg = UpgradeConfig.GetUpgradeConfig(k)
+		if cfg and cfg.apply then mult = mult + cfg.apply(data) end
+	end
+	return mult
+end
+
+function UpgradeConfig.GetShippingCapacity(data)
+	local cap = AdminConfig.PlatformCapacity or 10
+	local keys = {"shipCapacityT1", "shippingCapacityT6", "universalShipping"}
+	for _, k in ipairs(keys) do
+		local cfg = UpgradeConfig.GetUpgradeConfig(k)
+		if cfg and cfg.apply then cap = cap + cfg.apply(data) end
+	end
+	return cap
+end
+
+return UpgradeConfig
+
+local EpicUpgradeConfig = {}
+
+-- 1. TABS REMOVED: Everything sits in one clean panel now!
+EpicUpgradeConfig.Tabs = {"Epic"} 
+
+-- 2. DYNAMIC SCALING MATH
+local function scaleCost(base, growth, level)
+	return math.floor(base * math.pow(growth, level))
+end
+
+-- 3. THE UPGRADES
+EpicUpgradeConfig.Tiers = {
+	{
+		tierName = "Permanent Upgrades",
+		unlockRequirement = 0,
+		upgrades = {
+			["epicAuraValue"] = {
+				displayName = "Aura Value Multiplier",
+				description = "Permanently increases the base value of all generated Auras by +10% per level.",
+				iconId = "rbxassetid://79023170440309", 
+				maxLevel = 50, category = "Epic", baseCost = 10, costGrowth = 1.3,
+				apply = function(d) return 1 + ((d.epicUpgrades and d.epicUpgrades.epicAuraValue) or 0) * 0.1 end
+			},
+			["epicHoldSpeed"] = {
+				displayName = "Turbo Purchasing",
+				description = "Increases how fast you buy regular upgrades when holding down the button.",
+				iconId = "rbxassetid://83928956442803", 
+				maxLevel = 10, category = "Epic", baseCost = 25, costGrowth = 1.5,
+				apply = function(d) return 1 + ((d.epicUpgrades and d.epicUpgrades.epicHoldSpeed) or 0) * 0.3 end
+			},
+			["epicMoveSpeed"] = {
+				displayName = "Swiftness",
+				description = "Permanently increases your character's walking speed.",
+				iconId = "rbxassetid://118830794642672", 
+				maxLevel = 15, category = "Epic", baseCost = 15, costGrowth = 1.4,
+				apply = function(d) return ((d.epicUpgrades and d.epicUpgrades.epicMoveSpeed) or 0) * 1 end
+			},
+			["epicClickMilestone"] = {
+				displayName = "Milestone Momentum",
+				description = "Reduces the clicks/time required to reach the next clicker milestone.",
+				iconId = "rbxassetid://79639901121048", 
+				maxLevel = 20, category = "Epic", baseCost = 50, costGrowth = 1.6,
+				apply = function(d) return ((d.epicUpgrades and d.epicUpgrades.epicClickMilestone) or 0) * 2 end
+			},
+			["epicPrestigeReward"] = {
+				displayName = "Soul Aura Mastery",
+				description = "Increases the amount of Soul Auras you receive when prestiging by +5% per level.",
+				iconId = "rbxassetid://132836221449559", 
+				maxLevel = 25, category = "Epic", baseCost = 100, costGrowth = 1.8,
+				apply = function(d) return 1 + ((d.epicUpgrades and d.epicUpgrades.epicPrestigeReward) or 0) * 0.05 end
+			},
+			["epicShipCooldown"] = {
+				displayName = "Shipping Overdrive",
+				description = "Permanently decreases the cooldown time of shipping auras by 0.5s per level.",
+				iconId = "rbxassetid://128287334405117", 
+				maxLevel = 10, category = "Epic", baseCost = 40, costGrowth = 1.5,
+				apply = function(d) 
+					-- Returns how many seconds to shave off (Level 1 = 0.5s, Level 10 = 5s)
+					return ((d.epicUpgrades and d.epicUpgrades.epicShipCooldown) or 0) * 1.5 
+				end
+			},
+
+			-- =====================================
+			-- NEW UPGRADES IMPLEMENTED
+			-- =====================================
+
+			["epicShipStorage"] = {
+				displayName = "Ship Storage Increase",
+				description = "Permanently increases the maximum amount of auras a single ship can carry.",
+				iconId = "rbxassetid://119837557643684", 
+				maxLevel = 10, category = "Epic", baseCost = 80, costGrowth = 1.6,
+				apply = function(d) 
+					-- Adds 5 extra slots to platform capacity per level
+					return ((d.epicUpgrades and d.epicUpgrades.epicShipStorage) or 0) * 5 
+				end
+			},
+			["epicConveyorThrust"] = {
+				displayName = "Golden Conveyer",
+				description = "Auras Shot from the Spawner Can Now move on the Conveyer!",
+				iconId = "rbxassetid://133910450658029", 
+				maxLevel = 1, category = "Epic", baseCost = 150, costGrowth = 1.0,
+				apply = function(d) 
+					-- Only requires Level 1 to activate logic in ClickHandler
+					return (d.epicUpgrades and d.epicUpgrades.epicConveyorThrust) or 0 
+				end
+			},
+			["epicGoldenAuraYield"] = {
+				displayName = "Golden Multiplier",
+				description = "Increases the amount of Golden Auras you receive when they get shipped.",
+				iconId = "rbxassetid://119182511828436", 
+				maxLevel = 20, category = "Epic", baseCost = 95, costGrowth = 1.5,
+				apply = function(d) 
+					-- Yields +1 extra Golden Aura per level
+					return ((d.epicUpgrades and d.epicUpgrades.epicGoldenAuraYield) or 0) * 1 
+				end
+			},
+			["epicGoldenChance"] = {
+				displayName = "Golden Luck",
+				description = "Permanently increases the chance for a shot out aura to be Elite",
+				iconId = "rbxassetid://91666080426191", 
+				maxLevel = 15, category = "Epic", baseCost = 150, costGrowth = 1.6,
+				apply = function(d) 
+					-- +2% bonus chance per level
+					return ((d.epicUpgrades and d.epicUpgrades.epicGoldenChance) or 0) * 0.02 
+				end
+			},
+			["epicLuck"] = {
+				displayName = "Epic Luck Increase",
+				description = "Permanently boosts your overall luck percentage by +5% per level, yielding higher tier auras.",
+				iconId = "rbxassetid://77583702492506", 
+				maxLevel = 25, category = "Epic", baseCost = 200, costGrowth = 1.5,
+				apply = function(d) 
+					-- Gives +5% luck scaling multiplier
+					return ((d.epicUpgrades and d.epicUpgrades.epicLuck) or 0) * 0.05 
+				end
+			},
+			["epicDoubleSpawn"] = {
+				displayName = "Aura Duplication",
+				description = "Every aura spawned from the spawner is instantly duplicated!",
+				iconId = "rbxassetid://76353531333364", 
+				maxLevel = 1, category = "Epic", baseCost = 100000, costGrowth = 1.0,
+				apply = function(d) 
+					-- Binary trigger
+					return (d.epicUpgrades and d.epicUpgrades.epicDoubleSpawn) or 0 
+				end
+			},
+		}
+
+	}
+}
+
+function EpicUpgradeConfig.GetUpgradeConfig(upgradeId)
+	for _, tierData in ipairs(EpicUpgradeConfig.Tiers) do
+		if tierData.upgrades[upgradeId] then return tierData.upgrades[upgradeId] end
+	end
+	return nil
+end
+
+function EpicUpgradeConfig.CalculateCost(upgradeId, currentLevel)
+	local cfg = EpicUpgradeConfig.GetUpgradeConfig(upgradeId)
+	if not cfg then return math.huge end
+	if currentLevel >= cfg.maxLevel then return math.huge end
+	return scaleCost(cfg.baseCost, cfg.costGrowth, currentLevel)
+end
+
+EpicUpgradeConfig.TabColors = { Epic = Color3.fromRGB(150, 80, 255) }
+return EpicUpgradeConfig
+
+local Players             = game:GetService("Players")
+local ReplicatedStorage   = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local AdminConfig       = require(ReplicatedStorage.Modules.AdminConfig)
+local UpgradeConfig     = require(ReplicatedStorage.Modules.UpgradeConfig)
+local EpicUpgradeConfig = require(ReplicatedStorage.Modules:WaitForChild("EpicUpgradeConfig"))
+local MutationConfig    = require(ReplicatedStorage.Modules.MutationConfig)
+local GameManager       = require(ServerScriptService.GameManager)
+local BoostManager      = require(ServerScriptService.BoostManager)
+
+local PurchaseUpgrade     = ReplicatedStorage.RemoteEvents:WaitForChild("PurchaseUpgrade")
+local UpgradeUpdated      = ReplicatedStorage.RemoteEvents:WaitForChild("UpgradeUpdated")
+local PurchaseEpicUpgrade = ReplicatedStorage.RemoteEvents:WaitForChild("PurchaseEpicUpgrade")
+local EpicUpgradeUpdated  = ReplicatedStorage.RemoteEvents:WaitForChild("EpicUpgradeUpdated")
+
+-- ✨ BRIDGENET2 UPGRADE
+local BridgeNet2      = require(ReplicatedStorage.Modules:WaitForChild("BridgeNet2"))
+local UpdateHUDBridge = BridgeNet2.ServerBridge("UpdateHUD")
+
+-- ✨ THE FIX: Replaced strict time cooldowns with a generous per-frame batch limit!
+-- This allows ultra-fast holding without the server dropping your network requests.
+local purchasesThisFrame = {}
+game:GetService("RunService").Heartbeat:Connect(function()
+	table.clear(purchasesThisFrame)
+end)
+
+-- Mapping the Index Rewards to the Upgrade Tiers to scale Bank filling
+local TierFillAmounts = {
+	[1] = 5,
+
+	[2] = 10,
+
+	[3] = 15,
+
+	[4] = 25,
+
+	[5] = 50,
+
+	[6] = 75,
+
+	[7] = 125,
+	[8] = 175,
+	[9] = 250,
+	[10] = 500
+}
+
+local function GetUpgradeTierIndex(upgradeId, isEpic)
+	local config = isEpic and EpicUpgradeConfig or UpgradeConfig
+	for idx, tierData in ipairs(config.Tiers) do
+		if tierData.upgrades[upgradeId] then
+			return idx
+		end
+	end
+	return 1
+end
+
+local function SendFullUpgradeState(player)
+	local data = GameManager.GetData(player.UserId)
+	if not data then return end
+
+	local state = {}
+	for tierNum, tierData in ipairs(UpgradeConfig.Tiers) do
+		for upgradeId, cfg in pairs(tierData.upgrades) do
+			local currentLevel = data.upgrades[upgradeId] or 0
+			state[upgradeId] = {
+				level    = currentLevel,
+				maxLevel = cfg.maxLevel,
+				-- Passed "data" in here to respect the dynamic `habitatDiscount`
+				cost     = currentLevel < cfg.maxLevel and UpgradeConfig.CalculateCost(upgradeId, currentLevel, data) or 0,
+				maxed    = currentLevel >= cfg.maxLevel,
+			}
+		end
+	end
+
+	UpgradeUpdated:FireClient(player, {
+		type     = "fullState",
+		upgrades = state,
+		currency = data.currency,
+	})
+
+	local epicState = {}
+	if data.epicUpgrades then
+		for tierNum, tierData in ipairs(EpicUpgradeConfig.Tiers) do
+			for upgradeId, cfg in pairs(tierData.upgrades) do
+				local currentLevel = data.epicUpgrades[upgradeId] or 0
+				epicState[upgradeId] = {
+					level    = currentLevel,
+					maxLevel = cfg.maxLevel,
+					cost     = currentLevel < cfg.maxLevel and EpicUpgradeConfig.CalculateCost(upgradeId, currentLevel) or 0,
+					maxed    = currentLevel >= cfg.maxLevel,
+				}
+			end
+		end
+
+		EpicUpgradeUpdated:FireClient(player, {
+			type        = "fullState",
+			upgrades    = epicState,
+			goldenAuras = data.goldenAuras
+		})
+	end
+
+
+end
+
+Players.PlayerAdded:Connect(function(player)
+	task.wait(2)
+	SendFullUpgradeState(player)
+end)
+
+local function SendHUDAfterPurchase(player, data)
+	local uid     = player.UserId
+	local runtime = GameManager.GetRuntime(uid)
+	if not runtime then return end
+
+	local storedCount = runtime.storedCubeCount or 0
+	local activeMV    = runtime.activeMutatedValue or 0
+
+	local boostMult = BoostManager.GetValueMultiplier(uid) * BoostManager.GetSpawnRateMultiplier(uid)
+	local rate = math.floor(activeMV * boostMult)
+
+	local upgradesState = {}
+	for upgradeId, level in pairs(data.upgrades or {}) do
+		upgradesState[upgradeId] = { level = level }
+	end
+
+	local epicUpgradesState = {}
+	for upgradeId, level in pairs(data.epicUpgrades or {}) do
+		epicUpgradesState[upgradeId] = { level = level }
+	end
+
+	UpdateHUDBridge:Fire(player, {
+		currency        = data.currency,
+		goldenAuras     = data.goldenAuras,
+		pendingAuras    = storedCount,
+		habitatCapacity = UpgradeConfig.GetHabitatCapacity(data),
+		shipCapacity    = UpgradeConfig.GetShippingCapacity(data) or AdminConfig.PlatformCapacity,
+		rate            = rate,
+		passiveInterval = UpgradeConfig.GetPassiveInterval(data),
+		totalEarned     = data.totalEarned    or 0,
+		soulAuras       = data.soulAuras      or 0,
+		farmEvaluation  = data.farmEvaluation or 0,
+		upgrades        = upgradesState, 
+		epicUpgrades    = epicUpgradesState
+	})
+
+
+end
+
+-- 1. Regular Upgrades
+PurchaseUpgrade.OnServerEvent:Connect(function(player, upgradeId)
+	local uid = player.UserId
+
+	if type(upgradeId) ~= "string" then return end
+
+	-- Allow up to 20 purchases per physics frame (perfect for high-speed holding)
+	purchasesThisFrame[uid] = (purchasesThisFrame[uid] or 0) + 1
+	if purchasesThisFrame[uid] > 20 then return end
+
+	local cfg = UpgradeConfig.GetUpgradeConfig(upgradeId)
+	if not cfg then return end
+
+	local data = GameManager.GetData(uid)
+	if not data then return end
+	if not data.upgrades then data.upgrades = {} end
+
+	local currentLevel = data.upgrades[upgradeId] or 0
+	if currentLevel >= cfg.maxLevel then return end
+
+	-- Passed "data" in here to respect the dynamic `habitatDiscount`
+	local cost = UpgradeConfig.CalculateCost(upgradeId, currentLevel, data)
+	if data.currency < cost then return end
+
+	data.currency            = data.currency - cost
+	data.upgrades[upgradeId] = currentLevel + 1
+	local newLevel           = currentLevel + 1
+
+	local nextCost = 0
+	if newLevel < cfg.maxLevel then
+		nextCost = UpgradeConfig.CalculateCost(upgradeId, newLevel, data)
+	end
+
+	GameManager.SavePlayer(player)
+
+	UpgradeUpdated:FireClient(player, {
+		type      = "purchased",
+		upgradeId = upgradeId,
+		level     = newLevel,
+		maxLevel  = cfg.maxLevel,
+		cost      = nextCost,
+		maxed     = newLevel >= cfg.maxLevel,
+		currency  = data.currency,
+	})
+
+	local tierIndex = GetUpgradeTierIndex(upgradeId, false)
+	local fillAmount = TierFillAmounts[tierIndex] or 5
+	local BankFillEvent = ServerScriptService:FindFirstChild("BankFillEvent")
+	if BankFillEvent then
+		BankFillEvent:Fire(uid, fillAmount)
+	end
+
+	SendHUDAfterPurchase(player, data)
+
+
+end)
+
+-- 2. Epic Upgrades (Research)
+PurchaseEpicUpgrade.OnServerEvent:Connect(function(player, upgradeId)
+	local uid = player.UserId
+
+	if type(upgradeId) ~= "string" then return end
+
+	-- Allow up to 20 purchases per physics frame (perfect for high-speed holding)
+	purchasesThisFrame[uid] = (purchasesThisFrame[uid] or 0) + 1
+	if purchasesThisFrame[uid] > 20 then return end
+
+	local cfg = EpicUpgradeConfig.GetUpgradeConfig(upgradeId)
+	if not cfg then return end
+
+	local data = GameManager.GetData(uid)
+	if not data then return end
+	if not data.epicUpgrades then data.epicUpgrades = {} end
+
+	local currentLevel = data.epicUpgrades[upgradeId] or 0
+	if currentLevel >= cfg.maxLevel then return end
+
+	local cost = EpicUpgradeConfig.CalculateCost(upgradeId, currentLevel)
+	if (data.goldenAuras or 0) < cost then return end
+
+	data.goldenAuras = data.goldenAuras - cost
+	data.epicUpgrades[upgradeId] = currentLevel + 1
+	local newLevel = currentLevel + 1
+
+	local nextCost = 0
+	if newLevel < cfg.maxLevel then
+		nextCost = EpicUpgradeConfig.CalculateCost(upgradeId, newLevel)
+	end
+
+	GameManager.SavePlayer(player)
+
+	EpicUpgradeUpdated:FireClient(player, {
+		type        = "purchased",
+		upgradeId   = upgradeId,
+		level       = newLevel,
+		maxLevel    = cfg.maxLevel,
+		cost        = nextCost,
+		maxed       = newLevel >= cfg.maxLevel,
+		goldenAuras = data.goldenAuras,
+	})
+
+	local tierIndex = GetUpgradeTierIndex(upgradeId, true)
+	local fillAmount = TierFillAmounts[tierIndex] or 25
+	local BankFillEvent = ServerScriptService:FindFirstChild("BankFillEvent")
+	if BankFillEvent then
+		BankFillEvent:Fire(uid, fillAmount)
+	end
+
+	SendHUDAfterPurchase(player, data)
+
+
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	purchasesThisFrame[player.UserId] = nil
+end)
+
+return {}
